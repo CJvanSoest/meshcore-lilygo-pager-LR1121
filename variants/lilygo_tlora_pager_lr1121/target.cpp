@@ -142,8 +142,17 @@ static void kb_begin() {
   Serial.println("TCA8418: 4x10 matrix ready");
 }
 
-// Called from main loop() via the variant_loop weak hook. Drains any
-// pending key events from the TCA8418 FIFO and prints them on Serial.
+// Backspace key raw code per LilyGo T-Pager config (no ASCII letter mapped).
+#ifndef TPAGER_KB_BACKSPACE_RAW
+  #define TPAGER_KB_BACKSPACE_RAW 0x1D
+#endif
+
+// Called from main loop() via the variant_loop weak hook. Drains pending
+// key events from the TCA8418 FIFO; key-down events are forwarded to
+// main.cpp's ui_input_char() (weak — null in non-UI builds) which routes
+// them to UITask when the compose screen is active.
+extern "C" void ui_input_char(char c) __attribute__((weak));
+
 void variant_loop() {
   if (!_kb_ok) { kb_begin(); return; }   // try late init if I2C wasn't ready
 
@@ -151,12 +160,19 @@ void variant_loop() {
     uint8_t ev = _kb.getEvent();
     bool pressed = (ev & 0x80) != 0;
     uint8_t k = ev & 0x7F;
-    // TCA8418 keys are 1-based, row-major across configured cols.
-    int row = (k - 1) / 10;
-    int col = (k - 1) % 10;
-    char c = (row >= 0 && row < 4 && col >= 0 && col < 10) ? kb_keymap[row][col] : '\0';
-    Serial.printf("KB %s raw=%u row=%d col=%d ch=%c\n",
-                  pressed ? "DOWN" : "UP", k, row, col, c ? c : '?');
+    if (!pressed) continue;            // only act on key-down
+
+    char c = '\0';
+    if (k == TPAGER_KB_BACKSPACE_RAW) {
+      c = '\b';
+    } else {
+      int row = (k - 1) / 10;
+      int col = (k - 1) % 10;
+      if (row >= 0 && row < 4 && col >= 0 && col < 10) c = kb_keymap[row][col];
+    }
+    Serial.printf("KB raw=%u ch=%c\n", k, c ? c : '?');
+
+    if (c != '\0' && ui_input_char) ui_input_char(c);
   }
 }
 

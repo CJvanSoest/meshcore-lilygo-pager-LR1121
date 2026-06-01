@@ -186,6 +186,16 @@ public:
     return (h && h->name[0]) ? h->name : nullptr;
   }
 
+  // Fills 'dest' with the transport key for the configured home region.
+  // Returns false when there is no home region (in which case the caller
+  // should fall back to a plain unscoped sendFlood). Used by variant UIs
+  // to tag outgoing messages so region-aware monitors pick them up.
+  bool getHomeScope(::TransportKey& dest) {
+    auto* h = region_map.getHomeRegion();
+    if (!h || h->isWildcard()) return false;
+    return region_map.getTransportKeysFor(*h, &dest, 1) > 0;
+  }
+
   void begin(FILESYSTEM* fs);
   void sendNodeDiscoverReq();
   const char* getFirmwareVer() override { return FIRMWARE_VERSION; }

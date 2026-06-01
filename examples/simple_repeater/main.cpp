@@ -20,6 +20,70 @@ extern "C" const char* mesh_home_region_name() {
   return the_mesh.getHomeRegionName();
 }
 
+// Bridge invoked by the UITask compose screen when the user presses Enter.
+// Sends a GROUP_TXT packet to the hard-coded #test channel via plain
+// sendFlood (no region scope yet — full region-scoped channel send is
+// follow-up work; for now this is enough to make the message visible to
+// any node tuned to the same channel).
+extern "C" void ui_send_message(const char* msg) {
+  if (!msg || !msg[0]) return;
+
+#ifndef COMPOSE_CHANNEL
+  #define COMPOSE_CHANNEL "#test"
+#endif
+  const char* CHANNEL_NAME = COMPOSE_CHANNEL;
+  mesh::GroupChannel channel;
+  uint8_t full_secret[32];
+  mesh::Utils::sha256(full_secret, 16, (const uint8_t*)CHANNEL_NAME, strlen(CHANNEL_NAME));
+  memset(channel.secret, 0, sizeof(channel.secret));
+  memcpy(channel.secret, full_secret, 16);
+  mesh::Utils::sha256(channel.hash, sizeof(channel.hash), channel.secret, 16);
+
+  // Payload: 4-byte timestamp + TXT_TYPE_PLAIN (0) + "<sender>: <text>"
+  uint32_t ts = the_mesh.getRTCClock()->getCurrentTime();
+  const char* name = the_mesh.getNodePrefs()->node_name;
+
+  // Payload buffer: 4 bytes timestamp + 1 byte TXT_TYPE_PLAIN + sender+msg
+  static const int PAYLOAD_BUF_LEN = 196;
+  uint8_t buf[PAYLOAD_BUF_LEN];
+  memcpy(buf, &ts, 4);
+  buf[4] = 0;  // TXT_TYPE_PLAIN
+  int prefix = snprintf((char*)&buf[5], PAYLOAD_BUF_LEN - 5, "%s: ", name);
+  if (prefix < 0) prefix = 0;
+  int max_text = PAYLOAD_BUF_LEN - 5 - prefix - 1;
+  int text_len = (int)strlen(msg);
+  if (text_len > max_text) text_len = max_text;
+  memcpy(&buf[5 + prefix], msg, text_len);
+  int total = 5 + prefix + text_len;
+
+  auto pkt = the_mesh.createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, channel, buf, total);
+  if (pkt) {
+    uint8_t hash_size = the_mesh.getNodePrefs()->path_hash_mode + 1;
+    TransportKey scope;
+    if (the_mesh.getHomeScope(scope)) {
+      the_mesh.sendFloodScoped(scope, pkt, 0, hash_size);
+      Serial.print("[SEND #test scoped] ");
+    } else {
+      the_mesh.sendFlood(pkt, 0, hash_size);
+      Serial.print("[SEND #test unscoped] ");
+    }
+    Serial.println(msg);
+  } else {
+    Serial.println("[SEND #test] packet alloc failed");
+  }
+}
+
+// Bridge for variants with their own input device (e.g. T-Pager keyboard).
+// They call this on every key-down; we forward to UITask when compose is
+// the active screen.
+extern "C" void ui_input_char(char c) {
+#if defined(DISPLAY_CLASS) && (COMPOSE_BUFFER_SIZE > 0)
+  if (ui_task.isComposeActive()) ui_task.addInputChar(c);
+#else
+  (void)c;
+#endif
+}
+
 void halt() {
   while (1) ;
 }

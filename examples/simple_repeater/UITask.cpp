@@ -44,10 +44,12 @@ void UITask::begin(NodePrefs* node_prefs, const char* build_date, const char* fi
   sprintf(_version_info, "%s (%s)", version, build_date);
 }
 
-// Forward declaration of the optional 'About' screen renderer used when
-// _current_screen == 1. Lives further down in this file so renderCurrScreen
-// stays readable.
+// Forward declarations for non-home screen renderers — defined at the bottom
+// of this file to keep renderCurrScreen readable.
 static void renderAboutScreen(DisplayDriver* d, const char* version_info);
+#if COMPOSE_BUFFER_SIZE > 0
+static void renderComposeScreen(DisplayDriver* d, const char* buf, uint16_t len);
+#endif
 
 void UITask::renderCurrScreen() {
   char tmp[80];
@@ -57,6 +59,12 @@ void UITask::renderCurrScreen() {
     renderAboutScreen(_display, _version_info);
     return;
   }
+#if COMPOSE_BUFFER_SIZE > 0
+  if (_current_screen == 2) {
+    renderComposeScreen(_display, _compose_buf, _compose_len);
+    return;
+  }
+#endif
 
   if (millis() < BOOT_SCREEN_MILLIS) { // boot screen
     // meshcore logo
@@ -218,3 +226,70 @@ static void renderAboutScreen(DisplayDriver* d, const char* version_info) {
   d->print(tmp);
 #endif
 }
+
+#if COMPOSE_BUFFER_SIZE > 0
+// --- Optional compose screen --------------------------------------------------
+//
+// Active when _current_screen == 2. The variant routes keyboard events to
+// UITask::addInputChar(). On Enter we hand the buffer to the weak bridge
+// 'ui_send_message' (typically defined in main.cpp) and clear.
+
+extern "C" void ui_send_message(const char* msg) __attribute__((weak));
+
+static void renderComposeScreen(DisplayDriver* d, const char* buf, uint16_t len) {
+  d->setColor(DisplayDriver::LIGHT);
+  d->setTextSize(1);
+
+  d->setCursor(0, 0);
+  d->setColor(DisplayDriver::YELLOW);
+#ifdef COMPOSE_CHANNEL
+  char hdr[40];
+  snprintf(hdr, sizeof(hdr), "Compose %s", COMPOSE_CHANNEL);
+  d->print(hdr);
+#else
+  d->print("Compose");
+#endif
+
+  // Visible buffer — append a block cursor for legibility.
+  d->setColor(DisplayDriver::LIGHT);
+  char shown[COMPOSE_BUFFER_SIZE + 2];
+  size_t n = len < COMPOSE_BUFFER_SIZE ? len : COMPOSE_BUFFER_SIZE - 1;
+  memcpy(shown, buf, n);
+  shown[n] = '_';
+  shown[n + 1] = 0;
+  d->setCursor(0, 14);
+  d->printWordWrap(shown, d->width());
+
+  // Hint at the bottom.
+  d->setColor(DisplayDriver::DARK);  // dim
+  d->setCursor(0, d->height() - 8);
+  d->setColor(DisplayDriver::LIGHT);
+  d->print("Enter=send  Bksp=del");
+}
+
+void UITask::addInputChar(char c) {
+  if (_current_screen != 2) return;   // only when compose screen is active
+  _next_refresh = 0;                  // force redraw
+
+  if (c == '\b' || c == 0x7F) {       // backspace / delete
+    if (_compose_len > 0) {
+      _compose_buf[--_compose_len] = 0;
+    }
+    return;
+  }
+  if (c == '\r' || c == '\n') {       // submit
+    if (_compose_len > 0) {
+      _compose_buf[_compose_len] = 0;
+      if (ui_send_message) ui_send_message(_compose_buf);
+      _compose_len = 0;
+      _compose_buf[0] = 0;
+    }
+    return;
+  }
+  if (c < 0x20 || c > 0x7E) return;   // ignore non-printable
+  if (_compose_len + 1 >= COMPOSE_BUFFER_SIZE) return;
+  _compose_buf[_compose_len++] = c;
+  _compose_buf[_compose_len] = 0;
+}
+#endif  // COMPOSE_BUFFER_SIZE > 0
+
