@@ -410,7 +410,7 @@ static void build_ui() {
 
   // Footer hint
   lv_obj_t* hint = lv_label_create(s_root);
-  lv_label_set_text(hint, "rotate: scroll  click/dbl-click: open  long: back");
+  lv_label_set_text(hint, "rotate: scroll   click: open   long: back");
   lv_obj_set_style_text_color(hint, lv_color_hex(0x707880), 0);
   lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -4);
 
@@ -473,7 +473,7 @@ static void build_ui() {
   s_edit_group = lv_group_create();
 
   lv_obj_t* back_hint = lv_label_create(s_subscreen_root);
-  lv_label_set_text(back_hint, LV_SYMBOL_LEFT "  long-press to return");
+  lv_label_set_text(back_hint, "click or dbl-click: edit   long-press: back");
   lv_obj_set_style_text_color(back_hint, lv_color_hex(0x707880), 0);
   lv_obj_align(back_hint, LV_ALIGN_BOTTOM_MID, 0, -4);
 
