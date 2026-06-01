@@ -86,5 +86,19 @@ hands doesn't have to rediscover them:
 - S3.3 phase 2c: numeric keyboard entry for frequency.
 - S3.3 phase 2d: region scope picker (reads / writes RegionMap).
 - S3.3 phase 2e: duty-cycle indicator (likely top header, next to battery).
-- S3.4: channel list + message history viewer.
-- S3.5: contact list (heard adverts).
+- S3.4 prereq: symbol layer on the QWERTY keyboard (`Space + key`) — needed
+  before chat / channel-name input can land any digit or `#`.
+- S3.4: channel list + message history viewer (with `+ Add channel`
+  via text-input — no hardcoded NL-specific channel names in the
+  upstream code).
+- S3.5: contacts tile (heard adverts) with favourite flag and a
+  not-favourite-first eviction policy when the 350-contact cap is hit.
+- S3.6: map renderer — XYZ raster tiles from microSD. Five base
+  sources shipped with the firmware (OSM, PDOK for NL, OpenTopoMap,
+  CyclOSM, Stamen Toner). See `MAPS.md` for the source list, tile-URL
+  templates, the planned in-map source-switcher UX and links to free
+  providers for other countries / world-wide use.
+- S3.7: at-rest encrypted message store on SD (AES-256-CTR with a key
+  derived from `efuse_mac || optional_passphrase`). DM threads and
+  channel chat histories land in `/messages/<hash>.jsonl` instead of
+  SPIFFS.
