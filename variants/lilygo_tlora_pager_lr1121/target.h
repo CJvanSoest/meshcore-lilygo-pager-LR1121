@@ -17,6 +17,8 @@
 class TLoraPagerBoard : public ESP32Board {
 public:
   void begin();
+  uint16_t getBattMilliVolts() override;
+  const char* getManufacturerName() const override { return "LilyGo"; }
 };
 
 extern TLoraPagerBoard board;

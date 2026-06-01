@@ -234,8 +234,24 @@ mesh::LocalIdentity radio_new_identity() {
 #ifndef BQ27220_I2C_ADDR
   #define BQ27220_I2C_ADDR 0x55
 #endif
-#define BQ27220_REG_SOC 0x2C  // State Of Charge, 2 bytes, 0..100 %
-                              // (0x1C is StandbyTimeToEmpty — common confusion)
+#define BQ27220_REG_SOC     0x2C  // State Of Charge, 2 bytes, 0..100 %
+                                  // (0x1C is StandbyTimeToEmpty — common confusion)
+#define BQ27220_REG_VOLTAGE 0x08  // Voltage, 2 bytes, mV
+
+static int read_bq27220_word(uint8_t reg) {
+  Wire.beginTransmission(BQ27220_I2C_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(true) != 0) return -1;
+  if (Wire.requestFrom(BQ27220_I2C_ADDR, (uint8_t)2) != 2) return -1;
+  uint8_t lo = Wire.read();
+  uint8_t hi = Wire.read();
+  return (int)((hi << 8) | lo);
+}
+
+uint16_t TLoraPagerBoard::getBattMilliVolts() {
+  int v = read_bq27220_word(BQ27220_REG_VOLTAGE);
+  return v >= 0 ? (uint16_t)v : 0;
+}
 
 static int read_battery_percent() {
   // BQ27220 uses STOP-between-write-and-read (not repeated start) — pass
