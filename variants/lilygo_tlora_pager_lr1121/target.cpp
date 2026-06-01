@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <Adafruit_TCA8418.h>
 #include "target.h"
 
 TLoraPagerBoard board;
@@ -106,6 +107,57 @@ void TLoraPagerBoard::begin() {
     Serial.println("WARN: XL9555 LORA_EN write failed (expander reachable?)");
   }
   delay(10);  // small settle for the regulator
+
+  // Keyboard: power on via XL9555 EXPANDS_KB_EN (pin 8), pulse-reset via
+  // EXPANDS_KB_RST (pin 2), then init the TCA8418 matrix scanner.
+  xl9555_set_output(8, true);    // KB_EN HIGH — power keyboard
+  delay(2);
+  xl9555_set_output(2, false);   // KB_RST LOW
+  delay(5);
+  xl9555_set_output(2, true);    // KB_RST HIGH — out of reset
+  delay(20);
+}
+
+// --- TCA8418 keyboard ---------------------------------------------------------
+static Adafruit_TCA8418 _kb;
+static bool _kb_ok = false;
+
+// QWERTY keymap copied from LilyGo_LoRa_Pager.cpp (4 rows x 10 cols).
+// '\0' marks a position with no key (or a modifier handled elsewhere).
+static const char kb_keymap[4][10] = {
+  {'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'},
+  {'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', '\n'},
+  {'\0','z', 'x', 'c', 'v', 'b', 'n', 'm', '\0','\0'},
+  {' ', '\0','\0','\0','\0','\0','\0','\0','\0','\0'}
+};
+
+static void kb_begin() {
+  _kb_ok = _kb.begin(TCA8418_DEFAULT_ADDR, &Wire);
+  if (!_kb_ok) {
+    Serial.println("WARN: TCA8418 begin failed");
+    return;
+  }
+  _kb.matrix(4, 10);
+  _kb.flush();
+  Serial.println("TCA8418: 4x10 matrix ready");
+}
+
+// Called from main loop() via the variant_loop weak hook. Drains any
+// pending key events from the TCA8418 FIFO and prints them on Serial.
+void variant_loop() {
+  if (!_kb_ok) { kb_begin(); return; }   // try late init if I2C wasn't ready
+
+  while (_kb.available()) {
+    uint8_t ev = _kb.getEvent();
+    bool pressed = (ev & 0x80) != 0;
+    uint8_t k = ev & 0x7F;
+    // TCA8418 keys are 1-based, row-major across configured cols.
+    int row = (k - 1) / 10;
+    int col = (k - 1) % 10;
+    char c = (row >= 0 && row < 4 && col >= 0 && col < 10) ? kb_keymap[row][col] : '\0';
+    Serial.printf("KB %s raw=%u row=%d col=%d ch=%c\n",
+                  pressed ? "DOWN" : "UP", k, row, col, c ? c : '?');
+  }
 }
 
 bool radio_init() {

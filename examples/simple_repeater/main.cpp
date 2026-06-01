@@ -161,6 +161,11 @@ void loop() {
 #endif
   rtc_clock.tick();
 
+  // Variant-supplied periodic work (e.g. polling a keyboard FIFO). Default
+  // is a no-op via the weak symbol below.
+  extern void variant_loop() __attribute__((weak));
+  if (variant_loop) variant_loop();
+
   if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
     #if defined(NRF52_PLATFORM)
     board.sleep(1800); // nrf ignores seconds param, sleeps whenever possible
