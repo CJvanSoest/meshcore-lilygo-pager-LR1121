@@ -80,6 +80,12 @@ void TLoraPagerBoard::begin() {
 #ifdef PIN_USER_BTN
   pinMode(PIN_USER_BTN, INPUT_PULLUP);
 #endif
+#ifdef PIN_ENCODER_A
+  pinMode(PIN_ENCODER_A, INPUT_PULLUP);
+#endif
+#ifdef PIN_ENCODER_B
+  pinMode(PIN_ENCODER_B, INPUT_PULLUP);
+#endif
 
   // Bring up I2C on the LilyGo T-Pager bus (SDA=3, SCL=2 per LilyGoLib pinmap)
   Wire.begin(PIN_BOARD_SDA, PIN_BOARD_SCL);

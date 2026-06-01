@@ -125,6 +125,27 @@ void UITask::renderCurrScreen() {
 }
 
 void UITask::loop() {
+#if defined(PIN_ENCODER_A) && defined(PIN_ENCODER_B)
+  // Rotary encoder — falling edge on A signals one detent. Direction is
+  // taken from B's state at that moment: B HIGH = CW, B LOW = CCW.
+  // Polled here at loop rate; for fast spinning we may miss steps, but
+  // for menu navigation that is fine.
+  static int last_enc_a = HIGH;
+  int enc_a = digitalRead(PIN_ENCODER_A);
+  if (last_enc_a == HIGH && enc_a == LOW) {
+    int enc_b = digitalRead(PIN_ENCODER_B);
+    if (enc_b == HIGH) {
+      _current_screen = (_current_screen + 1) % NUM_SCREENS;
+    } else {
+      _current_screen = (_current_screen + NUM_SCREENS - 1) % NUM_SCREENS;
+    }
+    _next_refresh = 0;
+    _auto_off = millis() + AUTO_OFF_MILLIS;
+    if (!_display->isOn()) _display->turnOn();
+  }
+  last_enc_a = enc_a;
+#endif
+
 #ifdef PIN_USER_BTN
   if (millis() >= _next_read) {
     int btnState = digitalRead(PIN_USER_BTN);
