@@ -81,6 +81,35 @@ void UITask::renderCurrScreen() {
     _display->setCursor(0, 30);
     sprintf(tmp, "BW: %03.2f CR: %d", _node_prefs->bw, _node_prefs->cr);
     _display->print(tmp);
+
+    // uptime (only render on taller displays — fits below the bw/cr line)
+    if (_display->height() >= 50) {
+      unsigned long up_s = millis() / 1000;
+      _display->setCursor(0, 40);
+      _display->setColor(DisplayDriver::LIGHT);
+      sprintf(tmp, "UP: %02lu:%02lu:%02lu",
+              up_s / 3600, (up_s / 60) % 60, up_s % 60);
+      _display->print(tmp);
+    }
+
+    // path hash size (mode 0/1/2 maps to 1/2/3 bytes)
+    if (_display->height() >= 60) {
+      _display->setCursor(0, 50);
+      _display->setColor(DisplayDriver::LIGHT);
+      int bytes = _node_prefs->path_hash_mode + 1;
+      sprintf(tmp, "PATH: %d byte%s", bytes, bytes == 1 ? "" : "s");
+      _display->print(tmp);
+    }
+
+    // region scope — variant-configured via -D STATUS_REGION
+#ifdef STATUS_REGION
+    if (_display->height() >= 70) {
+      _display->setCursor(0, 60);
+      _display->setColor(DisplayDriver::LIGHT);
+      sprintf(tmp, "RGN: %s", STATUS_REGION);
+      _display->print(tmp);
+    }
+#endif
   }
 }
 

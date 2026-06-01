@@ -75,8 +75,12 @@ public:
   }
 };
 
+// LGFXDisplay::begin() applies setRotation(1) which swaps the panel axes —
+// combined with our offset_rotation=2 the effective view is landscape
+// 480 wide x 222 tall. The sprite dimensions must match that, otherwise
+// UI_ZOOM scaling clips off-screen.
 class TPagerST7796Display : public LGFXDisplay {
   LGFX_TPager disp;
 public:
-  TPagerST7796Display() : LGFXDisplay(222, 480, disp) {}
+  TPagerST7796Display() : LGFXDisplay(480, 222, disp) {}
 };
