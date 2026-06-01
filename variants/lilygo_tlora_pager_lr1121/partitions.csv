@@ -1,0 +1,10 @@
+# T-Lora Pager LR1121 — 16 MB flash partition layout
+# Larger app slots (5 MB each) and roomy SPIFFS (~6 MB) for identity, contacts,
+# channel keys, message store, map cache.
+# Name,     Type, SubType,  Offset,    Size,      Flags
+nvs,        data, nvs,      0x9000,    0x5000,
+otadata,    data, ota,      0xE000,    0x2000,
+app0,       app,  ota_0,    0x10000,   0x500000,
+app1,       app,  ota_1,    0x510000,  0x500000,
+spiffs,     data, spiffs,   0xA10000,  0x5E0000,
+coredump,   data, coredump, 0xFF0000,  0x10000,
