@@ -1,0 +1,90 @@
+# LilyGo T-Lora Pager (LR1121) — MeshCore variant
+
+Multi-band T-Pager port for MeshCore. The LR1121 variant of the Pager
+ships with the multi-band Semtech LR1121 radio (sub-GHz + 2.4 GHz);
+this folder also covers the rest of the on-board hardware (ST7796 IPS
+display, TCA8418 keyboard, rotary encoder, AXP-style PMU, BQ27220 fuel
+gauge, MicroNMEA GPS, XL9555 IO expander).
+
+## Build environments
+
+| env name | purpose | based on |
+|---|---|---|
+| `T_LoRa_Pager_LR1121_repeater` | full-featured relay node with a thin status UI + chat compose | `examples/simple_repeater` |
+| `T_LoRa_Pager_LR1121_companion_radio_usb` | standalone client with LVGL tile-carousel UI (LilyGo-demo style) | `examples/companion_radio`, with this folder's `UITask.cpp` replacing the stock `ui-new/UITask.cpp` |
+
+Both pull in `helpers/ui/LGFXDisplay.cpp` and the variant's own
+`TPagerST7796Display.h`, `target.cpp`, `TPagerLVGL.cpp` and `UITask.cpp`.
+
+## Navigation (companion build, LVGL UI)
+
+- **Encoder rotation** scrolls / changes value. Direction is inverted
+  while inside sub-screens (vertical lists) so "rotate up" moves the
+  focus up.
+- **Click** opens a tile, applies a setting, or toggles a boolean
+  inline. If the focus didn't land on the row the first click "wakes"
+  it — in that case a **double-click** is the natural follow-through.
+- **Long-press (≥600 ms)** goes back. From a settings edit popup it
+  cancels without applying; from a sub-screen it returns to the
+  carousel.
+
+The companion `UITask` is replaced by our LVGL variant via the
+`build_src_filter` exclusion in `platformio.ini` (the include path order
+also ensures our `UITask.h` shadows the upstream one).
+
+## Pin map / hardware
+
+Mirrors `Xinyuan-LilyGO/LilyGoLib-PlatformIO/variants/lilygo_tlora_pager/pins_arduino.h`.
+
+- LoRa (LR1121): `CS=36 IRQ=14 RST=47 BUSY=48` on the shared SPI bus
+  (`SCLK=35 MOSI=34 MISO=33`).
+- Display (ST7796): `CS=38 DC=37 BL=42`. Panel mounted 180° (offset
+  rotation 2); LGFXDisplay applies +90° on top, so the effective layout
+  is landscape 480×222.
+- Encoder: `ROTARY_A=40 ROTARY_B=41 ROTARY_C=7` (push).
+- Keyboard (TCA8418 on I²C 0x34): 4×10 matrix.
+- I²C bus: `SDA=3 SCL=2`.
+- XL9555 IO expander on 0x20 with `EXPANDS_LORA_EN=3`,
+  `EXPANDS_KB_EN=8`, `EXPANDS_KB_RST=2` — the LR1121 power rail and
+  the keyboard reset are routed through the expander, not direct GPIO.
+
+## Known LVGL caveats
+
+These cost some debug time and are documented here so the next pair of
+hands doesn't have to rediscover them:
+
+- **LVGL needs a tick source.** Call
+  `lv_tick_set_cb((uint32_t(*)())millis)` once before `lv_timer_handler`
+  — without it timers (including the indev read-cb) never fire.
+- **Encoder indev does not raise `LV_EVENT_LONG_PRESSED`** on focused
+  widgets. The long-press is reserved for the group's edit-mode
+  transition. Detect long-press yourself in the input poll.
+- **Encoder `enc_diff` accumulator** needs a cap (`±4` here) and
+  `continue_reading=false`, otherwise a fast spin drains the queue in
+  one cycle and feels like the focus jumped to the end.
+- **`LV_USE_STDLIB_MALLOC=LV_STDLIB_CUSTOM`** in the canonical LilyGo
+  `lv_conf.h` expects you to provide `lv_malloc_core`/`lv_free_core`.
+  We switched to `LV_STDLIB_BUILTIN` since we don't ship those symbols.
+- **Encoder + spinbox: don't call `lv_spinbox_step_prev`** at creation
+  time. It bumps the step to 10, which collapses to the range bounds
+  for small ranges (SF 5..12 only shows 5 or 12).
+
+## Status as of S3.3 phase 2a
+
+- Tile carousel with 6 tiles, encoder navigation, click/long-press semantics.
+- Radio sub-screen renders the live `NodePrefs` values in a two-column
+  list (label + value, right-aligned).
+- Edit popup with spinbox for `SF`, `CR`, `TX power`. Apply path calls
+  the weak bridge `ui_apply_radio_changes()` defined by the example
+  main.cpp (sets radio params + persists prefs).
+- RX boost toggles inline.
+- After apply the just-edited row keeps focus.
+
+## TODO (next phases)
+
+- S3.3 phase 2b: dropdown for BW and path-hash-size.
+- S3.3 phase 2c: numeric keyboard entry for frequency.
+- S3.3 phase 2d: region scope picker (reads / writes RegionMap).
+- S3.3 phase 2e: duty-cycle indicator (likely top header, next to battery).
+- S3.4: channel list + message history viewer.
+- S3.5: contact list (heard adverts).

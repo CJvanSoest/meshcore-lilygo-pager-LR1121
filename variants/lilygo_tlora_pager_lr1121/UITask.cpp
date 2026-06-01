@@ -46,11 +46,16 @@ static lv_obj_t* s_subscreen_body;
 static lv_obj_t* s_radio_list;
 static lv_group_t* s_group;          // carousel tiles
 static lv_group_t* s_radio_group;    // Radio settings list rows
+static lv_group_t* s_edit_group;     // edit popup widget
+static lv_obj_t*   s_edit_popup;     // dark backdrop + content
+static lv_obj_t*   s_edit_title;
+static lv_obj_t*   s_edit_widget;    // spinbox / switch / etc.
 static int s_active_tile = -1;
+static int s_editing_idx = -1;       // which radio row is being edited (-1 = none)
 
 // Forward declarations of helpers that touch NodePrefs (kept inside the
 // file but referenced from event callbacks).
-static void radio_list_populate(NodePrefs* p);
+static void radio_list_populate(NodePrefs* p, int focus_row = 0);
 static void radio_item_clicked(lv_event_t* e);
 static void back_long_press_event(lv_event_t* e);
 extern "C" void ui_apply_radio_changes() __attribute__((weak));
@@ -147,11 +152,17 @@ static void leave_subscreen() {
 // Populate the Radio sub-screen list with current NodePrefs values. Two
 // labels per row (label column + right-aligned value column) so the
 // values line up neatly under each other regardless of font width.
-static void radio_list_populate(NodePrefs* p) {
+//
+// 'focus_row' (default 0) is the row that gets the encoder focus after
+// repopulation — pass the last-edited index when called from an apply
+// path so the user stays on the row they just changed.
+static void radio_list_populate(NodePrefs* p, int focus_row) {
   if (!s_radio_list || !p) return;
 
   lv_obj_clean(s_radio_list);
   if (s_radio_group) lv_group_remove_all_objs(s_radio_group);
+  lv_obj_t* first_row = nullptr;
+  lv_obj_t* target_row = nullptr;
 
   static const char* LABELS[] = {
     "Freq",       // MHz
@@ -204,13 +215,91 @@ static void radio_list_populate(NodePrefs* p) {
                         (void*)(intptr_t)i);
     lv_obj_add_event_cb(row, back_long_press_event, LV_EVENT_LONG_PRESSED, NULL);
     if (s_radio_group) lv_group_add_obj(s_radio_group, row);
+    if (i == 0) first_row = row;
+    if (i == focus_row) target_row = row;
   }
+  // Ensure something is focused so the first click immediately registers
+  // on the row under the cursor — and after a re-populate we want to land
+  // back on the row the user just edited.
+  lv_obj_t* focus_to = target_row ? target_row : first_row;
+  if (focus_to) lv_group_focus_obj(focus_to);
 }
 
-static void radio_item_clicked(lv_event_t* /*e*/) {
-  // S3.3 phase 1 placeholder — item editing comes next iteration. For now
-  // just acknowledge so we know clicks reach the list rows.
-  Serial.println("Radio item clicked (edit-mode: TODO)");
+// ---------- Edit popup -------------------------------------------------------
+
+static void close_edit_popup_apply() {
+  if (s_editing_idx < 0) return;
+  NodePrefs* p = s_self ? s_self->getPrefs() : nullptr;
+  if (!p) return;
+
+  switch (s_editing_idx) {
+    case 1: p->sf = lv_spinbox_get_value(s_edit_widget); break;
+    case 3: p->cr = lv_spinbox_get_value(s_edit_widget); break;
+    case 4: p->tx_power_dbm = (int8_t)lv_spinbox_get_value(s_edit_widget); break;
+    default: break;
+  }
+
+  int idx_was = s_editing_idx;
+  if (ui_apply_radio_changes) ui_apply_radio_changes();
+
+  lv_obj_add_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (s_edit_group) lv_group_set_editing(s_edit_group, false);
+  if (s_radio_group) lv_group_set_editing(s_radio_group, false);
+  if (enc && s_radio_group) lv_indev_set_group(enc, s_radio_group);
+  s_editing_idx = -1;
+  radio_list_populate(p, idx_was);   // restores focus on the row just edited
+}
+
+static void radio_item_clicked(lv_event_t* e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  NodePrefs* p = s_self ? s_self->getPrefs() : nullptr;
+  if (!p) return;
+
+  // RX boost (idx 5) — toggle inline, no popup.
+  if (idx == 5) {
+    p->rx_boosted_gain = !p->rx_boosted_gain;
+    if (ui_apply_radio_changes) ui_apply_radio_changes();
+    radio_list_populate(p, 5);
+    return;
+  }
+
+  // Only the integer rows have a spinbox editor in S3.3 phase 2a — others
+  // (freq, BW, region…) get their editors in subsequent phases.
+  bool supported = (idx == 1 || idx == 3 || idx == 4);
+  if (!supported) return;
+
+  s_editing_idx = idx;
+  lv_obj_remove_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
+
+  if (s_edit_widget) { lv_obj_del(s_edit_widget); s_edit_widget = nullptr; }
+  lv_group_remove_all_objs(s_edit_group);
+
+  int min_v = 0, max_v = 100, init = 0, digits = 2;
+  if (idx == 1) { min_v = 5;  max_v = 12; init = p->sf;           digits = 2; lv_label_set_text(s_edit_title, "Spreading Factor (SF)"); }
+  if (idx == 3) { min_v = 5;  max_v = 8;  init = p->cr;           digits = 1; lv_label_set_text(s_edit_title, "Coding Rate (CR)"); }
+  if (idx == 4) { min_v = -9; max_v = 22; init = p->tx_power_dbm; digits = 2; lv_label_set_text(s_edit_title, "TX Power (dBm)"); }
+
+  s_edit_widget = lv_spinbox_create(s_edit_popup);
+  lv_obj_set_width(s_edit_widget, 120);
+  lv_spinbox_set_range(s_edit_widget, min_v, max_v);
+  lv_spinbox_set_digit_format(s_edit_widget, digits, 0);
+  lv_spinbox_set_value(s_edit_widget, init);
+  // NOTE: leave the step at 1 (the default) — lv_spinbox_step_prev would
+  // bump it to tens and the encoder would jump 5 → 12 → 5.
+  lv_obj_align(s_edit_widget, LV_ALIGN_CENTER, 0, 0);
+
+  lv_obj_add_event_cb(s_edit_widget, [](lv_event_t*) {
+    close_edit_popup_apply();
+  }, LV_EVENT_CLICKED, nullptr);
+
+  lv_group_add_obj(s_edit_group, s_edit_widget);
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (enc) {
+    lv_indev_set_group(enc, s_edit_group);
+    lv_group_focus_obj(s_edit_widget);
+    lv_group_set_editing(s_edit_group, true);   // encoder rotates value
+  }
 }
 
 static bool s_in_subscreen = false;
@@ -321,7 +410,7 @@ static void build_ui() {
 
   // Footer hint
   lv_obj_t* hint = lv_label_create(s_root);
-  lv_label_set_text(hint, "rotate: scroll   click: open   long: back");
+  lv_label_set_text(hint, "rotate: scroll  click/dbl-click: open  long: back");
   lv_obj_set_style_text_color(hint, lv_color_hex(0x707880), 0);
   lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -4);
 
@@ -359,6 +448,29 @@ static void build_ui() {
   lv_obj_add_flag(s_radio_list, LV_OBJ_FLAG_HIDDEN);
 
   s_radio_group = lv_group_create();
+
+  // Edit popup (overlay) — hidden by default, shown by radio_item_clicked.
+  s_edit_popup = lv_obj_create(scr);
+  lv_obj_set_size(s_edit_popup, lv_pct(80), 130);
+  lv_obj_center(s_edit_popup);
+  lv_obj_set_style_bg_color(s_edit_popup, lv_color_hex(0x1c2530), 0);
+  lv_obj_set_style_border_width(s_edit_popup, 2, 0);
+  lv_obj_set_style_border_color(s_edit_popup, lv_color_hex(0xFAA61A), 0);
+  lv_obj_set_style_radius(s_edit_popup, 8, 0);
+  lv_obj_set_style_text_color(s_edit_popup, lv_color_hex(0xffffff), 0);
+  lv_obj_add_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
+
+  s_edit_title = lv_label_create(s_edit_popup);
+  lv_label_set_text(s_edit_title, "");
+  lv_obj_set_style_text_color(s_edit_title, lv_color_hex(0xFAA61A), 0);
+  lv_obj_align(s_edit_title, LV_ALIGN_TOP_MID, 0, 4);
+
+  lv_obj_t* edit_hint = lv_label_create(s_edit_popup);
+  lv_label_set_text(edit_hint, "rotate to change, click to save");
+  lv_obj_set_style_text_color(edit_hint, lv_color_hex(0x707880), 0);
+  lv_obj_align(edit_hint, LV_ALIGN_BOTTOM_MID, 0, -4);
+
+  s_edit_group = lv_group_create();
 
   lv_obj_t* back_hint = lv_label_create(s_subscreen_root);
   lv_label_set_text(back_hint, LV_SYMBOL_LEFT "  long-press to return");
@@ -454,11 +566,19 @@ void UITask::loop() {
     } else {
       unsigned long held = millis() - s_btn_press_at;
       tpager_lvgl_encoder_pressed(false);
-      if (held >= 600 && s_in_subscreen) {
-        Serial.println("LONG_PRESS → leave subscreen");
-        leave_subscreen();
-        s_in_subscreen = false;
-        s_skip_next_click = true;
+      if (held >= 600) {
+        if (s_editing_idx >= 0) {
+          // Cancel edit popup without applying.
+          lv_obj_add_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
+          lv_indev_t* enc2 = tpager_lvgl_get_encoder();
+          if (enc2 && s_radio_group) lv_indev_set_group(enc2, s_radio_group);
+          s_editing_idx = -1;
+          s_skip_next_click = true;
+        } else if (s_in_subscreen) {
+          leave_subscreen();
+          s_in_subscreen = false;
+          s_skip_next_click = true;
+        }
       }
     }
     _auto_off = millis() + AUTO_OFF_MILLIS;
