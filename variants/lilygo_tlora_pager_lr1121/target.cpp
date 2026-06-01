@@ -6,6 +6,7 @@
 TLoraPagerBoard board;
 
 #ifdef DISPLAY_CLASS
+  LGFX_TPager tpager_lgfx_panel;
   DISPLAY_CLASS display;
   #ifndef USER_BTN_LONG_PRESS_MS
     #define USER_BTN_LONG_PRESS_MS 1000

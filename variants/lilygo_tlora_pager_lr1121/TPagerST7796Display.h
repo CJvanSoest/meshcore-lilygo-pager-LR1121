@@ -75,12 +75,14 @@ public:
   }
 };
 
+// Singleton panel so LVGL and MeshCore's DisplayDriver can both reach it.
+extern LGFX_TPager tpager_lgfx_panel;
+
 // LGFXDisplay::begin() applies setRotation(1) which swaps the panel axes —
 // combined with our offset_rotation=2 the effective view is landscape
 // 480 wide x 222 tall. The sprite dimensions must match that, otherwise
 // UI_ZOOM scaling clips off-screen.
 class TPagerST7796Display : public LGFXDisplay {
-  LGFX_TPager disp;
 public:
-  TPagerST7796Display() : LGFXDisplay(480, 222, disp) {}
+  TPagerST7796Display() : LGFXDisplay(480, 222, tpager_lgfx_panel) {}
 };
