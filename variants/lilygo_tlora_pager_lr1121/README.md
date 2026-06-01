@@ -6,6 +6,18 @@ this folder also covers the rest of the on-board hardware (ST7796 IPS
 display, TCA8418 keyboard, rotary encoder, AXP-style PMU, BQ27220 fuel
 gauge, MicroNMEA GPS, XL9555 IO expander).
 
+## Powering the device on and off
+
+* **Power on:** the small dedicated power button on the side of the
+  Pager (the one between the antennas) — same as the LilyGo factory
+  firmware.
+* **Power off:** hold the **encoder / scroll button for ≥ 3 seconds**.
+  We pull the system rail down via the BQ25896 charger's BATFET_DIS
+  bit (`tpager_power_off()` in `target.cpp`, mirrors
+  `XPowersLib::PowersBQ25896::shutdown()`).
+* The 600 ms encoder hold is reserved for the "back" gesture inside
+  the LVGL UI. Only ≥ 3 s actually powers the device down.
+
 ## Build environments
 
 | env name | purpose | based on |
