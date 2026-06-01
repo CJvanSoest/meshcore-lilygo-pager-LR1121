@@ -110,6 +110,15 @@ void UITask::renderCurrScreen() {
       _display->print(tmp);
     }
 #endif
+
+    // Variant-defined extra status lines (weak symbol — default no-op).
+    // The variant's target.cpp may override this to draw RSSI/SNR, battery,
+    // GPS, etc. without touching shared UITask code.
+    extern void render_extra_status_lines(DisplayDriver* d, int start_y)
+      __attribute__((weak));
+    if (render_extra_status_lines && _display->height() >= 90) {
+      render_extra_status_lines(_display, 70);
+    }
   }
 }
 

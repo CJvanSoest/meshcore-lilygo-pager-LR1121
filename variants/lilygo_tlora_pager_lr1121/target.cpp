@@ -79,6 +79,16 @@ void TLoraPagerBoard::begin() {
   // Bring up I2C on the LilyGo T-Pager bus (SDA=3, SCL=2 per LilyGoLib pinmap)
   Wire.begin(PIN_BOARD_SDA, PIN_BOARD_SCL);
 
+  // One-time I2C bus scan to verify which devices respond. Useful for
+  // diagnosing BQ27220 / XL9555 wiring issues.
+  Serial.println("I2C scan:");
+  for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("  found 0x%02X\n", addr);
+    }
+  }
+
   // Enable LoRa power rail via XL9555 expander pin 3 (EXPANDS_LORA_EN)
   // Without this, the LR1121 is unpowered and radio_init() will fail.
   if (!xl9555_set_output(3, true)) {
@@ -135,4 +145,66 @@ void radio_set_tx_power(int8_t dbm) {
 mesh::LocalIdentity radio_new_identity() {
   RadioNoiseListener rng(radio);
   return mesh::LocalIdentity(&rng);
+}
+
+// --- BQ27220 fuel gauge (minimal I2C read of State Of Charge register) ---
+#ifndef BQ27220_I2C_ADDR
+  #define BQ27220_I2C_ADDR 0x55
+#endif
+#define BQ27220_REG_SOC 0x2C  // State Of Charge, 2 bytes, 0..100 %
+                              // (0x1C is StandbyTimeToEmpty — common confusion)
+
+static int read_battery_percent() {
+  // BQ27220 uses STOP-between-write-and-read (not repeated start) — pass
+  // endTransmission(true), then requestFrom in a fresh transaction.
+  Wire.beginTransmission(BQ27220_I2C_ADDR);
+  Wire.write(BQ27220_REG_SOC);
+  uint8_t err = Wire.endTransmission(true);
+  if (err != 0) return -1000 - err;   // negative debug marker
+  if (Wire.requestFrom(BQ27220_I2C_ADDR, (uint8_t)2) != 2) return -2000;
+  uint8_t lo = Wire.read();
+  uint8_t hi = Wire.read();
+  return (int)((hi << 8) | lo);
+}
+
+// --- Variant status hook (called from UITask::renderCurrScreen home-screen) ---
+#include <helpers/ui/DisplayDriver.h>
+extern WRAPPER_CLASS radio_driver;
+
+void render_extra_status_lines(DisplayDriver* d, int start_y) {
+  char tmp[40];
+  d->setColor(DisplayDriver::LIGHT);
+
+  // RX RSSI / SNR of the last received packet
+  d->setCursor(0, start_y);
+  sprintf(tmp, "RX: %d dBm / %d dB",
+          (int)radio_driver.getLastRSSI(),
+          (int)radio_driver.getLastSNR());
+  d->print(tmp);
+
+  // Battery percentage (BQ27220 fuel gauge)
+  int bat = read_battery_percent();
+  d->setCursor(0, start_y + 10);
+  if (bat >= 0 && bat <= 100) {
+    sprintf(tmp, "BAT: %d %%", bat);
+  } else if (bat > 100) {
+    sprintf(tmp, "BAT: raw %d", bat);  // device responded but value out of 0..100
+  } else {
+    sprintf(tmp, "BAT: err %d", bat);  // I2C-level error
+  }
+  d->print(tmp);
+
+  // GPS fix + coordinates (only when valid)
+#if ENV_INCLUDE_GPS
+  extern MicroNMEALocationProvider nmea;
+  d->setCursor(0, start_y + 20);
+  if (nmea.isValid()) {
+    float lat = nmea.getLatitude() / 1000000.0f;
+    float lon = nmea.getLongitude() / 1000000.0f;
+    sprintf(tmp, "GPS: %.4f, %.4f", lat, lon);
+  } else {
+    sprintf(tmp, "GPS: -- (%ld sat)", (long)nmea.satellitesCount());
+  }
+  d->print(tmp);
+#endif
 }
