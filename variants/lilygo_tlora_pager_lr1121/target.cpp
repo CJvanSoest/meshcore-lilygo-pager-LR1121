@@ -239,6 +239,26 @@ mesh::LocalIdentity radio_new_identity() {
                                   // (0x1C is StandbyTimeToEmpty — common confusion)
 #define BQ27220_REG_VOLTAGE 0x08  // Voltage, 2 bytes, mV
 
+#define BQ25896_I2C_ADDR 0x6B
+#define BQ25896_REG_09H  0x09     // BATFET_DIS bit 5 — set to shut down.
+
+// Pull power rail down via the BQ25896 battery charger. Mirrors what
+// XPowersLib::PowersBQ25896::shutdown() does: read REG09, set BATFET_DIS,
+// write back. The chip kills the system rail immediately.
+extern "C" void tpager_power_off() {
+  Wire.beginTransmission(BQ25896_I2C_ADDR);
+  Wire.write(BQ25896_REG_09H);
+  if (Wire.endTransmission(true) != 0) return;
+  Wire.requestFrom(BQ25896_I2C_ADDR, (uint8_t)1);
+  if (!Wire.available()) return;
+  uint8_t val = Wire.read();
+  val |= (1 << 5);
+  Wire.beginTransmission(BQ25896_I2C_ADDR);
+  Wire.write(BQ25896_REG_09H);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
 static int read_bq27220_word(uint8_t reg) {
   Wire.beginTransmission(BQ27220_I2C_ADDR);
   Wire.write(reg);

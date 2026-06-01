@@ -58,6 +58,8 @@ static int s_editing_idx = -1;       // which radio row is being edited (-1 = no
 static void radio_list_populate(NodePrefs* p, int focus_row = 0);
 static void radio_item_clicked(lv_event_t* e);
 static void back_long_press_event(lv_event_t* e);
+
+extern "C" void tpager_power_off() __attribute__((weak));
 extern "C" void ui_apply_radio_changes() __attribute__((weak));
 
 static int s_last_enc_a = HIGH;
@@ -410,7 +412,7 @@ static void build_ui() {
 
   // Footer hint
   lv_obj_t* hint = lv_label_create(s_root);
-  lv_label_set_text(hint, "rotate: scroll   click: open   long: back");
+  lv_label_set_text(hint, "rotate: scroll   click: open   long: back   3s: power off");
   lv_obj_set_style_text_color(hint, lv_color_hex(0x707880), 0);
   lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -4);
 
@@ -566,7 +568,13 @@ void UITask::loop() {
     } else {
       unsigned long held = millis() - s_btn_press_at;
       tpager_lvgl_encoder_pressed(false);
-      if (held >= 600) {
+      // Very long press (≥3 s) from anywhere triggers a clean power-off
+      // via the BQ25896 BATFET_DIS bit — matches the LilyGo / Ripple
+      // factory behaviour when the dedicated power button is held.
+      if (held >= 3000 && tpager_power_off) {
+        Serial.println("VERY_LONG_PRESS → tpager_power_off()");
+        tpager_power_off();
+      } else if (held >= 600) {
         if (s_editing_idx >= 0) {
           // Cancel edit popup without applying.
           lv_obj_add_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
