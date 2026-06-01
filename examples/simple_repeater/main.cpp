@@ -13,6 +13,13 @@ SimpleMeshTables tables;
 
 MyMesh the_mesh(board, radio_driver, *new ArduinoMillis(), fast_rng, rtc_clock, tables);
 
+// Bridge so variant UI code can show the configured region without
+// depending on MyMesh internals. The symbol is picked up by variants
+// via a __attribute__((weak)) declaration in their target.cpp.
+extern "C" const char* mesh_home_region_name() {
+  return the_mesh.getHomeRegionName();
+}
+
 void halt() {
   while (1) ;
 }

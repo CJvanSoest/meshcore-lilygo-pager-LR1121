@@ -178,6 +178,14 @@ protected:
 public:
   MyMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::MillisecondClock& ms, mesh::RNG& rng, mesh::RTCClock& rtc, mesh::MeshTables& tables);
 
+  // Configured home-region name (e.g. "nl", "nl-ge", "de", "uk-lon"), or
+  // nullptr when no home region is set. Safe to call from UI code without
+  // exposing the RegionMap internals.
+  const char* getHomeRegionName() {
+    auto* h = region_map.getHomeRegion();
+    return (h && h->name[0]) ? h->name : nullptr;
+  }
+
   void begin(FILESYSTEM* fs);
   void sendNodeDiscoverReq();
   const char* getFirmwareVer() override { return FIRMWARE_VERSION; }

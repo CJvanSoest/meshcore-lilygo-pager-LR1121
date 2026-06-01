@@ -44,8 +44,20 @@ void UITask::begin(NodePrefs* node_prefs, const char* build_date, const char* fi
   sprintf(_version_info, "%s (%s)", version, build_date);
 }
 
+// Forward declaration of the optional 'About' screen renderer used when
+// _current_screen == 1. Lives further down in this file so renderCurrScreen
+// stays readable.
+static void renderAboutScreen(DisplayDriver* d, const char* version_info);
+
 void UITask::renderCurrScreen() {
   char tmp[80];
+
+  // Non-home screens skip the boot/home logic entirely.
+  if (_current_screen == 1) {
+    renderAboutScreen(_display, _version_info);
+    return;
+  }
+
   if (millis() < BOOT_SCREEN_MILLIS) { // boot screen
     // meshcore logo
     _display->setColor(DisplayDriver::BLUE);
@@ -101,23 +113,13 @@ void UITask::renderCurrScreen() {
       _display->print(tmp);
     }
 
-    // region scope — variant-configured via -D STATUS_REGION
-#ifdef STATUS_REGION
-    if (_display->height() >= 70) {
-      _display->setCursor(0, 60);
-      _display->setColor(DisplayDriver::LIGHT);
-      sprintf(tmp, "RGN: %s", STATUS_REGION);
-      _display->print(tmp);
-    }
-#endif
-
     // Variant-defined extra status lines (weak symbol — default no-op).
-    // The variant's target.cpp may override this to draw RSSI/SNR, battery,
-    // GPS, etc. without touching shared UITask code.
+    // The variant's target.cpp may override this to draw RGN, RSSI/SNR,
+    // battery, GPS, etc. without touching shared UITask code.
     extern void render_extra_status_lines(DisplayDriver* d, int start_y)
       __attribute__((weak));
-    if (render_extra_status_lines && _display->height() >= 90) {
-      render_extra_status_lines(_display, 70);
+    if (render_extra_status_lines && _display->height() >= 70) {
+      render_extra_status_lines(_display, 60);
     }
   }
 }
@@ -129,7 +131,9 @@ void UITask::loop() {
     if (btnState != _prevBtnState) {
       if (btnState == USER_BTN_PRESSED) {  // pressed?
         if (_display->isOn()) {
-          // TODO: any action ?
+          // Cycle to the next screen (boards with NUM_SCREENS > 1).
+          _current_screen = (_current_screen + 1) % NUM_SCREENS;
+          _next_refresh = 0;  // force immediate redraw
         } else {
           _display->turnOn();
         }
@@ -153,4 +157,43 @@ void UITask::loop() {
       _display->turnOff();
     }
   }
+}
+
+// --- Optional 'About' screen --------------------------------------------------
+//
+// Renders firmware version, MAC address and free heap. Only used when a
+// variant defines NUM_SCREENS > 1 and the user has cycled past the home
+// screen via the PIN_USER_BTN.
+
+#ifdef ESP_PLATFORM
+#include <esp_mac.h>
+#endif
+
+static void renderAboutScreen(DisplayDriver* d, const char* version_info) {
+  char tmp[64];
+  d->setColor(DisplayDriver::LIGHT);
+  d->setTextSize(1);
+
+  d->setCursor(0, 0);
+  d->print("About");
+
+  d->setCursor(0, 12);
+  d->print(version_info);
+
+#ifdef ESP_PLATFORM
+  uint8_t mac[6] = {0};
+  esp_efuse_mac_get_default(mac);
+  d->setCursor(0, 24);
+  sprintf(tmp, "MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  d->print(tmp);
+
+  d->setCursor(0, 36);
+  sprintf(tmp, "HEAP: %u KB", (unsigned)(ESP.getFreeHeap() / 1024));
+  d->print(tmp);
+
+  d->setCursor(0, 48);
+  sprintf(tmp, "FLASH: %u MB", (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)));
+  d->print(tmp);
+#endif
 }

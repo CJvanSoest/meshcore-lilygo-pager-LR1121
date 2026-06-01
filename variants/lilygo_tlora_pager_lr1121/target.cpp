@@ -76,6 +76,11 @@ static bool xl9555_set_output(uint8_t pin, bool high) {
 void TLoraPagerBoard::begin() {
   ESP32Board::begin();
 
+  // Encoder push button (ROTARY_C, GPIO 7) — active-low with internal pull-up.
+#ifdef PIN_USER_BTN
+  pinMode(PIN_USER_BTN, INPUT_PULLUP);
+#endif
+
   // Bring up I2C on the LilyGo T-Pager bus (SDA=3, SCL=2 per LilyGoLib pinmap)
   Wire.begin(PIN_BOARD_SDA, PIN_BOARD_SCL);
 
@@ -171,33 +176,51 @@ static int read_battery_percent() {
 #include <helpers/ui/DisplayDriver.h>
 extern WRAPPER_CLASS radio_driver;
 
+// Weak bridge — defined by the active mesh-example's main.cpp (e.g.
+// simple_repeater) which can see the_mesh and its RegionMap. Null when
+// the example doesn't provide one (e.g. companion_radio), in which case
+// the RGN line is skipped.
+extern "C" const char* mesh_home_region_name() __attribute__((weak));
+
 void render_extra_status_lines(DisplayDriver* d, int start_y) {
   char tmp[40];
   d->setColor(DisplayDriver::LIGHT);
+  int y = start_y;
+
+  // Region — read live from the active mesh's RegionMap home_id.
+  if (mesh_home_region_name) {
+    const char* rgn = mesh_home_region_name();
+    d->setCursor(0, y);
+    sprintf(tmp, "RGN: %s", rgn ? rgn : "(none)");
+    d->print(tmp);
+    y += 10;
+  }
 
   // RX RSSI / SNR of the last received packet
-  d->setCursor(0, start_y);
+  d->setCursor(0, y);
   sprintf(tmp, "RX: %d dBm / %d dB",
           (int)radio_driver.getLastRSSI(),
           (int)radio_driver.getLastSNR());
   d->print(tmp);
+  y += 10;
 
   // Battery percentage (BQ27220 fuel gauge)
   int bat = read_battery_percent();
-  d->setCursor(0, start_y + 10);
+  d->setCursor(0, y);
   if (bat >= 0 && bat <= 100) {
     sprintf(tmp, "BAT: %d %%", bat);
   } else if (bat > 100) {
-    sprintf(tmp, "BAT: raw %d", bat);  // device responded but value out of 0..100
+    sprintf(tmp, "BAT: raw %d", bat);
   } else {
-    sprintf(tmp, "BAT: err %d", bat);  // I2C-level error
+    sprintf(tmp, "BAT: err %d", bat);
   }
   d->print(tmp);
+  y += 10;
 
   // GPS fix + coordinates (only when valid)
 #if ENV_INCLUDE_GPS
   extern MicroNMEALocationProvider nmea;
-  d->setCursor(0, start_y + 20);
+  d->setCursor(0, y);
   if (nmea.isValid()) {
     float lat = nmea.getLatitude() / 1000000.0f;
     float lon = nmea.getLongitude() / 1000000.0f;
