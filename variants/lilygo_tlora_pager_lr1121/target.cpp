@@ -7,6 +7,10 @@ TLoraPagerBoard board;
 
 #ifdef DISPLAY_CLASS
   DISPLAY_CLASS display;
+  #ifndef USER_BTN_LONG_PRESS_MS
+    #define USER_BTN_LONG_PRESS_MS 1000
+  #endif
+  MomentaryButton user_btn(PIN_USER_BTN, USER_BTN_LONG_PRESS_MS, true);
 #endif
 
 static SPIClass spi;
