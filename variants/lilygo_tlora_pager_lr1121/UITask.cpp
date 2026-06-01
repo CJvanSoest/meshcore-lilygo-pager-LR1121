@@ -43,10 +43,21 @@ static lv_obj_t* s_title_label;
 static lv_obj_t* s_subscreen_root;
 static lv_obj_t* s_subscreen_title;
 static lv_obj_t* s_subscreen_body;
-static lv_group_t* s_group;
+static lv_obj_t* s_radio_list;
+static lv_group_t* s_group;          // carousel tiles
+static lv_group_t* s_radio_group;    // Radio settings list rows
+static int s_active_tile = -1;
+
+// Forward declarations of helpers that touch NodePrefs (kept inside the
+// file but referenced from event callbacks).
+static void radio_list_populate(NodePrefs* p);
+static void radio_item_clicked(lv_event_t* e);
+static void back_long_press_event(lv_event_t* e);
+extern "C" void ui_apply_radio_changes() __attribute__((weak));
 
 static int s_last_enc_a = HIGH;
 static int s_prev_btn = HIGH;
+static bool s_skip_next_click = false;
 static unsigned long s_btn_press_at = 0;
 static bool s_lvgl_ready = false;
 static unsigned long s_next_tick = 0;
@@ -80,25 +91,38 @@ static void init_styles() {
 // ---------- Sub-screen for a clicked tile -----------------------------------
 
 static void enter_subscreen(int idx) {
+  s_active_tile = idx;
   // Hide carousel, show subscreen container with content for the tile.
   lv_obj_add_flag(s_root, LV_OBJ_FLAG_HIDDEN);
   lv_obj_remove_flag(s_subscreen_root, LV_OBJ_FLAG_HIDDEN);
   lv_label_set_text(s_subscreen_title, TILES[idx].title);
 
+  // Default: simple body label visible, radio list hidden.
+  lv_obj_remove_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
+  if (s_radio_list) lv_obj_add_flag(s_radio_list, LV_OBJ_FLAG_HIDDEN);
+
+  // Default: encoder drives carousel group (will switch for Radio below).
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+
   char body[160];
   body[0] = 0;
   switch (idx) {
-    case 0:   // Radio — defer real values until UITask::loop refreshes
-      snprintf(body, sizeof(body), "%s\n\nstatus loading...", FIRMWARE_VERSION);
-      break;
+    case 0: {  // Radio — populate the live settings list
+      lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
+      if (s_radio_list) lv_obj_remove_flag(s_radio_list, LV_OBJ_FLAG_HIDDEN);
+      if (s_self && s_self->getPrefs()) radio_list_populate(s_self->getPrefs());
+      if (enc && s_radio_group) lv_indev_set_group(enc, s_radio_group);
+      return;   // skip the generic label assignment below
+    }
     case 1:
-      snprintf(body, sizeof(body), "Unread: %d\n\n(channel list comes in S3.4)", s_self ? s_self->getMsgCount() : 0);
+      snprintf(body, sizeof(body), "Unread: %d\n\n(channel list: S3.4)",
+               s_self ? s_self->getMsgCount() : 0);
       break;
     case 2:
       snprintf(body, sizeof(body), "GPS view\n\n(coords + sat count: S3.4)");
       break;
     case 3:
-      snprintf(body, sizeof(body), "Settings\n\n(editable list: S3.3)");
+      snprintf(body, sizeof(body), "Settings\n\n(global editable list later)");
       break;
     case 4:
       snprintf(body, sizeof(body), "Contacts\n\n(heard nodes: S3.5)");
@@ -112,16 +136,105 @@ static void enter_subscreen(int idx) {
 }
 
 static void leave_subscreen() {
+  // Restore carousel + its encoder group.
   lv_obj_add_flag(s_subscreen_root, LV_OBJ_FLAG_HIDDEN);
   lv_obj_remove_flag(s_root, LV_OBJ_FLAG_HIDDEN);
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (enc && s_group) lv_indev_set_group(enc, s_group);
+  s_active_tile = -1;
+}
+
+// Populate the Radio sub-screen list with current NodePrefs values. Two
+// labels per row (label column + right-aligned value column) so the
+// values line up neatly under each other regardless of font width.
+static void radio_list_populate(NodePrefs* p) {
+  if (!s_radio_list || !p) return;
+
+  lv_obj_clean(s_radio_list);
+  if (s_radio_group) lv_group_remove_all_objs(s_radio_group);
+
+  static const char* LABELS[] = {
+    "Freq",       // MHz
+    "SF",
+    "BW",         // kHz
+    "CR",
+    "TX power",   // dBm
+    "RX boost",
+  };
+  static const char* UNITS[]  = { " MHz", "", " kHz", "", " dBm", "" };
+  char val[24];
+
+  for (int i = 0; i < 6; i++) {
+    switch (i) {
+      case 0: snprintf(val, sizeof(val), "%.3f", p->freq); break;
+      case 1: snprintf(val, sizeof(val), "%d", p->sf); break;
+      case 2: snprintf(val, sizeof(val), "%.2f", p->bw); break;
+      case 3: snprintf(val, sizeof(val), "%d", p->cr); break;
+      case 4: snprintf(val, sizeof(val), "%d", p->tx_power_dbm); break;
+      case 5: snprintf(val, sizeof(val), "%s", p->rx_boosted_gain ? "on" : "off"); break;
+    }
+    char value_text[32];
+    snprintf(value_text, sizeof(value_text), "%s%s", val, UNITS[i]);
+
+    lv_obj_t* row = lv_obj_create(s_radio_list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), 24);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_pad_hor(row, 8, 0);
+    lv_obj_set_style_pad_ver(row, 2, 0);
+    lv_obj_set_style_radius(row, 4, 0);
+    lv_obj_set_style_margin_bottom(row, 2, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                                LV_FLEX_ALIGN_CENTER,
+                                LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+
+    lv_obj_t* lbl = lv_label_create(row);
+    lv_label_set_text(lbl, LABELS[i]);
+
+    lv_obj_t* vlb = lv_label_create(row);
+    lv_label_set_text(vlb, value_text);
+
+    lv_obj_add_event_cb(row, radio_item_clicked, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)i);
+    lv_obj_add_event_cb(row, back_long_press_event, LV_EVENT_LONG_PRESSED, NULL);
+    if (s_radio_group) lv_group_add_obj(s_radio_group, row);
+  }
+}
+
+static void radio_item_clicked(lv_event_t* /*e*/) {
+  // S3.3 phase 1 placeholder — item editing comes next iteration. For now
+  // just acknowledge so we know clicks reach the list rows.
+  Serial.println("Radio item clicked (edit-mode: TODO)");
 }
 
 static bool s_in_subscreen = false;
 
 static void tile_clicked_event(lv_event_t* e) {
   int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  Serial.printf("CLICK tile %d (skip=%d, in_sub=%d)\n", idx, s_skip_next_click, s_in_subscreen);
+  if (s_skip_next_click) { s_skip_next_click = false; return; }
   enter_subscreen(idx);
   s_in_subscreen = true;
+}
+
+// LVGL fires CLICKED on release *after* LONG_PRESSED — we use the global
+// s_skip_next_click flag (declared near the top of the file) so the
+// carousel tile under the focus doesn't immediately re-open.
+//
+// Long-press on anything inside the sub-screen returns to the carousel.
+static void back_long_press_event(lv_event_t* /*e*/) {
+  Serial.printf("LONG_PRESS (in_sub=%d)\n", s_in_subscreen);
+  if (s_in_subscreen) {
+    leave_subscreen();
+    s_in_subscreen = false;
+    s_skip_next_click = true;
+  }
 }
 
 // ---------- UI construction --------------------------------------------------
@@ -232,6 +345,21 @@ static void build_ui() {
   lv_label_set_long_mode(s_subscreen_body, LV_LABEL_LONG_WRAP);
   lv_obj_align(s_subscreen_body, LV_ALIGN_TOP_LEFT, 6, 28);
 
+  // Radio settings list — plain container with custom 2-column rows so the
+  // value column lines up. Built once, hidden by default, repopulated on
+  // every sub-screen entry.
+  s_radio_list = lv_obj_create(s_subscreen_root);
+  lv_obj_remove_style_all(s_radio_list);
+  lv_obj_set_size(s_radio_list, lv_pct(96), lv_pct(75));
+  lv_obj_align(s_radio_list, LV_ALIGN_TOP_LEFT, 6, 24);
+  lv_obj_set_flex_flow(s_radio_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_bg_color(s_radio_list, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_pad_all(s_radio_list, 2, 0);
+  lv_obj_set_scroll_dir(s_radio_list, LV_DIR_VER);
+  lv_obj_add_flag(s_radio_list, LV_OBJ_FLAG_HIDDEN);
+
+  s_radio_group = lv_group_create();
+
   lv_obj_t* back_hint = lv_label_create(s_subscreen_root);
   lv_label_set_text(back_hint, LV_SYMBOL_LEFT "  long-press to return");
   lv_obj_set_style_text_color(back_hint, lv_color_hex(0x707880), 0);
@@ -302,8 +430,11 @@ void UITask::loop() {
     s_quad_accum += QUAD_TABLE[(s_quad_prev << 2) | curr];
     s_quad_prev = curr;
 
-    while (s_quad_accum >= 4)  { tpager_lvgl_encoder_delta(+1); s_quad_accum -= 4; }
-    while (s_quad_accum <= -4) { tpager_lvgl_encoder_delta(-1); s_quad_accum += 4; }
+    // In a vertical list "rotate up" reading should move the focus up too —
+    // invert the encoder delta while we're not on the horizontal carousel.
+    int sign = s_in_subscreen ? -1 : 1;
+    while (s_quad_accum >= 4)  { tpager_lvgl_encoder_delta(+1 * sign); s_quad_accum -= 4; }
+    while (s_quad_accum <= -4) { tpager_lvgl_encoder_delta(-1 * sign); s_quad_accum += 4; }
 
     _auto_off = millis() + AUTO_OFF_MILLIS;
     if (_display && !_display->isOn()) _display->turnOn();
@@ -311,29 +442,38 @@ void UITask::loop() {
 #endif
 
 #ifdef PIN_USER_BTN
+  // Manual press/release tracking — LVGL's encoder indev does NOT raise
+  // LV_EVENT_LONG_PRESSED on widgets (long-press is reserved for the
+  // edit-mode transition), so we detect a held button here and call
+  // leave_subscreen() directly.
   int btn = digitalRead(PIN_USER_BTN);
   if (btn != s_prev_btn) {
     if (btn == LOW) {
       s_btn_press_at = millis();
+      tpager_lvgl_encoder_pressed(true);
     } else {
       unsigned long held = millis() - s_btn_press_at;
-      if (held >= 800) {
-        // Long press → back to carousel
-        if (s_in_subscreen) { leave_subscreen(); s_in_subscreen = false; }
-        tpager_lvgl_encoder_pressed(false);   // make sure no lingering press
-      } else {
-        // Short click → forward to LVGL (click on focused tile)
-        tpager_lvgl_encoder_pressed(true);
-        // The release we report via the very next read cycle ensures
-        // LVGL sees a complete press→release.
+      tpager_lvgl_encoder_pressed(false);
+      if (held >= 600 && s_in_subscreen) {
+        Serial.println("LONG_PRESS → leave subscreen");
+        leave_subscreen();
+        s_in_subscreen = false;
+        s_skip_next_click = true;
       }
-      _auto_off = millis() + AUTO_OFF_MILLIS;
-      if (_display && !_display->isOn()) _display->turnOn();
     }
+    _auto_off = millis() + AUTO_OFF_MILLIS;
+    if (_display && !_display->isOn()) _display->turnOn();
     s_prev_btn = btn;
-  } else if (btn == HIGH) {
-    tpager_lvgl_encoder_pressed(false);
   }
+  // Drop the skip flag after 1 s to avoid blocking a future legitimate
+  // click if LVGL didn't fire one to consume it.
+  static unsigned long s_skip_set_at = 0;
+  if (s_skip_next_click && s_skip_set_at == 0) s_skip_set_at = millis();
+  if (s_skip_next_click && millis() - s_skip_set_at > 1000) {
+    s_skip_next_click = false;
+    s_skip_set_at = 0;
+  }
+  if (!s_skip_next_click) s_skip_set_at = 0;
 #endif
 
   if (s_lvgl_ready && (long)(millis() - s_next_tick) >= 0) {

@@ -101,6 +101,16 @@ MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store
 
 /* END GLOBAL OBJECTS */
 
+// Bridge: variant UIs (e.g. T-Pager LVGL settings list) call this after
+// editing the NodePrefs in memory to push new radio parameters to the
+// LR1121 and persist the change to SPIFFS.
+extern "C" void ui_apply_radio_changes() {
+  auto* p = the_mesh.getNodePrefs();
+  radio_set_params(p->freq, p->bw, p->sf, p->cr);
+  radio_set_tx_power(p->tx_power_dbm);
+  the_mesh.savePrefs();
+}
+
 void halt() {
   while (1) ;
 }

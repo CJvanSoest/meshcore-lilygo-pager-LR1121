@@ -52,6 +52,10 @@ public:
   void begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* prefs);
   void loop() override;
 
+  // Accessors for variant code outside the class (LVGL event callbacks).
+  NodePrefs* getPrefs() { return _prefs; }
+  DisplayDriver* getDisplay() { return _display; }
+
   // Companion hooks — minimal stubs for now; full behaviour comes later.
   void msgRead(int msgcount) override { _msgcount = msgcount; }
   void newMsg(uint8_t /*path_len*/, const char* /*from*/, const char* /*text*/, int msgcount) override {
