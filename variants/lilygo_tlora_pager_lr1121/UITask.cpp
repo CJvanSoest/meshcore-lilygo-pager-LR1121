@@ -757,54 +757,90 @@ static void open_add_channel_popup() {
 
 // ---------- Chat view (S3.4 step 2/3) ---------------------------------------
 
-// Format ring-buffer entries for the currently-open channel into the
-// history label. Newest at the bottom, oldest first. Each line is
-// either the raw "sender: text" payload from the wire or, for our own
-// sent messages, just "(me): text".
+// Helper — push one chat line into the history spangroup as two coloured
+// segments: a green sender prefix (everything up to and including the
+// first ':') and a light-grey message body (the rest plus a newline).
+// Falls back to a single grey span if the line has no ':' separator.
+static void chat_history_append_line(const char* line) {
+  if (!s_chat_history || !line) return;
+  const char* colon = strchr(line, ':');
+  // Sender = "name: " (include the colon and trailing space) — green.
+  lv_span_t* sp_who = lv_spangroup_new_span(s_chat_history);
+  if (!sp_who) return;
+  if (colon) {
+    char who[40];
+    size_t n = (size_t)(colon - line) + 2;   // include ": "
+    if (n >= sizeof(who)) n = sizeof(who) - 1;
+    memcpy(who, line, n);
+    who[n] = 0;
+    lv_span_set_text(sp_who, who);
+  } else {
+    lv_span_set_text(sp_who, line);
+  }
+  lv_style_set_text_color(&sp_who->style, lv_color_hex(0x55cc66));
+
+  // Message body — light grey.
+  if (colon) {
+    const char* body = colon + 1;
+    while (*body == ' ') body++;
+    char tail[160];
+    int n = snprintf(tail, sizeof(tail), "%s\n", body);
+    (void)n;
+    lv_span_t* sp_msg = lv_spangroup_new_span(s_chat_history);
+    if (sp_msg) {
+      lv_span_set_text(sp_msg, tail);
+      lv_style_set_text_color(&sp_msg->style, lv_color_hex(0xc0c8d0));
+    }
+  } else {
+    lv_span_t* sp_nl = lv_spangroup_new_span(s_chat_history);
+    if (sp_nl) {
+      lv_span_set_text(sp_nl, "\n");
+      lv_style_set_text_color(&sp_nl->style, lv_color_hex(0xc0c8d0));
+    }
+  }
+}
+
+// Format ring-buffer entries for the currently-open chat into the
+// history widget. Newest at the bottom. Each line gets two colored
+// spans: green sender, grey body.
 static void chat_history_render() {
   if (!s_chat_history) return;
-  char out[1200];
-  int oi = 0;
-  out[0] = 0;
+  // Clear all existing spans before rebuilding.
+  while (lv_spangroup_get_span_count(s_chat_history) > 0) {
+    lv_span_t* sp = lv_spangroup_get_child(s_chat_history, 0);
+    if (!sp) break;
+    lv_spangroup_delete_span(s_chat_history, sp);
+  }
 
+  int rendered = 0;
   if (s_dm_mode) {
-    // Pull from the DM ring buffer in main.cpp via the bridge. Messages
-    // are returned oldest-first, prefixed with "(me): " for sent and
-    // "<peer>: " for received so the UI matches the channel chat layout.
     if (ui_get_dm_msg_count && ui_get_dm_msg) {
       int n = ui_get_dm_msg_count(s_dm_pubkey);
       for (int k = 0; k < n; k++) {
         UiDmMsg m;
         if (!ui_get_dm_msg(s_dm_pubkey, k, &m)) break;
         const char* who = m.from_me ? "(me)" : s_dm_peer_name;
-        int rem = (int)sizeof(out) - oi - 2;
-        if (rem <= 0) break;
-        int w = snprintf(&out[oi], rem, "%s: %s\n", who, m.text);
-        if (w < 0) break;
-        oi += (w > rem) ? rem : w;
+        char line[180];
+        snprintf(line, sizeof(line), "%s: %s", who, m.text);
+        chat_history_append_line(line);
+        rendered++;
       }
     }
-  } else {
-    if (s_chat_channel_idx < 0) return;
-    if (!s_chat_ring) return;
-    // Walk the channel ring oldest-to-newest. s_chat_head points at the
-    // next slot to write; s_chat_count says how many entries are populated.
+  } else if (s_chat_channel_idx >= 0 && s_chat_ring) {
     int start = (s_chat_head - s_chat_count + CHAT_RING_SIZE) % CHAT_RING_SIZE;
     for (int n = 0; n < s_chat_count; n++) {
       int i = (start + n) % CHAT_RING_SIZE;
       if (s_chat_ring[i].channel_idx != (uint8_t)s_chat_channel_idx) continue;
-      int rem = (int)sizeof(out) - oi - 2;
-      if (rem <= 0) break;
-      int w = snprintf(&out[oi], rem, "%s\n", s_chat_ring[i].text);
-      if (w < 0) break;
-      oi += (w > rem) ? rem : w;
+      chat_history_append_line(s_chat_ring[i].text);
+      rendered++;
     }
   }
-  if (oi == 0) {
-    lv_label_set_text(s_chat_history, "(no messages yet)");
-  } else {
-    if (oi > 0 && out[oi-1] == '\n') out[oi-1] = 0;
-    lv_label_set_text(s_chat_history, out);
+  if (rendered == 0) {
+    lv_span_t* sp = lv_spangroup_new_span(s_chat_history);
+    if (sp) {
+      lv_span_set_text(sp, "(no messages yet)");
+      lv_style_set_text_color(&sp->style, lv_color_hex(0x707880));
+    }
   }
   lv_obj_scroll_to_y(s_chat_history, INT16_MAX, LV_ANIM_OFF);   // pin to bottom
 }
@@ -1871,11 +1907,14 @@ static void build_ui() {
 
   // Chat-view widgets — history label (top, scrollable) + compose
   // label (bottom). Both hidden until chat_view_open() shows them.
-  s_chat_history = lv_label_create(s_subscreen_root);
+  // Chat history is a spangroup so individual messages can mix colors
+  // (green sender prefix + grey body). Spans are rebuilt by
+  // chat_history_render on every change.
+  s_chat_history = lv_spangroup_create(s_subscreen_root);
   lv_obj_remove_style_all(s_chat_history);
   lv_obj_set_size(s_chat_history, lv_pct(96), lv_pct(60));
   lv_obj_align(s_chat_history, LV_ALIGN_TOP_LEFT, 6, 44);
-  lv_label_set_long_mode(s_chat_history, LV_LABEL_LONG_WRAP);
+  lv_spangroup_set_mode(s_chat_history, LV_SPAN_MODE_BREAK);
   lv_obj_set_style_text_color(s_chat_history, lv_color_hex(0xc0c8d0), 0);
   lv_obj_set_style_bg_color(s_chat_history, lv_color_hex(0x0e141b), 0);
   lv_obj_add_flag(s_chat_history, LV_OBJ_FLAG_SCROLLABLE);
