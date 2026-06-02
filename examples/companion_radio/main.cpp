@@ -685,6 +685,15 @@ void setup() {
 
   board.begin();
 
+  // S3.6 follow-up — confirm PSRAM is alive. Without this, the chat /
+  // discovered / DM ring buffers (heap_caps_calloc(MALLOC_CAP_SPIRAM))
+  // silently return NULL and the UI shows empty lists. Banner is also
+  // useful in the next round of testing.
+  Serial.printf("[BOOT] psramFound=%d psram_size=%u free_psram=%u\n",
+                psramFound() ? 1 : 0,
+                (unsigned)ESP.getPsramSize(),
+                (unsigned)ESP.getFreePsram());
+
 #ifdef DISPLAY_CLASS
   DisplayDriver* disp = NULL;
   if (display.begin()) {
