@@ -60,6 +60,31 @@ Mirrors `Xinyuan-LilyGO/LilyGoLib-PlatformIO/variants/lilygo_tlora_pager/pins_ar
   `EXPANDS_KB_EN=8`, `EXPANDS_KB_RST=2` — the LR1121 power rail and
   the keyboard reset are routed through the expander, not direct GPIO.
 
+## Keyboard layout
+
+| layer    | how to engage                       | what it produces                                    |
+|----------|-------------------------------------|-----------------------------------------------------|
+| QWERTY   | tap a letter key                    | the silk-screened letter (a-z, Enter, Space, Backspace) |
+| Symbol   | hold the **orange FN key** next to Z | the silk-screened symbol on the same key            |
+
+Symbol-layer map (matches the physical hardware labels — taken from
+LilyGoLib's `LilyGo_LoRa_Pager.cpp` `symbol_map`):
+
+```
+FN+Q..P → 1 2 3 4 5 6 7 8 9 0
+FN+A..L → * / + - = : ' " @
+FN+Z..M → _ $ ; ? ! , .
+FN+Space → #         (our addition — needed for MeshCore channel names)
+```
+
+The TCA8418 FIFO is drained from `UITask::loop` via the
+`variant_loop()` hook in `target.cpp`. Upstream `examples/companion_radio`
+doesn't call any variant hook on its own, so we drive it explicitly.
+
+The Messages tile is an input-test screen that echoes the live keystroke
+buffer — handy for verifying the keyboard end-to-end without a host
+serial monitor.
+
 ## Known LVGL caveats
 
 These cost some debug time and are documented here so the next pair of
@@ -105,7 +130,8 @@ hands doesn't have to rediscover them:
 
 ## TODO (next phases)
 
-- S3.3 phase 2c: numeric keyboard entry for frequency.
+- S3.3 phase 2c: numeric keyboard entry for frequency (now that the
+  symbol layer is wired, digits are typable directly via FN+Q..P).
 - S3.3 phase 2d: region scope picker (reads / writes RegionMap).
 - S3.3 phase 2e: duty-cycle indicator (likely top header, next to battery).
 - S3.4 prereq: symbol layer on the QWERTY keyboard (`Space + key`) — needed

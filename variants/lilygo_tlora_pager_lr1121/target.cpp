@@ -128,13 +128,33 @@ static Adafruit_TCA8418 _kb;
 static bool _kb_ok = false;
 
 // QWERTY keymap copied from LilyGo_LoRa_Pager.cpp (4 rows x 10 cols).
-// '\0' marks a position with no key (or a modifier handled elsewhere).
+// '\0' marks a position with no key (or a modifier handled elsewhere —
+// e.g. the orange FN key sits at row 2 col 0 next to Z, see kb_keymap_symbol).
 static const char kb_keymap[4][10] = {
   {'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'},
   {'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', '\n'},
   {'\0','z', 'x', 'c', 'v', 'b', 'n', 'm', '\0','\0'},
   {' ', '\0','\0','\0','\0','\0','\0','\0','\0','\0'}
 };
+
+// Symbol layer — engaged while the dedicated orange FN key (row 2 col 0,
+// next to Z) is held down. This table mirrors the labels silk-screened
+// on the physical T-Pager keys, copied from LilyGoLib's
+// LilyGo_LoRa_Pager.cpp `symbol_map`, so D → '+', F → '-' etc. match
+// the printed hardware glyphs.
+//
+// One extension over the factory map: FN+Space → '#'. MeshCore channel
+// names start with '#' (e.g. `#mc-radar`) and the LilyGo layout has no
+// other place to bind the character. Space-on-its-own keeps its meaning
+// (the Space key is unmodified). FN-tap-without-other-keys never emits
+// anything, so this binding doesn't shadow regular Space input.
+static const char kb_keymap_symbol[4][10] = {
+  {'1', '2', '3', '4', '5', '6', '7', '8', '9', '0'},
+  {'*', '/', '+', '-', '=', ':', '\'','"', '@', '\n'},
+  {'\0','_', '$', ';', '?', '!', ',', '.', '\0','\0'},
+  {'#', '\0','\0','\0','\0','\0','\0','\0','\0','\0'}
+};
+#define TPAGER_KB_FN_RAW 21    // row 2, col 0 — the orange "FN" key
 
 static void kb_begin() {
   _kb_ok = _kb.begin(TCA8418_DEFAULT_ADDR, &Wire);
@@ -158,24 +178,38 @@ static void kb_begin() {
 // them to UITask when the compose screen is active.
 extern "C" void ui_input_char(char c) __attribute__((weak));
 
-void variant_loop() {
+extern "C" void variant_loop() {
   if (!_kb_ok) { kb_begin(); return; }   // try late init if I2C wasn't ready
+
+  // Static so the modifier state survives across loop ticks — FN can be
+  // pressed for hundreds of millis before the user reaches the next key.
+  static bool s_fn_held = false;
 
   while (_kb.available()) {
     uint8_t ev = _kb.getEvent();
     bool pressed = (ev & 0x80) != 0;
     uint8_t k = ev & 0x7F;
-    if (!pressed) continue;            // only act on key-down
+
+    // FN modifier (orange key next to Z) — track press/release, no char.
+    if (k == TPAGER_KB_FN_RAW) {
+      s_fn_held = pressed;
+      Serial.printf("KB FN %s\n", pressed ? "down" : "up");
+      continue;
+    }
+
+    if (!pressed) continue;            // only act on key-down for the rest
 
     char c = '\0';
     if (k == TPAGER_KB_BACKSPACE_RAW) {
-      c = '\b';
+      c = '\b';   // backspace works in both layers
     } else {
       int row = (k - 1) / 10;
       int col = (k - 1) % 10;
-      if (row >= 0 && row < 4 && col >= 0 && col < 10) c = kb_keymap[row][col];
+      if (row >= 0 && row < 4 && col >= 0 && col < 10) {
+        c = s_fn_held ? kb_keymap_symbol[row][col] : kb_keymap[row][col];
+      }
     }
-    Serial.printf("KB raw=%u ch=%c\n", k, c ? c : '?');
+    Serial.printf("KB raw=%u ch=%c%s\n", k, c ? c : '?', s_fn_held ? " (FN)" : "");
 
     if (c != '\0' && ui_input_char) ui_input_char(c);
   }

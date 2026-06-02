@@ -53,6 +53,15 @@ static lv_obj_t*   s_edit_widget;    // spinbox / switch / etc.
 static int s_active_tile = -1;
 static int s_editing_idx = -1;       // which radio row is being edited (-1 = none)
 
+// Input-test buffer for the Messages tile. Accumulates chars delivered
+// from variant_loop -> ui_input_char while that tile is open, so the
+// user can visually verify QWERTY + FN symbol layer + backspace without
+// needing a working USB-serial monitor.
+static char s_input_buf[160] = {0};
+static int  s_input_len = 0;
+static lv_obj_t* s_input_label = nullptr;
+static bool s_input_active = false;
+
 // Standard LoRa bandwidths (kHz). Cover the full SX12xx / LR11xx range so
 // users can match repeaters using narrow profiles (e.g. NL "EU/UK Narrow"
 // at 62.5 kHz) as well as the original wide MeshCore default (125 kHz).
@@ -94,6 +103,33 @@ static void back_long_press_event(lv_event_t* e);
 
 extern "C" void tpager_power_off() __attribute__((weak));
 extern "C" void ui_apply_radio_changes() __attribute__((weak));
+
+// Defined in target.cpp — drains the TCA8418 FIFO and emits chars via
+// ui_input_char(). The upstream companion main loop doesn't know about
+// our variant, so we drive the keyboard scan from UITask::loop instead.
+extern "C" void variant_loop();
+
+// Sink for chars produced by the TCA8418 keyboard (variant_loop in
+// target.cpp). When the Messages input-test sub-screen is active we
+// append the char to s_input_buf and refresh the label so the user
+// sees their keystrokes appear live on the display.
+extern "C" void ui_input_char(char c) {
+  if (!s_input_active || !s_input_label) return;
+  if (c == '\b') {
+    if (s_input_len > 0) {
+      s_input_len--;
+      s_input_buf[s_input_len] = 0;
+    }
+  } else if (s_input_len < (int)sizeof(s_input_buf) - 1) {
+    s_input_buf[s_input_len++] = c;
+    s_input_buf[s_input_len] = 0;
+  }
+  // Show a placeholder hint while the buffer is empty so the screen
+  // doesn't look broken before the first keystroke.
+  lv_label_set_text(s_input_label, s_input_len == 0
+    ? "(type to test — FN + key = symbol layer, backspace deletes)"
+    : s_input_buf);
+}
 
 static int s_last_enc_a = HIGH;
 static int s_prev_btn = HIGH;
@@ -154,10 +190,29 @@ static void enter_subscreen(int idx) {
       if (enc && s_radio_group) lv_indev_set_group(enc, s_radio_group);
       return;   // skip the generic label assignment below
     }
-    case 1:
-      snprintf(body, sizeof(body), "Unread: %d\n\n(channel list: S3.4)",
-               s_self ? s_self->getMsgCount() : 0);
-      break;
+    case 1: {
+      // S3.4 placeholder: input-test screen. While this sub-screen is
+      // visible, every char delivered to ui_input_char() (from the
+      // TCA8418 keyboard via variant_loop) is appended to a buffer and
+      // shown live, so the user can verify the QWERTY + FN symbol
+      // layer + backspace without needing the host serial monitor.
+      s_input_buf[0] = 0;
+      s_input_len = 0;
+      s_input_active = true;
+      // Hide the generic single-line body label and (re)build a wrapping
+      // label that takes most of the screen for the typed text.
+      lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
+      if (!s_input_label) {
+        s_input_label = lv_label_create(s_subscreen_root);
+        lv_obj_set_style_text_color(s_input_label, lv_color_hex(0xc0c8d0), 0);
+        lv_label_set_long_mode(s_input_label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(s_input_label, lv_pct(94));
+        lv_obj_align(s_input_label, LV_ALIGN_TOP_LEFT, 6, 28);
+      }
+      lv_obj_remove_flag(s_input_label, LV_OBJ_FLAG_HIDDEN);
+      lv_label_set_text(s_input_label, "(type to test — FN + key = symbol layer, backspace deletes)");
+      return;
+    }
     case 2:
       snprintf(body, sizeof(body), "GPS view\n\n(coords + sat count: S3.4)");
       break;
@@ -181,6 +236,11 @@ static void leave_subscreen() {
   lv_obj_remove_flag(s_root, LV_OBJ_FLAG_HIDDEN);
   lv_indev_t* enc = tpager_lvgl_get_encoder();
   if (enc && s_group) lv_indev_set_group(enc, s_group);
+  // Tear down the Messages input-test state if it was active. The label
+  // itself stays around (lazily created once) but is hidden so it doesn't
+  // bleed into other sub-screens.
+  s_input_active = false;
+  if (s_input_label) lv_obj_add_flag(s_input_label, LV_OBJ_FLAG_HIDDEN);
   s_active_tile = -1;
 }
 
@@ -612,6 +672,11 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* pr
 }
 
 void UITask::loop() {
+  // Drive the TCA8418 keyboard scanner — upstream main.cpp doesn't call
+  // any variant hook, so we do it here. variant_loop() is cheap when the
+  // FIFO is empty and self-initialises on first call.
+  variant_loop();
+
 #if defined(PIN_ENCODER_A) && defined(PIN_ENCODER_B)
   // Full quadrature state-table decoder. Each mechanical detent moves the
   // gray code through four transitions (00→01→11→10→00 for one direction).
