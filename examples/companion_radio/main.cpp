@@ -141,6 +141,87 @@ extern "C" void ui_get_duty_cycle_seconds(int* used_s, int* max_s) {
   if (max_s)  *max_s  = (int)(max_budget / 1000UL);
 }
 
+// Channel bridges for the variant UI.
+#include <helpers/ChannelDetails.h>
+
+// 16-byte → 24-char base64 encoder. We can't include <base64.hpp>
+// (already pulled in by BaseChatMesh.cpp and its functions aren't
+// `inline`, so a second TU including it triggers multiple-definition
+// link errors). This is a tiny self-contained variant that suffices
+// for our 128-bit channel secrets.
+static void b64_encode_16(const uint8_t* in, char* out) {
+  static const char alph[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  int oi = 0;
+  for (int i = 0; i < 15; i += 3) {     // 5 full triplets
+    uint32_t t = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8) | in[i+2];
+    out[oi++] = alph[(t >> 18) & 0x3F];
+    out[oi++] = alph[(t >> 12) & 0x3F];
+    out[oi++] = alph[(t >>  6) & 0x3F];
+    out[oi++] = alph[t & 0x3F];
+  }
+  uint32_t s = (uint32_t)in[15] << 16;  // trailing byte
+  out[oi++] = alph[(s >> 18) & 0x3F];
+  out[oi++] = alph[(s >> 12) & 0x3F];
+  out[oi++] = '=';
+  out[oi++] = '=';
+  out[oi] = 0;
+}
+
+extern "C" int ui_get_channel_count() {
+  ChannelDetails ch;
+  int count = 0;
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    if (the_mesh.getChannel(i, ch) && ch.name[0]) count++;
+  }
+  return count;
+}
+
+// Returns true if a channel with that index exists; fills name buf.
+// `idx` indexes only the populated channels (i.e., skips empty slots).
+extern "C" bool ui_get_channel_name(int idx, char* buf, int buf_size) {
+  ChannelDetails ch;
+  int seen = 0;
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    if (the_mesh.getChannel(i, ch) && ch.name[0]) {
+      if (seen == idx) {
+        size_t n = strlen(ch.name);
+        if ((int)n >= buf_size) n = buf_size - 1;
+        memcpy(buf, ch.name, n);
+        buf[n] = 0;
+        return true;
+      }
+      seen++;
+    }
+  }
+  return false;
+}
+
+// Add a hashtag-style channel. Secret is derived as
+// SHA256("#"+name)[0..15] (the MeshCore convention for hashtag chans;
+// see DEVLOG entry on channel auto-derivation). Returns false if the
+// channel table is full or the name is empty.
+//
+// We bypass BaseChatMesh::addChannel and use setChannel into a manually-
+// located free slot. Reason: addChannel uses `num_channels` as the next
+// free slot index, but `num_channels` is only incremented by addChannel
+// itself — loadChannels (via setChannel) does NOT bump it. So after a
+// reboot `num_channels` stays at 1 ("Public" from first-boot init) and
+// any subsequent addChannel call overwrites slot 1 regardless of which
+// channels are already persisted there. Walking the table for an empty
+// name slot is the deterministic fix.
+extern "C" bool ui_add_hashtag_channel(const char* name) {
+  if (!name || !name[0]) return false;
+  char hashtagged[40];
+  snprintf(hashtagged, sizeof(hashtagged), "#%s", name);
+  uint8_t secret[16];
+  mesh::Utils::sha256(secret, 16,
+                      (const uint8_t*)hashtagged, strlen(hashtagged));
+  if (!the_mesh.uiAddHashtagChannel(name, secret)) return false;
+  the_mesh.uiSaveChannels();
+  return true;
+}
+
 // Apply a new default-scope name from the variant UI. The HMAC key
 // is derived from "#"+name via TransportKeyStore::getAutoKeyFor — same
 // pattern MyMesh uses at first-boot from DEFAULT_FLOOD_SCOPE_NAME.

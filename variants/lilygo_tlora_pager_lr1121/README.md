@@ -140,11 +140,25 @@ hands doesn't have to rediscover them:
   every sub-screen, so DC and battery never require leaving the current
   tile.
 
+## Channels (S3.4 — work in progress)
+
+* Messages tile now hosts a channels list. Top row is "+ Add channel";
+  remaining rows show the joined channels (`Public` is pre-populated by
+  MyMesh; everything else gets a `#` prefix in the UI).
+* Clicking "+ Add channel" opens a text-input popup. Allowed chars are
+  lowercase letters + digits + `-`. Enter / encoder-click commits.
+* Add path derives the 16-byte secret as `SHA256("#"+name)[0..15]`
+  (MeshCore hashtag convention) and stores it via the new
+  `MyMesh::uiAddHashtagChannel()` helper. The store walks the channel
+  table for an empty slot so existing channels are never overwritten.
+* `MAX_GROUP_CHANNELS=40` on this build (set in `platformio.ini`).
+* Clicking on an existing channel row is a no-op for now — the chat
+  view (history + compose) is the next step (S3.4 step 2/3).
+
 ## TODO (next phases)
 
-- S3.4: channel list + message history viewer (with `+ Add channel`
-  via text-input — no hardcoded NL-specific channel names in the
-  upstream code).
+- S3.4 step 2/3: chat view per channel — scrollable history of received
+  messages + compose box that sends GROUP_TXT via `sendGroupMessage`.
 - S3.5: contacts tile (heard adverts) with favourite flag and a
   not-favourite-first eviction policy when the 350-contact cap is hit.
 - S3.6: map renderer — XYZ raster tiles from microSD. Five base

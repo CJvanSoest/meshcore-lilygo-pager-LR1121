@@ -58,6 +58,7 @@ class BaseChatMesh : public mesh::Mesh {
 
   friend class ContactsIterator;
 
+protected:
   ContactInfo contacts[MAX_CONTACTS];
   int num_contacts;
   int sort_array[MAX_CONTACTS];
@@ -70,6 +71,8 @@ class BaseChatMesh : public mesh::Mesh {
   mesh::Packet* _pendingLoopback;
   uint8_t temp_buf[MAX_TRANS_UNIT];
   ConnectionInfo connections[MAX_CONNECTIONS];
+
+private:
 
   mesh::Packet* composeMsgPacket(const ContactInfo& recipient, uint32_t timestamp, uint8_t attempt, const char *text, uint32_t& expected_ack);
   void sendAckTo(const ContactInfo& dest, uint32_t ack_hash);

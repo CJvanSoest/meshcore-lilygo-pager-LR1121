@@ -165,6 +165,30 @@ protected:
 
 public:
   void savePrefs() { _store->savePrefs(_prefs, sensors.node_lat, sensors.node_lon); }
+  // Public wrapper around the private saveChannels() shortcut so variant
+  // UIs can persist a newly-added channel after addChannel().
+  void uiSaveChannels() { _store->saveChannels(this); }
+
+  // Variant-UI channel add. Walks channels[] for an empty slot and uses
+  // setChannel() so we never overwrite a slot that loadChannels() filled
+  // (the upstream `num_channels` counter is only bumped by addChannel,
+  // not by setChannel-via-load, so after a reboot it stays at 1 and
+  // BaseChatMesh::addChannel would clobber slot 1). The 16-byte secret
+  // is consumed verbatim (no base64 round-trip).
+  bool uiAddHashtagChannel(const char* name, const uint8_t secret16[16]) {
+    int idx = -1;
+    for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+      if (channels[i].name[0] == 0) { idx = i; break; }
+    }
+    if (idx < 0) return false;
+    ChannelDetails ch;
+    memset(&ch, 0, sizeof(ch));
+    memcpy(ch.channel.secret, secret16, 16);   // upper 16 bytes stay zero
+    StrHelper::strncpy(ch.name, name, sizeof(ch.name));
+    if (!setChannel(idx, ch)) return false;
+    if (idx + 1 > num_channels) num_channels = idx + 1;
+    return true;
+  }
 
 #if ENV_INCLUDE_GPS == 1
   void applyGpsPrefs() {

@@ -45,8 +45,14 @@ static lv_obj_t* s_subscreen_root;
 static lv_obj_t* s_subscreen_title;
 static lv_obj_t* s_subscreen_body;
 static lv_obj_t* s_radio_list;
+static lv_obj_t* s_channel_list;     // S3.4 channels list (Messages tile)
 static lv_group_t* s_group;          // carousel tiles
 static lv_group_t* s_radio_group;    // Radio settings list rows
+static lv_group_t* s_channel_group;  // Channels list rows
+// Special s_editing_idx value used when the text-input popup is open for
+// "add new channel". Out-of-range w.r.t. radio rows so existing
+// per-row dispatch ignores it.
+#define EDIT_IDX_NEW_CHANNEL  100
 static lv_group_t* s_edit_group;     // edit popup widget
 static lv_obj_t*   s_edit_popup;     // dark backdrop + content
 static lv_obj_t*   s_edit_title;
@@ -110,12 +116,18 @@ static void radio_list_populate(NodePrefs* p, int focus_row = 0);
 static void radio_item_clicked(lv_event_t* e);
 static void back_long_press_event(lv_event_t* e);
 static void close_edit_popup_apply();   // referenced from ui_input_char (Enter commits)
+static void channels_list_populate(int focus_row = 0);
+static void open_add_channel_popup();
 
 extern "C" void tpager_power_off() __attribute__((weak));
 extern "C" void ui_apply_radio_changes() __attribute__((weak));
 // Companion writes the new default-scope name + derived HMAC key into
 // NodePrefs and persists. Empty name = wildcard / no scope.
 extern "C" void ui_apply_default_scope(const char* name) __attribute__((weak));
+// Channels (S3.4) — companion enumerates / mutates the GroupChannel table.
+extern "C" int  ui_get_channel_count() __attribute__((weak));
+extern "C" bool ui_get_channel_name(int idx, char* buf, int buf_size) __attribute__((weak));
+extern "C" bool ui_add_hashtag_channel(const char* name) __attribute__((weak));
 // Tenths-of-percent (0..1000) of the duty-cycle quota that has been
 // consumed in the current hour-window. 0 = idle, 1000 = throttled.
 extern "C" int  ui_get_duty_cycle_used_tenths() __attribute__((weak));
@@ -138,10 +150,12 @@ extern "C" uint8_t tpager_kb_last_raw();
 //   * freq-editor popup  (s_editing_idx == 0)  — digits + '.' + backspace
 //   * Messages tester    (s_input_active)      — anything goes
 extern "C" void ui_input_char(char c) {
-  // Text-input popup: freq (idx 0) or scope (idx 7). Char filter is
-  // per-row — freq accepts digits + '.', scope accepts lowercase
-  // letters + digits + '-'. Both accept '\b' (pop) and '\n' (commit).
-  if ((s_editing_idx == 0 || s_editing_idx == 7) && s_text_value_label) {
+  // Text-input popup: freq (idx 0), scope (idx 7), or new-channel
+  // (EDIT_IDX_NEW_CHANNEL). Char filter is per-row — freq accepts
+  // digits + '.', scope and new-channel accept lowercase letters +
+  // digits + '-'. All accept '\b' (pop) and '\n' (commit).
+  if ((s_editing_idx == 0 || s_editing_idx == 7 ||
+       s_editing_idx == EDIT_IDX_NEW_CHANNEL) && s_text_value_label) {
     if (c == '\n') {
       close_edit_popup_apply();
       return;
@@ -151,7 +165,7 @@ extern "C" void ui_input_char(char c) {
       bool allow;
       if (s_editing_idx == 0) {
         allow = (c >= '0' && c <= '9') || c == '.';
-      } else {  // scope
+      } else {  // scope or new-channel
         allow = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
       }
       if (!allow) return;   // reject other chars silently
@@ -221,9 +235,12 @@ static void enter_subscreen(int idx) {
   lv_obj_remove_flag(s_subscreen_root, LV_OBJ_FLAG_HIDDEN);
   lv_label_set_text(s_subscreen_title, TILES[idx].title);
 
-  // Default: simple body label visible, radio list hidden.
+  // Default: simple body label visible, all per-tile containers hidden.
   lv_obj_remove_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
-  if (s_radio_list) lv_obj_add_flag(s_radio_list, LV_OBJ_FLAG_HIDDEN);
+  if (s_radio_list)   lv_obj_add_flag(s_radio_list,   LV_OBJ_FLAG_HIDDEN);
+  if (s_channel_list) lv_obj_add_flag(s_channel_list, LV_OBJ_FLAG_HIDDEN);
+  if (s_input_label)  lv_obj_add_flag(s_input_label,  LV_OBJ_FLAG_HIDDEN);
+  s_input_active = false;
 
   // Default: encoder drives carousel group (will switch for Radio below).
   lv_indev_t* enc = tpager_lvgl_get_encoder();
@@ -238,27 +255,11 @@ static void enter_subscreen(int idx) {
       if (enc && s_radio_group) lv_indev_set_group(enc, s_radio_group);
       return;   // skip the generic label assignment below
     }
-    case 1: {
-      // S3.4 placeholder: input-test screen. While this sub-screen is
-      // visible, every char delivered to ui_input_char() (from the
-      // TCA8418 keyboard via variant_loop) is appended to a buffer and
-      // shown live, so the user can verify the QWERTY + FN symbol
-      // layer + backspace without needing the host serial monitor.
-      s_input_buf[0] = 0;
-      s_input_len = 0;
-      s_input_active = true;
-      // Hide the generic single-line body label and (re)build a wrapping
-      // label that takes most of the screen for the typed text.
+    case 1: {  // Messages → S3.4 channels list
       lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
-      if (!s_input_label) {
-        s_input_label = lv_label_create(s_subscreen_root);
-        lv_obj_set_style_text_color(s_input_label, lv_color_hex(0xc0c8d0), 0);
-        lv_label_set_long_mode(s_input_label, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(s_input_label, lv_pct(94));
-        lv_obj_align(s_input_label, LV_ALIGN_TOP_LEFT, 6, 48);
-      }
-      lv_obj_remove_flag(s_input_label, LV_OBJ_FLAG_HIDDEN);
-      lv_label_set_text(s_input_label, "(type to test — FN + key = symbol layer, backspace deletes)");
+      if (s_channel_list) lv_obj_remove_flag(s_channel_list, LV_OBJ_FLAG_HIDDEN);
+      channels_list_populate(0);
+      if (enc && s_channel_group) lv_indev_set_group(enc, s_channel_group);
       return;
     }
     case 2:
@@ -284,11 +285,10 @@ static void leave_subscreen() {
   lv_obj_remove_flag(s_root, LV_OBJ_FLAG_HIDDEN);
   lv_indev_t* enc = tpager_lvgl_get_encoder();
   if (enc && s_group) lv_indev_set_group(enc, s_group);
-  // Tear down the Messages input-test state if it was active. The label
-  // itself stays around (lazily created once) but is hidden so it doesn't
-  // bleed into other sub-screens.
+  // Tear down per-tile widgets so they don't bleed into other sub-screens.
   s_input_active = false;
-  if (s_input_label) lv_obj_add_flag(s_input_label, LV_OBJ_FLAG_HIDDEN);
+  if (s_input_label)   lv_obj_add_flag(s_input_label,   LV_OBJ_FLAG_HIDDEN);
+  if (s_channel_list)  lv_obj_add_flag(s_channel_list,  LV_OBJ_FLAG_HIDDEN);
   s_active_tile = -1;
 }
 
@@ -388,10 +388,144 @@ static void radio_list_populate(NodePrefs* p, int focus_row) {
   if (focus_to) lv_group_focus_obj(focus_to);
 }
 
+// ---------- Channels list (Messages tile, S3.4 step 1) ----------------------
+
+// Row 0 is always "+ Add channel". Subsequent rows mirror the channels
+// reported by ui_get_channel_count / ui_get_channel_name. Clicking a row
+// either opens the add popup or (later, step 2) the chat view.
+
+static void channel_row_clicked(lv_event_t* e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  if (idx < 0) {
+    open_add_channel_popup();
+    return;
+  }
+  // Chat view per channel comes in the next step. For now, no-op so the
+  // user can confirm the row exists.
+}
+
+static void channels_list_populate(int focus_row) {
+  if (!s_channel_list) return;
+  lv_obj_clean(s_channel_list);
+  if (s_channel_group) lv_group_remove_all_objs(s_channel_group);
+
+  auto build_row = [&](const char* text, int data, bool is_add) -> lv_obj_t* {
+    lv_obj_t* row = lv_obj_create(s_channel_list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), 24);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row,
+        is_add ? lv_color_hex(0xFAA61A) : lv_color_hex(0xc0c8d0), 0);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_pad_hor(row, 8, 0);
+    lv_obj_set_style_pad_ver(row, 2, 0);
+    lv_obj_set_style_radius(row, 4, 0);
+    lv_obj_set_style_margin_bottom(row, 2, 0);
+    lv_obj_set_style_border_color(row, lv_color_hex(0x303a47), 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+
+    lv_obj_t* lbl = lv_label_create(row);
+    lv_label_set_text(lbl, text);
+
+    lv_obj_add_event_cb(row, channel_row_clicked, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)data);
+    lv_obj_add_event_cb(row, back_long_press_event, LV_EVENT_LONG_PRESSED, NULL);
+    if (s_channel_group) lv_group_add_obj(s_channel_group, row);
+    return row;
+  };
+
+  lv_obj_t* first = build_row("+ Add channel", -1, true);
+
+  int count = ui_get_channel_count ? ui_get_channel_count() : 0;
+  char name[40];
+  lv_obj_t* target = nullptr;
+  for (int i = 0; i < count; i++) {
+    if (ui_get_channel_name && ui_get_channel_name(i, name, sizeof(name))) {
+      char with_hash[42];
+      // "Public" is the only non-hashtag channel (hardcoded PSK). Show
+      // it as-is. Everything else gets a "#" prefix for readability.
+      if (strcmp(name, "Public") == 0) {
+        snprintf(with_hash, sizeof(with_hash), "%s", name);
+      } else {
+        snprintf(with_hash, sizeof(with_hash), "#%s", name);
+      }
+      lv_obj_t* r = build_row(with_hash, i, false);
+      if (i + 1 == focus_row) target = r;
+    }
+  }
+  lv_group_focus_obj(target ? target : first);
+}
+
+static void open_add_channel_popup() {
+  s_editing_idx = EDIT_IDX_NEW_CHANNEL;
+  lv_obj_remove_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
+  if (s_edit_widget) { lv_obj_del(s_edit_widget); s_edit_widget = nullptr; }
+  if (s_text_value_label) { lv_obj_del(s_text_value_label); s_text_value_label = nullptr; }
+  lv_group_remove_all_objs(s_edit_group);
+
+  s_text_buf[0] = 0;
+  s_text_len = 0;
+  lv_label_set_text(s_edit_title, "New channel (hashtag)");
+
+  s_text_value_label = lv_label_create(s_edit_popup);
+  lv_obj_set_style_text_color(s_text_value_label, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_font(s_text_value_label, &lv_font_montserrat_24, 0);
+  lv_label_set_text(s_text_value_label, "_");
+  lv_obj_align(s_text_value_label, LV_ALIGN_CENTER, 0, -12);
+
+  s_edit_widget = lv_button_create(s_edit_popup);
+  lv_obj_set_size(s_edit_widget, 60, 24);
+  lv_obj_align(s_edit_widget, LV_ALIGN_BOTTOM_MID, 0, -20);
+  lv_obj_t* okl = lv_label_create(s_edit_widget);
+  lv_label_set_text(okl, "OK");
+  lv_obj_center(okl);
+  lv_obj_add_event_cb(s_edit_widget, [](lv_event_t*) {
+    close_edit_popup_apply();
+  }, LV_EVENT_CLICKED, nullptr);
+
+  lv_group_add_obj(s_edit_group, s_edit_widget);
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (enc) {
+    lv_indev_set_group(enc, s_edit_group);
+    lv_group_focus_obj(s_edit_widget);
+    lv_group_set_editing(s_edit_group, true);
+  }
+}
+
 // ---------- Edit popup -------------------------------------------------------
 
 static void close_edit_popup_apply() {
   if (s_editing_idx < 0) return;
+
+  // Special case: adding a channel doesn't touch NodePrefs at all —
+  // it goes through the dedicated channel-add bridge and returns the
+  // user to the channels list. Order matters: clear editing state on
+  // both groups BEFORE rebuilding the channels list (otherwise the
+  // group still thinks it's editing the now-destroyed OK button and
+  // the encoder feels "locked").
+  if (s_editing_idx == EDIT_IDX_NEW_CHANNEL) {
+    if (s_text_len > 0 && ui_add_hashtag_channel) {
+      ui_add_hashtag_channel(s_text_buf);
+    }
+    lv_obj_add_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
+    if (s_edit_group)    lv_group_set_editing(s_edit_group, false);
+    if (s_channel_group) lv_group_set_editing(s_channel_group, false);
+    s_editing_idx = -1;
+    channels_list_populate(1);   // rebuilds rows; focuses new entry
+    lv_indev_t* enc = tpager_lvgl_get_encoder();
+    if (enc && s_channel_group) {
+      lv_indev_set_group(enc, s_channel_group);
+      lv_group_set_editing(s_channel_group, false);
+    }
+    s_skip_next_click = true;     // swallow the click that just committed
+    return;
+  }
+
   NodePrefs* p = s_self ? s_self->getPrefs() : nullptr;
   if (!p) return;
 
@@ -698,6 +832,22 @@ static void build_ui() {
 
   s_radio_group = lv_group_create();
 
+  // Channels list (Messages tile, S3.4) — same row pattern as the radio
+  // list, built once and hidden by default. channels_list_populate fills
+  // it on demand. Sized identically so the header area stays consistent
+  // between tiles.
+  s_channel_list = lv_obj_create(s_subscreen_root);
+  lv_obj_remove_style_all(s_channel_list);
+  lv_obj_set_size(s_channel_list, lv_pct(96), lv_pct(70));
+  lv_obj_align(s_channel_list, LV_ALIGN_TOP_LEFT, 6, 44);
+  lv_obj_set_flex_flow(s_channel_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_bg_color(s_channel_list, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_pad_all(s_channel_list, 2, 0);
+  lv_obj_set_scroll_dir(s_channel_list, LV_DIR_VER);
+  lv_obj_add_flag(s_channel_list, LV_OBJ_FLAG_HIDDEN);
+
+  s_channel_group = lv_group_create();
+
   // ---- Persistent header (always visible) ----
   // Parented to the screen itself and built AFTER s_root + s_subscreen_root
   // so it paints on top of both — node name, DC usage and battery stay
@@ -860,11 +1010,16 @@ void UITask::loop() {
           if (s_edit_widget && (s_editing_idx == 2 || s_editing_idx == 6)) {
             lv_dropdown_close(s_edit_widget);
           }
+          // Route the encoder back to whichever list-group the popup
+          // was opened from: channels group for NEW_CHANNEL, otherwise
+          // the radio settings group.
+          lv_group_t* back_group = (s_editing_idx == EDIT_IDX_NEW_CHANNEL)
+                                   ? s_channel_group : s_radio_group;
           lv_obj_add_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
-          if (s_edit_group)  lv_group_set_editing(s_edit_group, false);
-          if (s_radio_group) lv_group_set_editing(s_radio_group, false);
+          if (s_edit_group) lv_group_set_editing(s_edit_group, false);
+          if (back_group)   lv_group_set_editing(back_group, false);
           lv_indev_t* enc2 = tpager_lvgl_get_encoder();
-          if (enc2 && s_radio_group) lv_indev_set_group(enc2, s_radio_group);
+          if (enc2 && back_group) lv_indev_set_group(enc2, back_group);
           s_editing_idx = -1;
           s_skip_next_click = true;
         } else if (s_in_subscreen) {
