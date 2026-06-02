@@ -199,15 +199,74 @@ hands doesn't have to rediscover them:
   the DRAM segment by 72 bytes — the 64-entry LRU cache uses
   ~1 KB instead and fits comfortably.
 
+## S3.6 — Communication-UI restructure (done 2026-06-02)
+
+Tile carousel reworked into the final layout:
+
+```
+Radio → Channels → DM → Contacts(★) → Discovered → Map → Settings → About
+```
+
+- **a (`2f4a41b0`)** — Messages tile renamed to Channels (label only).
+- **b (`249a2012`)** — Discovered tile + new weak hook
+  `ui_on_advert_seen` fired BEFORE the auto-add filter in
+  `BaseChatMesh::onAdvertRecv`, so chat-type adverts that aren't
+  auto-added still surface in the UI. 50-entry PSRAM-backed LRU
+  ring keyed by pub_key. Click a row → popup `Add to contacts /
+  Add as favorite / Cancel` via `MyMesh::uiAddContact()`. Two
+  action rows at the top: `+ Send advert (direct)` and
+  `+ Send advert (flood)` → `MyMesh::uiSendSelfAdvert(flood)`.
+- **c (`c38d9d42`)** — Contacts filtered to favorites
+  (`flags & 0x01`). Click → `Open DM / Unmark favorite / Cancel`.
+  Open DM wires straight into `dm_chat_view_open` after looking
+  up the contact name.
+- **d.1 (`70c4574d`)** — DM tile + per-contact chat view. 32-entry
+  PSRAM ring tagged by pub_key[:8]. `s_dm_mode` flag flips
+  `chat_history_render` between channel-ring and DM-ring sources;
+  Enter routes through `ui_send_dm()` or `ui_send_group_text()`.
+  Receive via new `ui_on_dm_message` weak hook in
+  `MyMesh::onMessageRecv`. NOT persisted across reboots — that's
+  the d.2 follow-up below.
+
+Adjustments in subsequent rounds (still 2026-06-02):
+
+- `qio_opi` PSRAM mode rejected by this board; switched to
+  `qio_qspi`. Verified: `[BOOT] psramFound=1 psram_size=8386295`.
+  All PSRAM-backed buffers (chat ring, DM ring, Discovered cache,
+  per-contact pubkey caches) now actually allocate.
+- "Delete channel" — Channel-row click on non-Public opens
+  `Open chat / Delete channel / Cancel`. `MyMesh::uiDeleteChannel`
+  zeroes the target slot then **compacts** later entries down so
+  populated-idx == slot-idx remains true.
+- TCA8418 caps-lock — unmarked key right of M (raw 29) is a sticky
+  caps-lock toggle.
+- Chat-history coloring — `s_chat_history` is now an `lv_spangroup`
+  (`LV_SPAN_MODE_BREAK`). Each line renders as: green sender
+  prefix (`0x55cc66`) + blue `@[mention]` tokens (`0x5ab8ff`) +
+  grey body (`0xc0c8d0`). Mention parser accepts both
+  `@[name]` (MeshCore wire format) and bare `@name`.
+- DC counter — switched from leaky-bucket "remaining" delta to
+  cumulative `getTotalAirTime()` at 100 ms resolution. Monotonic,
+  so every advert / chat send visibly moves the seconds counter.
+- Radio settings grew a 9th row "Name" (idx 8) — text input that
+  writes `NodePrefs.node_name` via `MyMesh::uiSetNodeName`.
+- Popup buttons (disc / con / ch menu) use a high-contrast focus
+  state via `style_popup_button` helper. List rows keep the
+  original subtle focus (changing them broke perceived scroll).
+- Header pager-name recolored from orange to grey (matches DC).
+
 ## TODO (next phases)
-- S3.5 follow-up: favourite flag + not-favourite-first eviction when
-  the 350-contact cap is hit.
-- S3.6: map renderer — XYZ raster tiles from microSD. Five base
-  sources shipped with the firmware (OSM, PDOK for NL, OpenTopoMap,
-  CyclOSM, Stamen Toner). See `MAPS.md` for the source list, tile-URL
-  templates, the planned in-map source-switcher UX and links to free
-  providers for other countries / world-wide use.
-- S3.7: at-rest encrypted message store on SD (AES-256-CTR with a key
-  derived from `efuse_mac || optional_passphrase`). DM threads and
-  channel chat histories land in `/messages/<hash>.jsonl` instead of
-  SPIFFS.
+- **S3.6d.2** — SD-persisted encrypted DM store (AES-256-CTR with
+  key = `SHA256(efuse_mac || passphrase)`). Files
+  `/messages/<sha256(pub_key)[:16]>.jsonl` on microSD. Needs
+  pin-map + SD bringup for this board (not yet defined in
+  `target.cpp`); recommended to do in a focused session.
+- **S3.5 follow-up** — favourite-first eviction policy when the
+  350-contact cap is hit (favourites stay, oldest non-favourite
+  gets reused).
+- **S3.7** — map renderer (XYZ raster tiles from microSD, 5 base
+  sources: OSM, PDOK for NL, OpenTopoMap, CyclOSM, Stamen Toner).
+  See `MAPS.md`. Needs SD bringup (same prereq as d.2).
+- **Misc smaller** — Settings and Map tiles are still placeholder
+  bodies; Settings could host global toggles (manual_add_contacts,
+  GPS enable, audio mute, etc.).
