@@ -574,6 +574,17 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
     channel_name = channel_details.name;
   }
   if (_ui) _ui->newMsg(path_len, channel_name, text, offline_queue_len);
+
+  // Variant-UI hook: deliver the raw text + channel index so a
+  // per-channel chat view can append it to its own ring buffer. The
+  // existing newMsg only carries the channel name (string) which makes
+  // it ambiguous when two channels share a prefix.
+  extern void ui_on_channel_message(int channel_idx, uint32_t timestamp,
+                                    const char* text)
+      __attribute__((weak));
+  if (ui_on_channel_message) {
+    ui_on_channel_message(channel_idx, timestamp, text);
+  }
 #endif
 }
 

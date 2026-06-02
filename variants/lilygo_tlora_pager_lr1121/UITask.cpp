@@ -53,6 +53,30 @@ static lv_group_t* s_channel_group;  // Channels list rows
 // "add new channel". Out-of-range w.r.t. radio rows so existing
 // per-row dispatch ignores it.
 #define EDIT_IDX_NEW_CHANNEL  100
+
+// Chat view (S3.4 step 2/3) — opened when the user clicks an existing
+// channel row in the Messages tile. Single shared ring buffer keyed by
+// channel_idx, plus a compose buffer that the keyboard fills.
+struct ChatMsg {
+  uint8_t channel_idx;
+  uint32_t timestamp;   // unix seconds (0 if unknown)
+  char text[96];        // includes "sender: " prefix from the wire
+};
+#define CHAT_RING_SIZE 32
+static ChatMsg s_chat_ring[CHAT_RING_SIZE];
+static int s_chat_head = 0;     // next slot to write
+static int s_chat_count = 0;    // populated entries (≤ CHAT_RING_SIZE)
+static bool s_chat_open = false;
+static int  s_chat_channel_idx = -1;
+static lv_obj_t* s_chat_history = nullptr;
+static lv_obj_t* s_chat_compose = nullptr;
+static lv_obj_t* s_chat_counter = nullptr;
+// 121 leaves room for a NUL, so max payload is 120 chars. MeshCore's
+// MAX_TEXT_LEN is 160 (10×CIPHER_BLOCK_SIZE) minus an 8-byte sender
+// prefix `<name>: `, so ~120 is a safe upper bound matching the
+// Tanmatsu UI.
+static char s_compose_buf[121] = {0};
+static int  s_compose_len = 0;
 static lv_group_t* s_edit_group;     // edit popup widget
 static lv_obj_t*   s_edit_popup;     // dark backdrop + content
 static lv_obj_t*   s_edit_title;
@@ -118,6 +142,11 @@ static void back_long_press_event(lv_event_t* e);
 static void close_edit_popup_apply();   // referenced from ui_input_char (Enter commits)
 static void channels_list_populate(int focus_row = 0);
 static void open_add_channel_popup();
+static void chat_view_open(int channel_idx);
+static void chat_view_close();
+static void chat_history_render();
+static void chat_compose_render();
+static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char* text);
 
 extern "C" void tpager_power_off() __attribute__((weak));
 extern "C" void ui_apply_radio_changes() __attribute__((weak));
@@ -128,6 +157,7 @@ extern "C" void ui_apply_default_scope(const char* name) __attribute__((weak));
 extern "C" int  ui_get_channel_count() __attribute__((weak));
 extern "C" bool ui_get_channel_name(int idx, char* buf, int buf_size) __attribute__((weak));
 extern "C" bool ui_add_hashtag_channel(const char* name) __attribute__((weak));
+extern "C" bool ui_send_group_text(int channel_idx, const char* text) __attribute__((weak));
 // Tenths-of-percent (0..1000) of the duty-cycle quota that has been
 // consumed in the current hour-window. 0 = idle, 1000 = throttled.
 extern "C" int  ui_get_duty_cycle_used_tenths() __attribute__((weak));
@@ -150,6 +180,37 @@ extern "C" uint8_t tpager_kb_last_raw();
 //   * freq-editor popup  (s_editing_idx == 0)  — digits + '.' + backspace
 //   * Messages tester    (s_input_active)      — anything goes
 extern "C" void ui_input_char(char c) {
+  // Chat compose: when a chat view is open, the keyboard feeds the
+  // compose buffer instead of any popup. Enter sends via the bridge;
+  // '\b' pops; everything else (printable from the QWERTY + symbol
+  // layer) appends. We accept anything that's not Enter/backspace so
+  // letters, digits, symbols and even '#' (FN+Space) all work.
+  if (s_chat_open && s_chat_compose) {
+    if (c == '\n') {
+      if (s_compose_len > 0 && ui_send_group_text) {
+        if (ui_send_group_text(s_chat_channel_idx, s_compose_buf)) {
+          // Show our own message in the history immediately. The wire
+          // payload is "<sender>: <msg>" — mirror that locally with a
+          // "(me)" prefix so it visually matches received messages.
+          char local[120];
+          snprintf(local, sizeof(local), "(me): %s", s_compose_buf);
+          chat_ring_push((uint8_t)s_chat_channel_idx, 0, local);
+          chat_history_render();
+        }
+      }
+      s_compose_buf[0] = 0;
+      s_compose_len = 0;
+    } else if (c == '\b') {
+      if (s_compose_len > 0) { s_compose_len--; s_compose_buf[s_compose_len] = 0; }
+    } else {
+      if (s_compose_len < (int)sizeof(s_compose_buf) - 1) {
+        s_compose_buf[s_compose_len++] = c;
+        s_compose_buf[s_compose_len] = 0;
+      }
+    }
+    chat_compose_render();
+    return;
+  }
   // Text-input popup: freq (idx 0), scope (idx 7), or new-channel
   // (EDIT_IDX_NEW_CHANNEL). Char filter is per-row — freq accepts
   // digits + '.', scope and new-channel accept lowercase letters +
@@ -240,7 +301,12 @@ static void enter_subscreen(int idx) {
   if (s_radio_list)   lv_obj_add_flag(s_radio_list,   LV_OBJ_FLAG_HIDDEN);
   if (s_channel_list) lv_obj_add_flag(s_channel_list, LV_OBJ_FLAG_HIDDEN);
   if (s_input_label)  lv_obj_add_flag(s_input_label,  LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_history) lv_obj_add_flag(s_chat_history, LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_compose) lv_obj_add_flag(s_chat_compose, LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_counter) lv_obj_add_flag(s_chat_counter, LV_OBJ_FLAG_HIDDEN);
   s_input_active = false;
+  s_chat_open = false;
+  s_chat_channel_idx = -1;
 
   // Default: encoder drives carousel group (will switch for Radio below).
   lv_indev_t* enc = tpager_lvgl_get_encoder();
@@ -287,8 +353,13 @@ static void leave_subscreen() {
   if (enc && s_group) lv_indev_set_group(enc, s_group);
   // Tear down per-tile widgets so they don't bleed into other sub-screens.
   s_input_active = false;
+  s_chat_open = false;
+  s_chat_channel_idx = -1;
   if (s_input_label)   lv_obj_add_flag(s_input_label,   LV_OBJ_FLAG_HIDDEN);
   if (s_channel_list)  lv_obj_add_flag(s_channel_list,  LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_history)  lv_obj_add_flag(s_chat_history,  LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_compose)  lv_obj_add_flag(s_chat_compose,  LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_counter)  lv_obj_add_flag(s_chat_counter,  LV_OBJ_FLAG_HIDDEN);
   s_active_tile = -1;
 }
 
@@ -400,8 +471,7 @@ static void channel_row_clicked(lv_event_t* e) {
     open_add_channel_popup();
     return;
   }
-  // Chat view per channel comes in the next step. For now, no-op so the
-  // user can confirm the row exists.
+  chat_view_open(idx);
 }
 
 static void channels_list_populate(int focus_row) {
@@ -494,6 +564,140 @@ static void open_add_channel_popup() {
     lv_indev_set_group(enc, s_edit_group);
     lv_group_focus_obj(s_edit_widget);
     lv_group_set_editing(s_edit_group, true);
+  }
+}
+
+// ---------- Chat view (S3.4 step 2/3) ---------------------------------------
+
+// Format ring-buffer entries for the currently-open channel into the
+// history label. Newest at the bottom, oldest first. Each line is
+// either the raw "sender: text" payload from the wire or, for our own
+// sent messages, just "(me): text".
+static void chat_history_render() {
+  if (!s_chat_history || s_chat_channel_idx < 0) return;
+  char out[1200];
+  int oi = 0;
+  out[0] = 0;
+  // Walk the ring oldest-to-newest. s_chat_head points at the next slot
+  // to write; s_chat_count says how many entries are populated.
+  int start = (s_chat_head - s_chat_count + CHAT_RING_SIZE) % CHAT_RING_SIZE;
+  for (int n = 0; n < s_chat_count; n++) {
+    int i = (start + n) % CHAT_RING_SIZE;
+    if (s_chat_ring[i].channel_idx != (uint8_t)s_chat_channel_idx) continue;
+    int rem = (int)sizeof(out) - oi - 2;
+    if (rem <= 0) break;
+    int w = snprintf(&out[oi], rem, "%s\n", s_chat_ring[i].text);
+    if (w < 0) break;
+    oi += (w > rem) ? rem : w;
+  }
+  if (oi == 0) {
+    lv_label_set_text(s_chat_history, "(no messages yet)");
+  } else {
+    if (oi > 0 && out[oi-1] == '\n') out[oi-1] = 0;
+    lv_label_set_text(s_chat_history, out);
+  }
+  lv_obj_scroll_to_y(s_chat_history, INT16_MAX, LV_ANIM_OFF);   // pin to bottom
+}
+
+static void chat_compose_render() {
+  if (!s_chat_compose) return;
+  // Tail-visibility: show only the end of the buffer so the cursor is
+  // always on screen. A leading … signals truncation. The character
+  // counter lives on its own widget above the compose box so it
+  // doesn't crowd the text.
+  const int max_chars = (int)sizeof(s_compose_buf) - 1;
+  const int visible = 48;
+  const char* tail = s_compose_buf;
+  bool truncated = false;
+  if (s_compose_len > visible) {
+    tail = s_compose_buf + (s_compose_len - visible);
+    truncated = true;
+  }
+  char buf[160];
+  if (s_compose_len == 0) {
+    snprintf(buf, sizeof(buf), "> _");
+  } else {
+    snprintf(buf, sizeof(buf), "> %s%s_", truncated ? "…" : "", tail);
+  }
+  lv_label_set_text(s_chat_compose, buf);
+
+  if (s_chat_counter) {
+    char cbuf[16];
+    snprintf(cbuf, sizeof(cbuf), "%d/%d", s_compose_len, max_chars);
+    lv_label_set_text(s_chat_counter, cbuf);
+    // Tint red when within 10 chars of the limit.
+    uint32_t col = (s_compose_len > max_chars - 10) ? 0xe05050 : 0x707880;
+    lv_obj_set_style_text_color(s_chat_counter, lv_color_hex(col), 0);
+  }
+}
+
+static void chat_view_open(int channel_idx) {
+  s_chat_open = true;
+  s_chat_channel_idx = channel_idx;
+  s_compose_buf[0] = 0;
+  s_compose_len = 0;
+  // Hide the channels list while the chat is active.
+  if (s_channel_list) lv_obj_add_flag(s_channel_list, LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_history) lv_obj_remove_flag(s_chat_history, LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_compose) lv_obj_remove_flag(s_chat_compose, LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_counter) lv_obj_remove_flag(s_chat_counter, LV_OBJ_FLAG_HIDDEN);
+
+  // Title shows which channel we're chatting in.
+  char title[40];
+  char chname[40];
+  if (ui_get_channel_name && ui_get_channel_name(channel_idx, chname, sizeof(chname))) {
+    if (strcmp(chname, "Public") == 0) {
+      snprintf(title, sizeof(title), "Public");
+    } else {
+      snprintf(title, sizeof(title), "#%s", chname);
+    }
+  } else {
+    snprintf(title, sizeof(title), "chat #%d", channel_idx);
+  }
+  lv_label_set_text(s_subscreen_title, title);
+
+  chat_history_render();
+  chat_compose_render();
+}
+
+static void chat_view_close() {
+  s_chat_open = false;
+  s_chat_channel_idx = -1;
+  if (s_chat_history) lv_obj_add_flag(s_chat_history, LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_compose) lv_obj_add_flag(s_chat_compose, LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_counter) lv_obj_add_flag(s_chat_counter, LV_OBJ_FLAG_HIDDEN);
+  // Return to channels list within the Messages sub-screen.
+  lv_label_set_text(s_subscreen_title, TILES[1].title);
+  if (s_channel_list) lv_obj_remove_flag(s_channel_list, LV_OBJ_FLAG_HIDDEN);
+  channels_list_populate(0);
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (enc && s_channel_group) {
+    lv_indev_set_group(enc, s_channel_group);
+    lv_group_set_editing(s_channel_group, false);
+  }
+}
+
+// Append a message to the ring buffer. Older entries are evicted FIFO.
+static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char* text) {
+  ChatMsg& slot = s_chat_ring[s_chat_head];
+  slot.channel_idx = channel_idx;
+  slot.timestamp = timestamp;
+  size_t n = strlen(text);
+  if (n >= sizeof(slot.text)) n = sizeof(slot.text) - 1;
+  memcpy(slot.text, text, n);
+  slot.text[n] = 0;
+  s_chat_head = (s_chat_head + 1) % CHAT_RING_SIZE;
+  if (s_chat_count < CHAT_RING_SIZE) s_chat_count++;
+}
+
+// Called by MyMesh::onChannelMessageRecv. Single-threaded with the LVGL
+// rendering, so we can update the UI directly when the active chat
+// matches.
+extern "C" void ui_on_channel_message(int channel_idx, uint32_t timestamp, const char* text) {
+  if (!text) return;
+  chat_ring_push((uint8_t)channel_idx, timestamp, text);
+  if (s_chat_open && s_chat_channel_idx == channel_idx) {
+    chat_history_render();
   }
 }
 
@@ -848,6 +1052,38 @@ static void build_ui() {
 
   s_channel_group = lv_group_create();
 
+  // Chat-view widgets — history label (top, scrollable) + compose
+  // label (bottom). Both hidden until chat_view_open() shows them.
+  s_chat_history = lv_label_create(s_subscreen_root);
+  lv_obj_remove_style_all(s_chat_history);
+  lv_obj_set_size(s_chat_history, lv_pct(96), lv_pct(60));
+  lv_obj_align(s_chat_history, LV_ALIGN_TOP_LEFT, 6, 44);
+  lv_label_set_long_mode(s_chat_history, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_color(s_chat_history, lv_color_hex(0xc0c8d0), 0);
+  lv_obj_set_style_bg_color(s_chat_history, lv_color_hex(0x0e141b), 0);
+  lv_obj_add_flag(s_chat_history, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(s_chat_history, LV_DIR_VER);
+  lv_obj_add_flag(s_chat_history, LV_OBJ_FLAG_HIDDEN);
+
+  s_chat_compose = lv_label_create(s_subscreen_root);
+  lv_obj_set_size(s_chat_compose, lv_pct(96), 24);
+  lv_obj_align(s_chat_compose, LV_ALIGN_BOTTOM_LEFT, 6, -4);
+  lv_label_set_long_mode(s_chat_compose, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_color(s_chat_compose, lv_color_hex(0xFAA61A), 0);
+  lv_obj_set_style_bg_color(s_chat_compose, lv_color_hex(0x1c2530), 0);
+  lv_obj_set_style_bg_opa(s_chat_compose, LV_OPA_COVER, 0);
+  lv_obj_set_style_pad_hor(s_chat_compose, 6, 0);
+  lv_obj_set_style_radius(s_chat_compose, 4, 0);
+  lv_obj_add_flag(s_chat_compose, LV_OBJ_FLAG_HIDDEN);
+
+  // Character-count indicator just above the compose box — kept on its
+  // own widget so the message text and the counter never share a line.
+  s_chat_counter = lv_label_create(s_subscreen_root);
+  lv_label_set_text(s_chat_counter, "");
+  lv_obj_set_style_text_color(s_chat_counter, lv_color_hex(0x707880), 0);
+  lv_obj_align(s_chat_counter, LV_ALIGN_BOTTOM_RIGHT, -8, -30);
+  lv_obj_add_flag(s_chat_counter, LV_OBJ_FLAG_HIDDEN);
+
   // ---- Persistent header (always visible) ----
   // Parented to the screen itself and built AFTER s_root + s_subscreen_root
   // so it paints on top of both — node name, DC usage and battery stay
@@ -971,8 +1207,24 @@ void UITask::loop() {
     // In a vertical list "rotate up" reading should move the focus up too —
     // invert the encoder delta while we're not on the horizontal carousel.
     int sign = s_in_subscreen ? -1 : 1;
-    while (s_quad_accum >= 4)  { tpager_lvgl_encoder_delta(+1 * sign); s_quad_accum -= 4; }
-    while (s_quad_accum <= -4) { tpager_lvgl_encoder_delta(-1 * sign); s_quad_accum += 4; }
+    while (s_quad_accum >= 4)  {
+      if (s_chat_open && s_chat_history) {
+        // In chat view encoder = scroll the history label (LVGL otherwise
+        // moves focus, but there's no useful group here).
+        lv_obj_scroll_by(s_chat_history, 0, -20, LV_ANIM_OFF);
+      } else {
+        tpager_lvgl_encoder_delta(+1 * sign);
+      }
+      s_quad_accum -= 4;
+    }
+    while (s_quad_accum <= -4) {
+      if (s_chat_open && s_chat_history) {
+        lv_obj_scroll_by(s_chat_history, 0, +20, LV_ANIM_OFF);
+      } else {
+        tpager_lvgl_encoder_delta(-1 * sign);
+      }
+      s_quad_accum += 4;
+    }
 
     _auto_off = millis() + AUTO_OFF_MILLIS;
     if (_display && !_display->isOn()) _display->turnOn();
@@ -1021,6 +1273,10 @@ void UITask::loop() {
           lv_indev_t* enc2 = tpager_lvgl_get_encoder();
           if (enc2 && back_group) lv_indev_set_group(enc2, back_group);
           s_editing_idx = -1;
+          s_skip_next_click = true;
+        } else if (s_chat_open) {
+          // One level back: chat → channels list (stays inside Messages).
+          chat_view_close();
           s_skip_next_click = true;
         } else if (s_in_subscreen) {
           leave_subscreen();

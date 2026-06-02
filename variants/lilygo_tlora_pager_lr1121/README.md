@@ -140,25 +140,39 @@ hands doesn't have to rediscover them:
   every sub-screen, so DC and battery never require leaving the current
   tile.
 
-## Channels (S3.4 — work in progress)
+## Channels (S3.4)
 
-* Messages tile now hosts a channels list. Top row is "+ Add channel";
+* Messages tile hosts a channels list. Top row is "+ Add channel";
   remaining rows show the joined channels (`Public` is pre-populated by
   MyMesh; everything else gets a `#` prefix in the UI).
-* Clicking "+ Add channel" opens a text-input popup. Allowed chars are
-  lowercase letters + digits + `-`. Enter / encoder-click commits.
-* Add path derives the 16-byte secret as `SHA256("#"+name)[0..15]`
-  (MeshCore hashtag convention) and stores it via the new
-  `MyMesh::uiAddHashtagChannel()` helper. The store walks the channel
-  table for an empty slot so existing channels are never overwritten.
+* "+ Add channel" opens a text-input popup. Allowed chars are
+  lowercase letters + digits + `-`. The 16-byte channel secret is
+  derived as `SHA256("#"+name)[0..15]` (MeshCore hashtag convention)
+  and stored via `MyMesh::uiAddHashtagChannel()` — that helper walks
+  `channels[]` for an empty slot so existing channels are never
+  overwritten (the upstream `addChannel` would otherwise reuse slot 1
+  after a reboot, because `loadChannels` doesn't bump `num_channels`).
 * `MAX_GROUP_CHANNELS=40` on this build (set in `platformio.ini`).
-* Clicking on an existing channel row is a no-op for now — the chat
-  view (history + compose) is the next step (S3.4 step 2/3).
+* Clicking on a channel row opens a **chat view** for that channel:
+  - Top ~60% of the screen: scrollable history label rendered from a
+    shared 32-entry in-memory ring buffer. Newest message at the
+    bottom; encoder rotation scrolls the history.
+  - Bottom: orange compose bar showing the tail of the message buffer
+    (last ~48 chars, with leading `…` when truncated). A separate
+    counter `X/120` above it goes red once you're within 10 chars of
+    the limit.
+  - Type via QWERTY + FN symbol layer (FN+Space gives `#`). Enter
+    sends via `sendGroupMessage`; the local copy is pushed into the
+    ring buffer with a `(me):` prefix so it appears immediately.
+  - Long-press goes back to the channels list; another long-press
+    returns to the carousel.
+* Receive integration: `MyMesh::onChannelMessageRecv` calls a weak
+  `ui_on_channel_message(channel_idx, ts, text)` hook (after the
+  existing `_ui->newMsg`); the variant UI implements it to push into
+  the ring buffer and re-render the history if the matching channel
+  is currently open.
 
 ## TODO (next phases)
-
-- S3.4 step 2/3: chat view per channel — scrollable history of received
-  messages + compose box that sends GROUP_TXT via `sendGroupMessage`.
 - S3.5: contacts tile (heard adverts) with favourite flag and a
   not-favourite-first eviction policy when the 350-contact cap is hit.
 - S3.6: map renderer — XYZ raster tiles from microSD. Five base

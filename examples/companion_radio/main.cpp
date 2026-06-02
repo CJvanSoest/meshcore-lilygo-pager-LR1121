@@ -222,6 +222,20 @@ extern "C" bool ui_add_hashtag_channel(const char* name) {
   return true;
 }
 
+// Send a chat message to a channel by index. Returns false if the
+// channel is empty or sendGroupMessage rejects the payload. The
+// caller is responsible for the channel index — variant UIs find it
+// via ui_get_channel_name iteration.
+extern "C" bool ui_send_group_text(int channel_idx, const char* text) {
+  if (!text || !text[0]) return false;
+  ChannelDetails ch;
+  if (!the_mesh.getChannel(channel_idx, ch) || !ch.name[0]) return false;
+  uint32_t now = the_mesh.getRTCClock()->getCurrentTime();
+  return the_mesh.sendGroupMessage(now, ch.channel,
+                                   the_mesh.getNodeName(),
+                                   text, strlen(text));
+}
+
 // Apply a new default-scope name from the variant UI. The HMAC key
 // is derived from "#"+name via TransportKeyStore::getAutoKeyFor — same
 // pattern MyMesh uses at first-boot from DEFAULT_FLOOD_SCOPE_NAME.
