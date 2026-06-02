@@ -24,10 +24,10 @@ struct TileDef {
 };
 static const TileDef TILES[] = {
   { LV_SYMBOL_WIFI,      "Radio"    },   // ((•))
-  { LV_SYMBOL_ENVELOPE,  "Messages" },   // envelope
+  { LV_SYMBOL_ENVELOPE,  "Channels" },   // envelope (was "Messages" — group chats live here)
   { LV_SYMBOL_GPS,       "Map"      },   // location pin
   { LV_SYMBOL_SETTINGS,  "Settings" },   // gear
-  { LV_SYMBOL_LIST,      "Contacts" },   // bullet list
+  { LV_SYMBOL_LIST,      "Contacts" },   // bullet list (favorites in S3.6c)
   { LV_SYMBOL_HOME,      "About"    },   // home/info
 };
 static const int NUM_TILES = sizeof(TILES) / sizeof(TILES[0]);
