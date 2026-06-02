@@ -1280,7 +1280,10 @@ static void discovered_list_populate() {
     lv_obj_set_size(row, lv_pct(100), 22);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
-    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), 0);
+    // Match the data-row text color (light grey normal, orange focused)
+    // so the focus transition is visible — otherwise orange-on-grey
+    // looks identical to orange-on-grey when focused.
+    lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);

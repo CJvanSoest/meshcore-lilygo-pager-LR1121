@@ -155,6 +155,11 @@ static const char kb_keymap_symbol[4][10] = {
   {'#', '\0','\0','\0','\0','\0','\0','\0','\0','\0'}
 };
 #define TPAGER_KB_FN_RAW 21    // row 2, col 0 — the orange "FN" key
+// Caps-lock key: the unmarked key right of M (row 2, col 8, raw = 29).
+// LilyGo's factory layout leaves this slot blank in their symbol_map.
+// We bind it to a sticky caps-lock toggle so letters can be capitalised
+// without holding a shift modifier (the board has no Shift key).
+#define TPAGER_KB_CAPS_RAW 29
 
 static void kb_begin() {
   _kb_ok = _kb.begin(TCA8418_DEFAULT_ADDR, &Wire);
@@ -199,6 +204,7 @@ extern "C" void variant_loop() {
   // Static so the modifier state survives across loop ticks — FN can be
   // pressed for hundreds of millis before the user reaches the next key.
   static bool s_fn_held = false;
+  static bool s_caps_lock = false;     // sticky; toggled by the key right of M
 
   while (_kb.available()) {
     uint8_t ev = _kb.getEvent();
@@ -216,6 +222,15 @@ extern "C" void variant_loop() {
       continue;
     }
 
+    // Caps-lock — toggle on key-down only (sticky).
+    if (k == TPAGER_KB_CAPS_RAW) {
+      if (pressed) {
+        s_caps_lock = !s_caps_lock;
+        Serial.printf("KB CAPS %s\n", s_caps_lock ? "on" : "off");
+      }
+      continue;
+    }
+
     if (!pressed) continue;            // only act on key-down for the rest
 
     char c = '\0';
@@ -226,9 +241,16 @@ extern "C" void variant_loop() {
       int col = (k - 1) % 10;
       if (row >= 0 && row < 4 && col >= 0 && col < 10) {
         c = s_fn_held ? kb_keymap_symbol[row][col] : kb_keymap[row][col];
+        // Caps-lock only affects letters in the base layer. FN-layer
+        // symbols and Enter/Space/Backspace pass through unchanged.
+        if (!s_fn_held && s_caps_lock && c >= 'a' && c <= 'z') {
+          c = (char)(c - 'a' + 'A');
+        }
       }
     }
-    Serial.printf("KB raw=%u ch=%c%s\n", k, c ? c : '?', s_fn_held ? " (FN)" : "");
+    Serial.printf("KB raw=%u ch=%c%s%s\n", k, c ? c : '?',
+                  s_fn_held ? " (FN)" : "",
+                  s_caps_lock ? " (CAPS)" : "");
 
     if (c != '\0' && ui_input_char) ui_input_char(c);
   }
