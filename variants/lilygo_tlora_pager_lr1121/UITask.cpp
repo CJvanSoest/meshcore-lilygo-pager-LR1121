@@ -779,25 +779,69 @@ static void chat_history_append_line(const char* line) {
   }
   lv_style_set_text_color(&sp_who->style, lv_color_hex(0x55cc66));
 
-  // Message body — light grey.
-  if (colon) {
-    const char* body = colon + 1;
-    while (*body == ' ') body++;
-    char tail[160];
-    int n = snprintf(tail, sizeof(tail), "%s\n", body);
-    (void)n;
-    lv_span_t* sp_msg = lv_spangroup_new_span(s_chat_history);
-    if (sp_msg) {
-      lv_span_set_text(sp_msg, tail);
-      lv_style_set_text_color(&sp_msg->style, lv_color_hex(0xc0c8d0));
-    }
-  } else {
+  // Message body — light grey with @-mentions highlighted blue.
+  if (!colon) {
     lv_span_t* sp_nl = lv_spangroup_new_span(s_chat_history);
     if (sp_nl) {
       lv_span_set_text(sp_nl, "\n");
       lv_style_set_text_color(&sp_nl->style, lv_color_hex(0xc0c8d0));
     }
+    return;
   }
+  const char* body = colon + 1;
+  while (*body == ' ') body++;
+
+  // Walk the body and split into alternating grey / blue spans. Mentions
+  // start at '@' and run until the next non-name char (letters, digits,
+  // '-' and '_' are part of the name; everything else breaks the token).
+  auto is_name_char = [](char c) -> bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '-' || c == '_';
+  };
+
+  char buf[160];
+  int bi = 0;
+  auto flush_grey = [&]() {
+    if (bi == 0) return;
+    buf[bi] = 0;
+    lv_span_t* sp = lv_spangroup_new_span(s_chat_history);
+    if (sp) {
+      lv_span_set_text(sp, buf);
+      lv_style_set_text_color(&sp->style, lv_color_hex(0xc0c8d0));
+    }
+    bi = 0;
+  };
+
+  for (const char* p = body; *p; p++) {
+    if (*p == '@') {
+      flush_grey();
+      // Collect mention token including the '@'.
+      char mention[40];
+      int mi = 0;
+      mention[mi++] = '@';
+      p++;
+      while (*p && is_name_char(*p) && mi < (int)sizeof(mention) - 1) {
+        mention[mi++] = *p++;
+      }
+      mention[mi] = 0;
+      lv_span_t* sp = lv_spangroup_new_span(s_chat_history);
+      if (sp) {
+        lv_span_set_text(sp, mention);
+        lv_style_set_text_color(&sp->style, lv_color_hex(0x5ab8ff));
+      }
+      if (!*p) break;
+      // The non-name char that broke the token still needs to be emitted
+      // — fall through and the outer loop will pick it up next iteration.
+      // p currently points at it, but the loop's p++ would skip past;
+      // back up one so the increment lands on this char.
+      p--;
+      continue;
+    }
+    if (bi < (int)sizeof(buf) - 1) buf[bi++] = *p;
+  }
+  // Trailing newline goes in the last grey span so word-wrap is clean.
+  if (bi < (int)sizeof(buf) - 1) buf[bi++] = '\n';
+  flush_grey();
 }
 
 // Format ring-buffer entries for the currently-open chat into the
