@@ -204,6 +204,19 @@ static void dm_list_populate();
 static void dm_chat_view_open(const uint8_t* pub_key, const char* peer_name);
 static void ch_menu_show(int populated_idx);
 static void ch_menu_close();
+
+// High-contrast focused state for popup buttons (disc / con / ch menus).
+// Default LVGL theme gives a too-subtle outline that's hard to track on
+// the ST7796 panel — applying orange bg + dark text matches the row
+// focus style used by the list tiles.
+static void style_popup_button(lv_obj_t* btn) {
+  lv_obj_set_style_bg_color(btn, lv_color_hex(0x1c2530), 0);
+  lv_obj_set_style_text_color(btn, lv_color_hex(0xc0c8d0), 0);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+  lv_obj_set_style_text_color(btn, lv_color_hex(0x101418), LV_STATE_FOCUSED);
+  lv_obj_set_style_border_width(btn, 0, 0);
+  lv_obj_set_style_border_width(btn, 0, LV_STATE_FOCUSED);
+}
 // No per-row cache for the DM list — DRAM is tight (88%+) so the click
 // handler refetches contact info on-demand via ui_get_dm_contact_info(idx).
 
@@ -218,6 +231,9 @@ extern "C" bool ui_get_channel_name(int idx, char* buf, int buf_size) __attribut
 extern "C" bool ui_add_hashtag_channel(const char* name) __attribute__((weak));
 extern "C" bool ui_delete_channel(int populated_idx) __attribute__((weak));
 extern "C" bool ui_send_group_text(int channel_idx, const char* text) __attribute__((weak));
+extern "C" bool ui_send_self_advert(bool flood) __attribute__((weak));
+extern "C" void ui_set_node_name(const char* name) __attribute__((weak));
+extern "C" const char* ui_get_node_name() __attribute__((weak));
 
 // Contacts bridges (S3.5 — S3.6c filters to favorites; S3.6b adds the
 // "Discovered" ring-buffer view as a sibling tile).
@@ -551,9 +567,9 @@ static void radio_list_populate(NodePrefs* p, int focus_row) {
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 24);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
-    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0x101418), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 8, 0);
     lv_obj_set_style_pad_ver(row, 2, 0);
     lv_obj_set_style_radius(row, 4, 0);
@@ -650,10 +666,10 @@ static void channels_list_populate(int focus_row) {
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 24);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_text_color(row,
         is_add ? lv_color_hex(0xFAA61A) : lv_color_hex(0xc0c8d0), 0);
-    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0x101418), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 8, 0);
     lv_obj_set_style_pad_ver(row, 2, 0);
     lv_obj_set_style_radius(row, 4, 0);
@@ -1069,9 +1085,9 @@ static void contacts_list_populate() {
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 22);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
-    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0x101418), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_margin_bottom(row, 1, 0);
@@ -1189,9 +1205,9 @@ static void dm_list_populate() {
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 26);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
-    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0x101418), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_margin_bottom(row, 1, 0);
@@ -1234,6 +1250,13 @@ static void disc_row_clicked(lv_event_t* e) {
   disc_menu_show(idx);
 }
 
+// "+ Send advert" row click handler. user_data carries 0 for zero-hop,
+// 1 for flood.
+static void send_advert_row_clicked(lv_event_t* e) {
+  bool flood = (bool)(intptr_t)lv_event_get_user_data(e);
+  if (ui_send_self_advert) ui_send_self_advert(flood);
+}
+
 static void discovered_list_populate() {
   if (!s_discovered_list || !ui_get_discovered_count) return;
   lv_obj_clean(s_discovered_list);
@@ -1241,6 +1264,36 @@ static void discovered_list_populate() {
 
   double self_lat = 0, self_lon = 0;
   if (ui_get_self_loc) ui_get_self_loc(&self_lat, &self_lon);
+
+  // "+ Send advert" action rows — top of list so they're always reachable
+  // even with a long node list. Two variants: direct (zero-hop, neighbours
+  // only) and flood (relayed beyond direct reach).
+  auto add_action_row = [&](const char* text, bool flood) {
+    lv_obj_t* row = lv_obj_create(s_discovered_list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), 22);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), 0);
+    lv_obj_set_style_text_color(row, lv_color_hex(0x101418), LV_STATE_FOCUSED);
+    lv_obj_set_style_pad_hor(row, 6, 0);
+    lv_obj_set_style_radius(row, 4, 0);
+    lv_obj_set_style_margin_bottom(row, 1, 0);
+    lv_obj_set_style_border_color(row, lv_color_hex(0x303a47), 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    lv_obj_add_event_cb(row, send_advert_row_clicked, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)(flood ? 1 : 0));
+    lv_obj_add_event_cb(row, back_long_press_event, LV_EVENT_LONG_PRESSED, NULL);
+    lv_obj_t* lbl = lv_label_create(row);
+    lv_label_set_text(lbl, text);
+    if (s_discovered_group) lv_group_add_obj(s_discovered_group, row);
+  };
+  add_action_row("+ Send advert (direct)", false);
+  add_action_row("+ Send advert (flood)",  true);
 
   // Header (same widths as Contacts — column constants are shared).
   {
@@ -1285,9 +1338,9 @@ static void discovered_list_populate() {
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 22);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
-    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0x101418), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_margin_bottom(row, 1, 0);
@@ -1837,7 +1890,9 @@ static void build_ui() {
   // the header (we don't want the header eating popup pixels).
   s_header_label = lv_label_create(scr);
   lv_label_set_text(s_header_label, "T-Pager");
-  lv_obj_set_style_text_color(s_header_label, lv_color_hex(0xFAA61A), 0);
+  // Same muted-grey as the DC label so the persistent top row reads as
+  // one cohesive status strip instead of three competing colors.
+  lv_obj_set_style_text_color(s_header_label, lv_color_hex(0x80868f), 0);
   lv_obj_align(s_header_label, LV_ALIGN_TOP_LEFT, 6, 4);
 
   s_dc_label = lv_label_create(scr);
@@ -1898,6 +1953,7 @@ static void build_ui() {
   for (int b = 0; b < 3; b++) {
     s_disc_menu_buttons[b] = lv_button_create(s_disc_menu_popup);
     lv_obj_set_size(s_disc_menu_buttons[b], lv_pct(80), 26);
+    style_popup_button(s_disc_menu_buttons[b]);
     lv_obj_t* lbl = lv_label_create(s_disc_menu_buttons[b]);
     lv_label_set_text(lbl, btn_labels[b]);
     lv_obj_center(lbl);
@@ -1948,6 +2004,7 @@ static void build_ui() {
   for (int b = 0; b < 3; b++) {
     s_con_menu_buttons[b] = lv_button_create(s_con_menu_popup);
     lv_obj_set_size(s_con_menu_buttons[b], lv_pct(80), 26);
+    style_popup_button(s_con_menu_buttons[b]);
     lv_obj_t* lbl = lv_label_create(s_con_menu_buttons[b]);
     lv_label_set_text(lbl, con_btn_labels[b]);
     lv_obj_center(lbl);
@@ -2011,6 +2068,7 @@ static void build_ui() {
   for (int b = 0; b < 3; b++) {
     s_ch_menu_buttons[b] = lv_button_create(s_ch_menu_popup);
     lv_obj_set_size(s_ch_menu_buttons[b], lv_pct(80), 26);
+    style_popup_button(s_ch_menu_buttons[b]);
     lv_obj_t* lbl = lv_label_create(s_ch_menu_buttons[b]);
     lv_label_set_text(lbl, ch_btn_labels[b]);
     lv_obj_center(lbl);

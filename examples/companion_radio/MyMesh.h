@@ -259,6 +259,35 @@ public:
     return false;
   }
 
+  // Variant-UI self-advert send (S3.6 round 3). Builds the same packet
+  // the companion-app CMD_SEND_SELF_ADVERT path produces. `flood=true`
+  // sends a flood-routed advert (visible to the mesh beyond direct
+  // neighbours); flood=false sends zero-hop (only direct hearers).
+  bool uiSendSelfAdvert(bool flood) {
+    mesh::Packet* pkt;
+    if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
+      pkt = createSelfAdvert(_prefs.node_name);
+    } else {
+      pkt = createSelfAdvert(_prefs.node_name, sensors.node_lat, sensors.node_lon);
+    }
+    if (!pkt) return false;
+    if (flood) {
+      TransportKey default_scope;
+      memcpy(&default_scope.key, _prefs.default_scope_key, sizeof(default_scope.key));
+      sendFloodScoped(default_scope, pkt, /*delay=*/0);
+    } else {
+      sendZeroHop(pkt);
+    }
+    return true;
+  }
+
+  // Variant-UI rename — set node_name + persist.
+  void uiSetNodeName(const char* name) {
+    if (!name) return;
+    StrHelper::strncpy(_prefs.node_name, name, sizeof(_prefs.node_name));
+    savePrefs();
+  }
+
   // Variant-UI DM send (S3.6d). Looks up the contact by pub_key, calls
   // sendMessage() with the current RTC time. Returns false if the
   // contact isn't in contacts[] (DM requires a known contact —

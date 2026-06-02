@@ -234,6 +234,22 @@ extern "C" bool ui_delete_channel(int populated_idx) {
   return true;
 }
 
+// Send a self-advert from the UI (Discovered tile "+ Send advert" row).
+// `flood=true` reaches the mesh beyond direct neighbours; false stays
+// local. Matches the companion-app CMD_SEND_SELF_ADVERT flow.
+extern "C" bool ui_send_self_advert(bool flood) {
+  return the_mesh.uiSendSelfAdvert(flood);
+}
+
+// Set the pager's node_name (Settings tile rename field) and persist.
+extern "C" void ui_set_node_name(const char* name) {
+  the_mesh.uiSetNodeName(name);
+}
+
+extern "C" const char* ui_get_node_name() {
+  return the_mesh.getNodePrefs()->node_name;
+}
+
 // ----------- Contacts (S3.5) -------------------------------------------------
 //
 // Per-contact SNR / RSSI cache. Keyed by an 8-byte prefix of the
