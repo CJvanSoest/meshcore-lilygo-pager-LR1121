@@ -2409,11 +2409,15 @@ void UITask::loop() {
     }
     if (s_dc_label && ui_get_duty_cycle_used_tenths) {
       int t = ui_get_duty_cycle_used_tenths();   // 0..1000 (0.0%..100.0%)
-      int used_s = 0, max_s = 0;
-      if (ui_get_duty_cycle_seconds) ui_get_duty_cycle_seconds(&used_s, &max_s);
-      char buf[32];
-      snprintf(buf, sizeof(buf), "DC %d.%d%% %ds/%ds",
-               t / 10, t % 10, used_s, max_s);
+      int used_ms = 0, max_s = 0;
+      if (ui_get_duty_cycle_seconds) ui_get_duty_cycle_seconds(&used_ms, &max_s);
+      char buf[40];
+      // used in ms, max in s. Display used as X.Xs (one decimal) so a
+      // single 80-200 ms advert visibly moves the counter.
+      int used_s_whole = used_ms / 1000;
+      int used_tenths  = (used_ms / 100) % 10;
+      snprintf(buf, sizeof(buf), "DC %d.%d%% %d.%ds/%ds",
+               t / 10, t % 10, used_s_whole, used_tenths, max_s);
       lv_label_set_text(s_dc_label, buf);
       // Tint: amber over 70% used, red over 90%, otherwise low-contrast.
       uint32_t col = (t > 900) ? 0xe05050

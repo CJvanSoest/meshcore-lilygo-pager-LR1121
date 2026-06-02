@@ -133,17 +133,17 @@ extern "C" int ui_get_duty_cycle_used_tenths() {
   return (int)((used * 1000UL) / max_budget);
 }
 
-// Same data exposed as "X seconds used out of Y seconds allowed per
-// hour-window", which is what the Tanmatsu UI also surfaces — easier
-// to interpret than a bare percentage when you're tracking your DC
-// quota live during a chat.
-extern "C" void ui_get_duty_cycle_seconds(int* used_s, int* max_s) {
+// Same data exposed as airtime numbers. Returns USED in milliseconds
+// (1 ms resolution so even a single 80-200 ms advert shifts the
+// display) and MAX in seconds (matches the per-hour quota in human
+// units). UI formats `X.Xs / Ys`.
+extern "C" void ui_get_duty_cycle_seconds(int* used_ms, int* max_s) {
   auto* p = the_mesh.getNodePrefs();
   float duty_cycle = 1.0f / (1.0f + p->airtime_factor);
   unsigned long max_budget = (unsigned long)(3600000UL * duty_cycle);
   unsigned long used = the_mesh.getTotalAirTime();
-  if (used_s) *used_s = (int)(used / 1000UL);
-  if (max_s)  *max_s  = (int)(max_budget / 1000UL);
+  if (used_ms) *used_ms = (int)used;
+  if (max_s)   *max_s   = (int)(max_budget / 1000UL);
 }
 
 // Channel bridges for the variant UI.
