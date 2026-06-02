@@ -3,6 +3,15 @@
 #include <Arduino.h> // needed for PlatformIO
 #include <Mesh.h>
 
+// Variant-UI hook: deliver per-channel incoming text + channel index so a
+// per-channel chat view can append to its own ring buffer. C-linkage
+// matters: definitions in UITask.cpp use `extern "C"`, and a C++-mangled
+// weak decl would never bind to them. (Linkage-spec must be at namespace
+// scope.)
+extern "C" void ui_on_channel_message(int channel_idx, uint32_t timestamp,
+                                      const char* text)
+    __attribute__((weak));
+
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
 #define CMD_SEND_CHANNEL_TXT_MSG      3
@@ -575,13 +584,9 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
   }
   if (_ui) _ui->newMsg(path_len, channel_name, text, offline_queue_len);
 
-  // Variant-UI hook: deliver the raw text + channel index so a
-  // per-channel chat view can append it to its own ring buffer. The
-  // existing newMsg only carries the channel name (string) which makes
-  // it ambiguous when two channels share a prefix.
-  extern void ui_on_channel_message(int channel_idx, uint32_t timestamp,
-                                    const char* text)
-      __attribute__((weak));
+  // Variant-UI hook (see file-scope decl above). Strong def in UITask.cpp
+  // is `extern "C"`; without matching the linkage here the C++-mangled
+  // weak decl never resolved to it and the hook stayed silently dead.
   if (ui_on_channel_message) {
     ui_on_channel_message(channel_idx, timestamp, text);
   }

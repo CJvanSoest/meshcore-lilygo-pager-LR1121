@@ -103,12 +103,23 @@ void BaseChatMesh::populateContactFromAdvert(ContactInfo& ci, const mesh::Identi
   ci.lastmod = getRTCClock()->getCurrentTime();
 }
 
-// Variant-UI hook: deliver the per-packet RSSI/SNR alongside the identity
-// so a Contacts tile can show signal strength per node. C-linkage matters:
-// the definition (e.g. companion_radio/main.cpp) is `extern "C"`. A C++
-// decl would mangle to a different symbol and the weak resolution would
-// silently never fire. (Linkage-spec must be at namespace scope.)
+// Variant-UI hooks. C-linkage matters: definitions live in companion_radio
+// (and similar) as `extern "C"`. A C++ decl would mangle to a different
+// symbol and the weak resolution would silently never fire.
+//
+// ui_on_advert_received fires only for adverts that pass the auto-add
+// filter (i.e. that end up in contacts[]); useful for Contacts-tile
+// SNR/RSSI updates.
+//
+// ui_on_advert_seen fires for EVERY advert before the auto-add filter,
+// so a "Discovered nodes" UI can show signals that aren't being stored
+// as contacts (chats default to not-auto-added on many companion-app
+// configs).
 extern "C" void ui_on_advert_received(const uint8_t* pub_key, float snr, float rssi)
+    __attribute__((weak));
+extern "C" void ui_on_advert_seen(const uint8_t* pub_key, const char* name,
+                                  uint8_t type, float snr, float rssi,
+                                  uint8_t path_len)
     __attribute__((weak));
 
 void BaseChatMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len) {
@@ -116,6 +127,16 @@ void BaseChatMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, 
   if (!(parser.isValid() && parser.hasName())) {
     MESH_DEBUG_PRINTLN("onAdvertRecv: invalid app_data, or name is missing: len=%d", app_data_len);
     return;
+  }
+
+  // Fire the "seen" hook FIRST — before the contacts-table lookup or any
+  // filter — so a Discovered UI gets every advert regardless of auto-add
+  // policy. Pass the parsed advert name directly rather than looking it up
+  // from contacts[] (the contact may not even exist yet).
+  if (ui_on_advert_seen) {
+    ui_on_advert_seen(id.pub_key, parser.getName(), parser.getType(),
+                      packet->getSNR(), _radio->getLastRSSI(),
+                      packet->path_len);
   }
 
   ContactInfo* from = NULL;

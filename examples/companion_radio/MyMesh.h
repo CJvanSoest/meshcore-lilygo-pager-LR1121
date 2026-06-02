@@ -190,6 +190,50 @@ public:
     return true;
   }
 
+  // Variant-UI bridges for the Discovered + Contacts tiles (S3.6b/c).
+  void uiSaveContacts() { _store->saveContacts(this); }
+
+  // Add a discovered node into contacts[]. Caller passes the cached
+  // pub_key + name + type from the Discovered tile ring buffer. We can't
+  // recover the full advert blob (path, lat/lon, signed payload) without
+  // another advert, but the bare contact entry is enough — the next
+  // onAdvertRecv from that pub_key will fill in the rest naturally.
+  // Returns false on table-full.
+  bool uiAddContact(const uint8_t* pub_key, const char* name, uint8_t type,
+                    bool favorite) {
+    // De-dup: if already present, just update flags + (re-)save.
+    for (int i = 0; i < num_contacts; i++) {
+      if (memcmp(contacts[i].id.pub_key, pub_key, PUB_KEY_SIZE) == 0) {
+        if (favorite) contacts[i].flags |= 0x01;
+        return true;
+      }
+    }
+    if (num_contacts >= MAX_CONTACTS) return false;
+    ContactInfo& ci = contacts[num_contacts];
+    memset(&ci, 0, sizeof(ci));
+    memcpy(ci.id.pub_key, pub_key, PUB_KEY_SIZE);
+    ci.out_path_len = OUT_PATH_UNKNOWN;
+    StrHelper::strncpy(ci.name, name, sizeof(ci.name));
+    ci.type = type;
+    if (favorite) ci.flags |= 0x01;
+    ci.last_advert_timestamp = 0;             // fills on next advert
+    ci.lastmod = getRTCClock()->getCurrentTime();
+    num_contacts++;
+    return true;
+  }
+
+  // Toggle the favorite-bit on a contact, looked up by pub_key prefix
+  // (full 32 bytes). Returns true if found+toggled, false if not present.
+  bool uiToggleFavorite(const uint8_t* pub_key) {
+    for (int i = 0; i < num_contacts; i++) {
+      if (memcmp(contacts[i].id.pub_key, pub_key, PUB_KEY_SIZE) == 0) {
+        contacts[i].flags ^= 0x01;
+        return true;
+      }
+    }
+    return false;
+  }
+
 #if ENV_INCLUDE_GPS == 1
   void applyGpsPrefs() {
     sensors.setSettingValue("gps", _prefs.gps_enabled ? "1" : "0");

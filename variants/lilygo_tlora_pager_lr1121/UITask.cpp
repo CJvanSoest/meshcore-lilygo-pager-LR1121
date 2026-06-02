@@ -22,13 +22,18 @@ struct TileDef {
   const char* symbol;   // LV_SYMBOL_* glyph from the built-in icons font
   const char* title;
 };
+// S3.6 layout — communication tiles first, then map/settings/info.
+// Index meaning is referenced by `enter_subscreen()` switch below; keep
+// the switch in sync if you reorder.
 static const TileDef TILES[] = {
-  { LV_SYMBOL_WIFI,      "Radio"    },   // ((•))
-  { LV_SYMBOL_ENVELOPE,  "Channels" },   // envelope (was "Messages" — group chats live here)
-  { LV_SYMBOL_GPS,       "Map"      },   // location pin
-  { LV_SYMBOL_SETTINGS,  "Settings" },   // gear
-  { LV_SYMBOL_LIST,      "Contacts" },   // bullet list (favorites in S3.6c)
-  { LV_SYMBOL_HOME,      "About"    },   // home/info
+  { LV_SYMBOL_WIFI,      "Radio"      },   // 0 — ((•))
+  { LV_SYMBOL_ENVELOPE,  "Channels"   },   // 1 — group chats (S3.4)
+  { LV_SYMBOL_USB,       "DM"         },   // 2 — direct messages (S3.6d)
+  { LV_SYMBOL_LIST,      "Contacts"   },   // 3 — favorites only (S3.6c)
+  { LV_SYMBOL_EYE_OPEN,  "Discovered" },   // 4 — every advert heard (S3.6b)
+  { LV_SYMBOL_GPS,       "Map"        },   // 5 — placeholder
+  { LV_SYMBOL_SETTINGS,  "Settings"   },   // 6 — placeholder
+  { LV_SYMBOL_HOME,      "About"      },   // 7 — build info
 };
 static const int NUM_TILES = sizeof(TILES) / sizeof(TILES[0]);
 
@@ -47,11 +52,18 @@ static lv_obj_t* s_subscreen_body;
 static lv_obj_t* s_radio_list;
 static lv_obj_t* s_channel_list;     // S3.4 channels list (Messages tile)
 static lv_obj_t* s_contacts_list;    // S3.5 contacts list (Contacts tile)
+static lv_obj_t* s_discovered_list;  // S3.6b discovered list (Discovered tile)
+static lv_obj_t* s_disc_menu_popup;  // S3.6b click-popup (Add / Add fav / Cancel)
+static lv_group_t* s_disc_menu_group;
+static lv_obj_t* s_disc_menu_buttons[3]; // 0=Add, 1=Add fav, 2=Cancel
+static int       s_disc_menu_pubidx = -1;
 static lv_group_t* s_group;          // carousel tiles
 static lv_group_t* s_radio_group;    // Radio settings list rows
 static lv_group_t* s_channel_group;  // Channels list rows
 static lv_group_t* s_contacts_group; // Contacts list rows
 static unsigned long s_contacts_next_refresh = 0;
+static lv_group_t* s_discovered_group; // Discovered list rows
+static unsigned long s_discovered_next_refresh = 0;
 // Special s_editing_idx value used when the text-input popup is open for
 // "add new channel". Out-of-range w.r.t. radio rows so existing
 // per-row dispatch ignores it.
@@ -151,6 +163,9 @@ static void chat_history_render();
 static void chat_compose_render();
 static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char* text);
 static void contacts_list_populate();
+static void discovered_list_populate();
+static void disc_menu_show(int disc_idx);
+static void disc_menu_close();
 
 extern "C" void tpager_power_off() __attribute__((weak));
 extern "C" void ui_apply_radio_changes() __attribute__((weak));
@@ -163,7 +178,8 @@ extern "C" bool ui_get_channel_name(int idx, char* buf, int buf_size) __attribut
 extern "C" bool ui_add_hashtag_channel(const char* name) __attribute__((weak));
 extern "C" bool ui_send_group_text(int channel_idx, const char* text) __attribute__((weak));
 
-// Contacts bridges (S3.5)
+// Contacts bridges (S3.5 — S3.6c filters to favorites; S3.6b adds the
+// "Discovered" ring-buffer view as a sibling tile).
 struct UiContact {
   char     name[32];
   uint8_t  type;
@@ -172,9 +188,16 @@ struct UiContact {
   uint32_t last_advert;
   int8_t   snr_q;
   int16_t  rssi;
+  uint8_t  pub_key[32];     // S3.6c — needed for toggle-favorite + DM thread lookup
+  uint8_t  flags;           // S3.6c — bit 0 = favorite
+  uint8_t  path_len;        // S3.6b — hop count for Discovered rows (0 = direct)
 };
 extern "C" int  ui_get_contact_count() __attribute__((weak));
 extern "C" bool ui_get_contact_info(int idx, UiContact* out) __attribute__((weak));
+extern "C" bool ui_toggle_favorite(const uint8_t* pub_key) __attribute__((weak));
+extern "C" int  ui_get_discovered_count() __attribute__((weak));
+extern "C" bool ui_get_discovered_info(int idx, UiContact* out) __attribute__((weak));
+extern "C" bool ui_add_discovered_to_contacts(int idx, bool favorite) __attribute__((weak));
 extern "C" void ui_get_self_loc(double* lat, double* lon) __attribute__((weak));
 extern "C" uint32_t ui_get_now_epoch() __attribute__((weak));
 // Tenths-of-percent (0..1000) of the duty-cycle quota that has been
@@ -317,13 +340,15 @@ static void enter_subscreen(int idx) {
 
   // Default: simple body label visible, all per-tile containers hidden.
   lv_obj_remove_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
-  if (s_radio_list)    lv_obj_add_flag(s_radio_list,    LV_OBJ_FLAG_HIDDEN);
-  if (s_channel_list)  lv_obj_add_flag(s_channel_list,  LV_OBJ_FLAG_HIDDEN);
-  if (s_contacts_list) lv_obj_add_flag(s_contacts_list, LV_OBJ_FLAG_HIDDEN);
-  if (s_input_label)   lv_obj_add_flag(s_input_label,   LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_history)  lv_obj_add_flag(s_chat_history,  LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_compose)  lv_obj_add_flag(s_chat_compose,  LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_counter)  lv_obj_add_flag(s_chat_counter,  LV_OBJ_FLAG_HIDDEN);
+  if (s_radio_list)      lv_obj_add_flag(s_radio_list,      LV_OBJ_FLAG_HIDDEN);
+  if (s_channel_list)    lv_obj_add_flag(s_channel_list,    LV_OBJ_FLAG_HIDDEN);
+  if (s_contacts_list)   lv_obj_add_flag(s_contacts_list,   LV_OBJ_FLAG_HIDDEN);
+  if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
+  if (s_disc_menu_popup) lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
+  if (s_input_label)     lv_obj_add_flag(s_input_label,     LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_history)    lv_obj_add_flag(s_chat_history,    LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_compose)    lv_obj_add_flag(s_chat_compose,    LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_counter)    lv_obj_add_flag(s_chat_counter,    LV_OBJ_FLAG_HIDDEN);
   s_input_active = false;
   s_chat_open = false;
   s_chat_channel_idx = -1;
@@ -334,27 +359,26 @@ static void enter_subscreen(int idx) {
   char body[160];
   body[0] = 0;
   switch (idx) {
-    case 0: {  // Radio — populate the live settings list
+    case 0: {  // Radio
       lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
       if (s_radio_list) lv_obj_remove_flag(s_radio_list, LV_OBJ_FLAG_HIDDEN);
       if (s_self && s_self->getPrefs()) radio_list_populate(s_self->getPrefs());
       if (enc && s_radio_group) lv_indev_set_group(enc, s_radio_group);
-      return;   // skip the generic label assignment below
+      return;
     }
-    case 1: {  // Messages → S3.4 channels list
+    case 1: {  // Channels (S3.4)
       lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
       if (s_channel_list) lv_obj_remove_flag(s_channel_list, LV_OBJ_FLAG_HIDDEN);
       channels_list_populate(0);
       if (enc && s_channel_group) lv_indev_set_group(enc, s_channel_group);
       return;
     }
-    case 2:
-      snprintf(body, sizeof(body), "GPS view\n\n(coords + sat count: S3.4)");
+    case 2:    // DM tile — placeholder (S3.6d will populate)
+      snprintf(body, sizeof(body),
+               "Direct messages\n\n(coming in S3.6d — per-contact threads,\n"
+               "SD-persisted history)");
       break;
-    case 3:
-      snprintf(body, sizeof(body), "Settings\n\n(global editable list later)");
-      break;
-    case 4: {  // Contacts → S3.5 list of heard nodes
+    case 3: {  // Contacts → favorites-only (S3.6c)
       lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
       if (s_contacts_list) lv_obj_remove_flag(s_contacts_list, LV_OBJ_FLAG_HIDDEN);
       contacts_list_populate();
@@ -362,7 +386,21 @@ static void enter_subscreen(int idx) {
       if (enc && s_contacts_group) lv_indev_set_group(enc, s_contacts_group);
       return;
     }
+    case 4: {  // Discovered (S3.6b) — every advert, even non-auto-added
+      lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
+      if (s_discovered_list) lv_obj_remove_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
+      discovered_list_populate();
+      s_discovered_next_refresh = millis() + 5000;
+      if (enc && s_discovered_group) lv_indev_set_group(enc, s_discovered_group);
+      return;
+    }
     case 5:
+      snprintf(body, sizeof(body), "GPS view\n\n(coords + sat count: later)");
+      break;
+    case 6:
+      snprintf(body, sizeof(body), "Settings\n\n(global editable list later)");
+      break;
+    case 7:
       snprintf(body, sizeof(body), "MeshCore T-Pager\n%s\n\nLVGL %d.%d.%d",
                FIRMWARE_VERSION, LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
       break;
@@ -380,12 +418,14 @@ static void leave_subscreen() {
   s_input_active = false;
   s_chat_open = false;
   s_chat_channel_idx = -1;
-  if (s_input_label)    lv_obj_add_flag(s_input_label,    LV_OBJ_FLAG_HIDDEN);
-  if (s_channel_list)   lv_obj_add_flag(s_channel_list,   LV_OBJ_FLAG_HIDDEN);
-  if (s_contacts_list)  lv_obj_add_flag(s_contacts_list,  LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_history)   lv_obj_add_flag(s_chat_history,   LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_compose)   lv_obj_add_flag(s_chat_compose,   LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_counter)   lv_obj_add_flag(s_chat_counter,   LV_OBJ_FLAG_HIDDEN);
+  if (s_input_label)     lv_obj_add_flag(s_input_label,     LV_OBJ_FLAG_HIDDEN);
+  if (s_channel_list)    lv_obj_add_flag(s_channel_list,    LV_OBJ_FLAG_HIDDEN);
+  if (s_contacts_list)   lv_obj_add_flag(s_contacts_list,   LV_OBJ_FLAG_HIDDEN);
+  if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
+  if (s_disc_menu_popup) lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_history)    lv_obj_add_flag(s_chat_history,    LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_compose)    lv_obj_add_flag(s_chat_compose,    LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_counter)    lv_obj_add_flag(s_chat_counter,    LV_OBJ_FLAG_HIDDEN);
   s_active_tile = -1;
 }
 
@@ -913,6 +953,164 @@ static void contacts_list_populate() {
   }
 }
 
+// ---------- Discovered tile (S3.6b) -----------------------------------------
+//
+// Same column layout as Contacts but driven by the ring buffer in
+// companion_radio/main.cpp instead of contacts[]. Lists EVERY heard
+// advert, including chats that the auto-add filter dropped. Click on a
+// row opens a 3-button popup: [Add to contacts] / [Add as favorite] /
+// [Cancel].
+
+static void disc_row_clicked(lv_event_t* e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  disc_menu_show(idx);
+}
+
+static void discovered_list_populate() {
+  if (!s_discovered_list || !ui_get_discovered_count) return;
+  lv_obj_clean(s_discovered_list);
+  if (s_discovered_group) lv_group_remove_all_objs(s_discovered_group);
+
+  double self_lat = 0, self_lon = 0;
+  if (ui_get_self_loc) ui_get_self_loc(&self_lat, &self_lon);
+
+  // Header (same widths as Contacts — column constants are shared).
+  {
+    lv_obj_t* hdr = lv_obj_create(s_discovered_list);
+    lv_obj_remove_style_all(hdr);
+    lv_obj_set_size(hdr, lv_pct(100), 18);
+    lv_obj_set_style_bg_opa(hdr, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0x707880), 0);
+    lv_obj_set_style_pad_hor(hdr, 6, 0);
+    lv_obj_set_style_margin_bottom(hdr, 1, 0);
+    lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_START,
+                                LV_FLEX_ALIGN_CENTER,
+                                LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(hdr, 6, 0);
+    static const struct { const char* text; int w; } cols[] = {
+      {"role", CON_COL_ROLE}, {"name", CON_COL_NAME},
+      {"SNR",  CON_COL_SNR },  {"RSSI", CON_COL_RSSI},
+      {"hops", CON_COL_DIST},  {"age",  CON_COL_AGE },
+    };
+    for (auto& c : cols) {
+      lv_obj_t* l = lv_label_create(hdr);
+      lv_obj_set_width(l, c.w);
+      lv_label_set_text(l, c.text);
+    }
+  }
+
+  int count = ui_get_discovered_count();
+  if (count == 0) {
+    lv_obj_t* empty = lv_label_create(s_discovered_list);
+    lv_label_set_text(empty, "(no adverts heard yet)");
+    lv_obj_set_style_text_color(empty, lv_color_hex(0x707880), 0);
+    return;
+  }
+
+  uint32_t now_ms = millis();
+  for (int i = 0; i < count; i++) {
+    UiContact ci;
+    if (!ui_get_discovered_info(i, &ci)) continue;
+
+    lv_obj_t* row = lv_obj_create(s_discovered_list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), 22);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_pad_hor(row, 6, 0);
+    lv_obj_set_style_radius(row, 4, 0);
+    lv_obj_set_style_margin_bottom(row, 1, 0);
+    lv_obj_set_style_border_color(row, lv_color_hex(0x303a47), 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                                LV_FLEX_ALIGN_CENTER,
+                                LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 6, 0);
+    lv_obj_add_event_cb(row, back_long_press_event, LV_EVENT_LONG_PRESSED, NULL);
+    lv_obj_add_event_cb(row, disc_row_clicked, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)i);
+
+    lv_obj_t* lbl_role = lv_label_create(row);
+    lv_obj_set_width(lbl_role, CON_COL_ROLE);
+    lv_label_set_text(lbl_role, role_short(ci.type));
+    lv_obj_set_style_text_color(lbl_role, lv_color_hex(0xFAA61A), 0);
+
+    lv_obj_t* lbl_name = lv_label_create(row);
+    lv_obj_set_width(lbl_name, CON_COL_NAME);
+    lv_label_set_long_mode(lbl_name, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_label_set_text(lbl_name, ci.name);
+
+    lv_obj_t* lbl_snr = lv_label_create(row);
+    lv_obj_set_width(lbl_snr, CON_COL_SNR);
+    char snr_buf[12];
+    snprintf(snr_buf, sizeof(snr_buf), "%+.1f", (float)ci.snr_q / 4.0f);
+    lv_label_set_text(lbl_snr, snr_buf);
+
+    lv_obj_t* lbl_rssi = lv_label_create(row);
+    lv_obj_set_width(lbl_rssi, CON_COL_RSSI);
+    char rssi_buf[12];
+    snprintf(rssi_buf, sizeof(rssi_buf), "%d", (int)ci.rssi);
+    lv_label_set_text(lbl_rssi, rssi_buf);
+
+    // For Discovered we show hop count (0 = direct) instead of distance —
+    // useful signal of mesh reach. Discovered entries usually lack GPS.
+    lv_obj_t* lbl_hops = lv_label_create(row);
+    lv_obj_set_width(lbl_hops, CON_COL_DIST);
+    char hop_buf[8];
+    snprintf(hop_buf, sizeof(hop_buf), "%u", (unsigned)ci.path_len);
+    lv_label_set_text(lbl_hops, hop_buf);
+    lv_obj_set_style_text_color(lbl_hops, lv_color_hex(0x80868f), 0);
+
+    // Age based on last_advert which we store as "ms-since-boot / 1000"
+    // for discovered entries (no NTP needed). Render as "Ns / Nm" etc.
+    lv_obj_t* lbl_age = lv_label_create(row);
+    lv_obj_set_width(lbl_age, CON_COL_AGE);
+    char age_buf[12];
+    uint32_t age_s = (now_ms / 1000) - ci.last_advert;
+    if      (age_s < 60)    snprintf(age_buf, sizeof(age_buf), "%us", age_s);
+    else if (age_s < 3600)  snprintf(age_buf, sizeof(age_buf), "%um", age_s / 60);
+    else                    snprintf(age_buf, sizeof(age_buf), "%uh", age_s / 3600);
+    lv_label_set_text(lbl_age, age_buf);
+    lv_obj_set_style_text_color(lbl_age, lv_color_hex(0x80868f), 0);
+
+    if (s_discovered_group) lv_group_add_obj(s_discovered_group, row);
+  }
+}
+
+// 3-option popup for clicked Discovered row. Maintained as a single
+// reused container with three buttons; show/hide instead of recreating
+// to keep the focus/encoder bind cycle deterministic.
+static void disc_menu_close() {
+  if (s_disc_menu_popup) lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
+  s_disc_menu_pubidx = -1;
+  // Restore encoder to the Discovered list.
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (enc && s_discovered_group) {
+    lv_group_set_editing(s_discovered_group, false);
+    lv_indev_set_group(enc, s_discovered_group);
+  }
+}
+
+static void disc_menu_show(int disc_idx) {
+  if (!s_disc_menu_popup) return;
+  s_disc_menu_pubidx = disc_idx;
+  lv_obj_remove_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_disc_menu_popup);
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (enc && s_disc_menu_group) {
+    lv_indev_set_group(enc, s_disc_menu_group);
+    if (s_disc_menu_buttons[0]) lv_group_focus_obj(s_disc_menu_buttons[0]);
+  }
+}
+
 // ---------- Edit popup -------------------------------------------------------
 
 static void close_edit_popup_apply() {
@@ -1279,6 +1477,21 @@ static void build_ui() {
 
   s_contacts_group = lv_group_create();
 
+  // Discovered list (S3.6b) — same row pattern as channels/contacts list.
+  // Driven by the ring buffer in companion_radio/main.cpp; populated on
+  // each enter + every 5s while open. Listens to ui_on_advert_seen.
+  s_discovered_list = lv_obj_create(s_subscreen_root);
+  lv_obj_remove_style_all(s_discovered_list);
+  lv_obj_set_size(s_discovered_list, lv_pct(96), lv_pct(70));
+  lv_obj_align(s_discovered_list, LV_ALIGN_TOP_LEFT, 6, 44);
+  lv_obj_set_flex_flow(s_discovered_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_bg_color(s_discovered_list, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_pad_all(s_discovered_list, 2, 0);
+  lv_obj_set_scroll_dir(s_discovered_list, LV_DIR_VER);
+  lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
+
+  s_discovered_group = lv_group_create();
+
   // Chat-view widgets — history label (top, scrollable) + compose
   // label (bottom). Both hidden until chat_view_open() shows them.
   s_chat_history = lv_label_create(s_subscreen_root);
@@ -1354,6 +1567,55 @@ static void build_ui() {
   lv_obj_align(edit_hint, LV_ALIGN_BOTTOM_MID, 0, -4);
 
   s_edit_group = lv_group_create();
+
+  // Discovered click-popup (S3.6b). Reused container; hidden by default,
+  // shown by disc_menu_show() with the row index baked in s_disc_menu_pubidx.
+  s_disc_menu_popup = lv_obj_create(scr);
+  lv_obj_set_size(s_disc_menu_popup, lv_pct(80), 130);
+  lv_obj_center(s_disc_menu_popup);
+  lv_obj_set_style_bg_color(s_disc_menu_popup, lv_color_hex(0x1c2530), 0);
+  lv_obj_set_style_border_width(s_disc_menu_popup, 2, 0);
+  lv_obj_set_style_border_color(s_disc_menu_popup, lv_color_hex(0xFAA61A), 0);
+  lv_obj_set_style_radius(s_disc_menu_popup, 8, 0);
+  lv_obj_set_style_text_color(s_disc_menu_popup, lv_color_hex(0xffffff), 0);
+  lv_obj_set_flex_flow(s_disc_menu_popup, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(s_disc_menu_popup, LV_FLEX_ALIGN_SPACE_EVENLY,
+                                          LV_FLEX_ALIGN_CENTER,
+                                          LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
+
+  s_disc_menu_group = lv_group_create();
+  static const char* btn_labels[3] = {
+    "Add to contacts",
+    "Add as favorite",
+    "Cancel",
+  };
+  for (int b = 0; b < 3; b++) {
+    s_disc_menu_buttons[b] = lv_button_create(s_disc_menu_popup);
+    lv_obj_set_size(s_disc_menu_buttons[b], lv_pct(80), 26);
+    lv_obj_t* lbl = lv_label_create(s_disc_menu_buttons[b]);
+    lv_label_set_text(lbl, btn_labels[b]);
+    lv_obj_center(lbl);
+    lv_group_add_obj(s_disc_menu_group, s_disc_menu_buttons[b]);
+    lv_obj_add_event_cb(s_disc_menu_buttons[b], [](lv_event_t* e) {
+      lv_obj_t* tgt = (lv_obj_t*)lv_event_get_target(e);
+      int which = -1;
+      for (int i = 0; i < 3; i++) if (s_disc_menu_buttons[i] == tgt) which = i;
+      if (which < 0 || s_disc_menu_pubidx < 0) { disc_menu_close(); return; }
+      bool ok = false;
+      if (which == 0 && ui_add_discovered_to_contacts) {
+        ok = ui_add_discovered_to_contacts(s_disc_menu_pubidx, false);
+      } else if (which == 1 && ui_add_discovered_to_contacts) {
+        ok = ui_add_discovered_to_contacts(s_disc_menu_pubidx, true);
+      } else {
+        ok = true;  // Cancel
+      }
+      (void)ok;
+      disc_menu_close();
+      discovered_list_populate();   // reflect new state (e.g. row could be
+                                    // marked already-added next time)
+    }, LV_EVENT_CLICKED, nullptr);
+  }
 
   lv_obj_t* back_hint = lv_label_create(s_subscreen_root);
   lv_label_set_text(back_hint, "click or dbl-click: edit   long-press: back");
@@ -1534,10 +1796,16 @@ void UITask::loop() {
 
   // Periodic refresh of the contacts list so the "last seen" column
   // and any newly-heard nodes appear without needing to leave/re-enter.
-  if (s_active_tile == 4 && s_contacts_list &&
+  // Tile indices: 3 = Contacts (favorites), 4 = Discovered.
+  if (s_active_tile == 3 && s_contacts_list &&
       (long)(millis() - s_contacts_next_refresh) >= 0) {
     s_contacts_next_refresh = millis() + 5000;
     contacts_list_populate();
+  }
+  if (s_active_tile == 4 && s_discovered_list &&
+      (long)(millis() - s_discovered_next_refresh) >= 0) {
+    s_discovered_next_refresh = millis() + 5000;
+    discovered_list_populate();
   }
 
   // Periodically refresh battery + header data on the carousel + sub-screen.

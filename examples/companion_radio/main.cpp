@@ -1,6 +1,7 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
 #include "MyMesh.h"
+#include <esp_heap_caps.h>  // heap_caps_calloc / MALLOC_CAP_SPIRAM
 
 // Believe it or not, this std C function is busted on some platforms!
 static uint32_t _atoi(const char* sp) {
@@ -291,32 +292,184 @@ struct UiContact {
   uint32_t last_advert;     // their clock (epoch seconds)
   int8_t   snr_q;           // SNR * 4 (or 0x80 / -128 = unknown)
   int16_t  rssi;            // dBm (or 0 = unknown)
+  uint8_t  pub_key[32];     // S3.6c: needed for toggle-favorite + DM thread lookup
+  uint8_t  flags;           // S3.6c: bit 0 = favorite
+  uint8_t  path_len;        // S3.6b: hop count from Discovered entries (0 = direct)
 };
 
+// Contacts tile (S3.6c) shows favorites ONLY. The full contact list is
+// still in contacts[], but the tile filters on `flags & 0x01`.
 extern "C" int ui_get_contact_count() {
   int count = 0;
   for (uint32_t i = 0; i < MAX_CONTACTS; i++) {
     ContactInfo ci;
     if (!the_mesh.getContactByIdx(i, ci)) break;
-    if (ci.name[0]) count++;
+    if (!ci.name[0]) continue;
+    if (ci.flags & 0x01) count++;
   }
   return count;
 }
 
+// Indexed view across the favorites-only subset.
 extern "C" bool ui_get_contact_info(int idx, UiContact* out) {
   if (!out) return false;
-  ContactInfo ci;
-  if (!the_mesh.getContactByIdx((uint32_t)idx, ci)) return false;
-  if (!ci.name[0]) return false;
+  int seen = 0;
+  for (uint32_t i = 0; i < MAX_CONTACTS; i++) {
+    ContactInfo ci;
+    if (!the_mesh.getContactByIdx(i, ci)) break;
+    if (!ci.name[0]) continue;
+    if ((ci.flags & 0x01) == 0) continue;
+    if (seen == idx) {
+      memset(out, 0, sizeof(*out));
+      StrHelper::strncpy(out->name, ci.name, sizeof(out->name));
+      out->type        = ci.type;
+      out->gps_lat     = ci.gps_lat;
+      out->gps_lon     = ci.gps_lon;
+      out->last_advert = ci.last_advert_timestamp;
+      UiSigEntry* sig  = sig_find(ci.id.pub_key);
+      out->snr_q       = sig ? sig->snr_q : (int8_t)-128;
+      out->rssi        = sig ? sig->rssi  : (int16_t)0;
+      memcpy(out->pub_key, ci.id.pub_key, 32);
+      out->flags       = ci.flags;
+      return true;
+    }
+    seen++;
+  }
+  return false;
+}
+
+// Toggle the favorite-bit on a contact identified by pub_key. Used by
+// both the Contacts tile (unmark) and the Discovered tile (mark as
+// favorite — which also adds to contacts[] first via ui_add_discovered).
+extern "C" bool ui_toggle_favorite(const uint8_t* pub_key) {
+  if (!the_mesh.uiToggleFavorite(pub_key)) return false;
+  the_mesh.uiSaveContacts();
+  return true;
+}
+
+// ---- Discovered nodes ring buffer (S3.6b) ----------------------------------
+// Captures every advert we hear, including chats that don't pass the
+// auto-add filter (default companion-app pref leaves AUTO_ADD_CHAT off,
+// so the standard Contacts list misses other users entirely). Backed by
+// the new BaseChatMesh hook `ui_on_advert_seen` which fires before the
+// filter runs.
+//
+// 50 entries, LRU eviction on last_ms — enough for an active mesh hour.
+
+struct UiDiscovered {
+  uint8_t  pub_key[32];     // full key so we can call uiAddContact later
+  char     name[32];
+  uint8_t  type;            // ADV_TYPE_*
+  int8_t   snr_q;           // SNR * 4
+  int16_t  rssi;            // dBm
+  uint8_t  path_len;        // 0 = direct, N = N hops
+  uint32_t first_ms;        // millis() at first sighting (this boot)
+  uint32_t last_ms;         // millis() at last update (0 = empty slot)
+};
+static const int UI_DISC_CACHE = 50;
+// Heap-allocated in PSRAM (50 entries × ~80 bytes = 4 KB; doesn't fit in DRAM
+// alongside everything else, and the ESP32-S3 on this board has 8 MB PSRAM).
+// Allocated lazily on first ui_on_advert_seen call; UI bridges check for nullptr.
+static UiDiscovered* s_disc_cache = nullptr;
+static bool ensure_disc_cache() {
+  if (s_disc_cache) return true;
+  // PSRAM-backed zero-initialized buffer.
+  s_disc_cache = (UiDiscovered*)heap_caps_calloc(
+      UI_DISC_CACHE, sizeof(UiDiscovered),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return s_disc_cache != nullptr;
+}
+
+static UiDiscovered* disc_find(const uint8_t* pub_key) {
+  if (!s_disc_cache) return nullptr;
+  for (int i = 0; i < UI_DISC_CACHE; i++) {
+    if (s_disc_cache[i].last_ms == 0) continue;
+    if (memcmp(s_disc_cache[i].pub_key, pub_key, 32) == 0) return &s_disc_cache[i];
+  }
+  return nullptr;
+}
+
+static UiDiscovered* disc_allocate(const uint8_t* pub_key) {
+  if (!ensure_disc_cache()) return nullptr;
+  UiDiscovered* hit = disc_find(pub_key);
+  if (hit) return hit;
+  // empty slot first, else LRU by last_ms
+  UiDiscovered* victim = &s_disc_cache[0];
+  uint32_t oldest = victim->last_ms;
+  for (int i = 1; i < UI_DISC_CACHE; i++) {
+    if (s_disc_cache[i].last_ms == 0) { victim = &s_disc_cache[i]; break; }
+    if (s_disc_cache[i].last_ms < oldest) {
+      oldest = s_disc_cache[i].last_ms;
+      victim = &s_disc_cache[i];
+    }
+  }
+  memcpy(victim->pub_key, pub_key, 32);
+  victim->first_ms = millis() ? millis() : 1;
+  return victim;
+}
+
+extern "C" void ui_on_advert_seen(const uint8_t* pub_key, const char* name,
+                                  uint8_t type, float snr, float rssi,
+                                  uint8_t path_len) {
+  UiDiscovered* e = disc_allocate(pub_key);
+  if (!e) return;     // PSRAM alloc failed; silently drop
+  StrHelper::strncpy(e->name, name ? name : "", sizeof(e->name));
+  e->type     = type;
+  e->snr_q    = (int8_t)(snr * 4.0f);
+  e->rssi     = (int16_t)rssi;
+  e->path_len = path_len;
+  e->last_ms  = millis() ? millis() : 1;
+}
+
+extern "C" int ui_get_discovered_count() {
+  if (!s_disc_cache) return 0;
+  int n = 0;
+  for (int i = 0; i < UI_DISC_CACHE; i++) {
+    if (s_disc_cache[i].last_ms != 0) n++;
+  }
+  return n;
+}
+
+// Returns discovered entries newest-first (by last_ms).
+extern "C" bool ui_get_discovered_info(int idx, UiContact* out) {
+  if (!out || !s_disc_cache) return false;
+  // Collect non-empty indices, sort by last_ms desc — cheap for 50 entries.
+  int order[UI_DISC_CACHE];
+  int n = 0;
+  for (int i = 0; i < UI_DISC_CACHE; i++) {
+    if (s_disc_cache[i].last_ms != 0) order[n++] = i;
+  }
+  for (int i = 1; i < n; i++) {
+    int v = order[i];
+    int j = i;
+    while (j > 0 && s_disc_cache[order[j-1]].last_ms < s_disc_cache[v].last_ms) {
+      order[j] = order[j-1]; j--;
+    }
+    order[j] = v;
+  }
+  if (idx < 0 || idx >= n) return false;
+  const UiDiscovered& d = s_disc_cache[order[idx]];
   memset(out, 0, sizeof(*out));
-  StrHelper::strncpy(out->name, ci.name, sizeof(out->name));
-  out->type        = ci.type;
-  out->gps_lat     = ci.gps_lat;
-  out->gps_lon     = ci.gps_lon;
-  out->last_advert = ci.last_advert_timestamp;
-  UiSigEntry* sig  = sig_find(ci.id.pub_key);
-  out->snr_q       = sig ? sig->snr_q : (int8_t)-128;
-  out->rssi        = sig ? sig->rssi  : (int16_t)0;
+  StrHelper::strncpy(out->name, d.name, sizeof(out->name));
+  out->type        = d.type;
+  out->snr_q       = d.snr_q;
+  out->rssi        = d.rssi;
+  out->last_advert = d.last_ms / 1000;  // ms since boot → "secs since boot"
+                                        // Discovered tile shows "Ns ago" relative.
+  memcpy(out->pub_key, d.pub_key, 32);
+  out->flags       = 0;
+  out->path_len    = d.path_len;
+  return true;
+}
+
+// Add a discovered entry to contacts[]. `favorite=true` also marks
+// the contact as favorite (bit 0 of flags), making it appear in the
+// favorites-only Contacts tile.
+extern "C" bool ui_add_discovered_to_contacts(int idx, bool favorite) {
+  UiContact uc;
+  if (!ui_get_discovered_info(idx, &uc)) return false;
+  if (!the_mesh.uiAddContact(uc.pub_key, uc.name, uc.type, favorite)) return false;
+  the_mesh.uiSaveContacts();
   return true;
 }
 
