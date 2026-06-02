@@ -53,6 +53,39 @@ static lv_obj_t*   s_edit_widget;    // spinbox / switch / etc.
 static int s_active_tile = -1;
 static int s_editing_idx = -1;       // which radio row is being edited (-1 = none)
 
+// Standard LoRa bandwidths (kHz). Cover the full SX12xx / LR11xx range so
+// users can match repeaters using narrow profiles (e.g. NL "EU/UK Narrow"
+// at 62.5 kHz) as well as the original wide MeshCore default (125 kHz).
+static const float BW_VALUES[] = {
+  7.81f, 10.42f, 15.63f, 20.83f, 31.25f, 41.67f, 62.5f, 125.0f, 250.0f, 500.0f
+};
+static const char* BW_OPTIONS =
+  "7.81 kHz\n"
+  "10.42 kHz\n"
+  "15.63 kHz\n"
+  "20.83 kHz\n"
+  "31.25 kHz\n"
+  "41.67 kHz\n"
+  "62.5 kHz\n"
+  "125 kHz\n"
+  "250 kHz\n"
+  "500 kHz";
+static const int BW_COUNT = sizeof(BW_VALUES) / sizeof(BW_VALUES[0]);
+
+// Path-hash mode → on-wire path-hash byte count (`mode + 1`). Modes 0..2
+// are valid; mode 3 is reserved (CommonCLI.cpp constrains to 0..2).
+static const char* PATH_HASH_OPTIONS = "1 byte (default)\n2 bytes\n3 bytes";
+
+static int bw_value_to_index(float bw) {
+  int best = 0;
+  float best_d = 1e9f;
+  for (int i = 0; i < BW_COUNT; i++) {
+    float d = bw > BW_VALUES[i] ? bw - BW_VALUES[i] : BW_VALUES[i] - bw;
+    if (d < best_d) { best_d = d; best = i; }
+  }
+  return best;
+}
+
 // Forward declarations of helpers that touch NodePrefs (kept inside the
 // file but referenced from event callbacks).
 static void radio_list_populate(NodePrefs* p, int focus_row = 0);
@@ -173,11 +206,13 @@ static void radio_list_populate(NodePrefs* p, int focus_row) {
     "CR",
     "TX power",   // dBm
     "RX boost",
+    "Path hash",  // bytes (mode+1)
   };
-  static const char* UNITS[]  = { " MHz", "", " kHz", "", " dBm", "" };
+  static const char* UNITS[]  = { " MHz", "", " kHz", "", " dBm", "", "" };
+  const int ROW_COUNT = sizeof(LABELS) / sizeof(LABELS[0]);
   char val[24];
 
-  for (int i = 0; i < 6; i++) {
+  for (int i = 0; i < ROW_COUNT; i++) {
     switch (i) {
       case 0: snprintf(val, sizeof(val), "%.3f", p->freq); break;
       case 1: snprintf(val, sizeof(val), "%d", p->sf); break;
@@ -185,6 +220,7 @@ static void radio_list_populate(NodePrefs* p, int focus_row) {
       case 3: snprintf(val, sizeof(val), "%d", p->cr); break;
       case 4: snprintf(val, sizeof(val), "%d", p->tx_power_dbm); break;
       case 5: snprintf(val, sizeof(val), "%s", p->rx_boosted_gain ? "on" : "off"); break;
+      case 6: snprintf(val, sizeof(val), "%d B", p->path_hash_mode + 1); break;
     }
     char value_text[32];
     snprintf(value_text, sizeof(value_text), "%s%s", val, UNITS[i]);
@@ -200,12 +236,23 @@ static void radio_list_populate(NodePrefs* p, int focus_row) {
     lv_obj_set_style_pad_ver(row, 2, 0);
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_margin_bottom(row, 2, 0);
+    // Thin bottom separator for readability between rows. Width-1 only on
+    // the bottom side so the focused-state bg pill still looks isolated.
+    lv_obj_set_style_border_color(row, lv_color_hex(0x303a47), 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
                                 LV_FLEX_ALIGN_CENTER,
                                 LV_FLEX_ALIGN_CENTER);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    // The radio list is taller than the visible viewport (7 rows × ~26 px
+    // each ≈ 182 px vs ~166 px of container). LVGL doesn't auto-scroll on
+    // focus by default — add this flag so the focused row is always
+    // scrolled into view, otherwise the bottom rows (Path hash) stay
+    // off-screen and the user can't see what's focused.
+    lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
 
     lv_obj_t* lbl = lv_label_create(row);
     lv_label_set_text(lbl, LABELS[i]);
@@ -236,8 +283,18 @@ static void close_edit_popup_apply() {
 
   switch (s_editing_idx) {
     case 1: p->sf = lv_spinbox_get_value(s_edit_widget); break;
+    case 2: {
+      int sel = lv_dropdown_get_selected(s_edit_widget);
+      if (sel >= 0 && sel < BW_COUNT) p->bw = BW_VALUES[sel];
+      break;
+    }
     case 3: p->cr = lv_spinbox_get_value(s_edit_widget); break;
     case 4: p->tx_power_dbm = (int8_t)lv_spinbox_get_value(s_edit_widget); break;
+    case 6: {
+      int sel = lv_dropdown_get_selected(s_edit_widget);
+      if (sel >= 0 && sel <= 2) p->path_hash_mode = (uint8_t)sel;
+      break;
+    }
     default: break;
   }
 
@@ -266,10 +323,14 @@ static void radio_item_clicked(lv_event_t* e) {
     return;
   }
 
-  // Only the integer rows have a spinbox editor in S3.3 phase 2a — others
-  // (freq, BW, region…) get their editors in subsequent phases.
-  bool supported = (idx == 1 || idx == 3 || idx == 4);
-  if (!supported) return;
+  // Editor matrix per row:
+  //   idx 1 / 3 / 4  → spinbox (SF, CR, TX power)
+  //   idx 2          → dropdown over standard LoRa BW values
+  //   idx 6          → dropdown over path-hash modes (1 / 2 / 3 bytes)
+  // Freq (idx 0) gets the numeric-keyboard editor in S3.3 phase 2c.
+  bool is_spinbox  = (idx == 1 || idx == 3 || idx == 4);
+  bool is_dropdown = (idx == 2 || idx == 6);
+  if (!is_spinbox && !is_dropdown) return;
 
   s_editing_idx = idx;
   lv_obj_remove_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
@@ -277,23 +338,51 @@ static void radio_item_clicked(lv_event_t* e) {
   if (s_edit_widget) { lv_obj_del(s_edit_widget); s_edit_widget = nullptr; }
   lv_group_remove_all_objs(s_edit_group);
 
-  int min_v = 0, max_v = 100, init = 0, digits = 2;
-  if (idx == 1) { min_v = 5;  max_v = 12; init = p->sf;           digits = 2; lv_label_set_text(s_edit_title, "Spreading Factor (SF)"); }
-  if (idx == 3) { min_v = 5;  max_v = 8;  init = p->cr;           digits = 1; lv_label_set_text(s_edit_title, "Coding Rate (CR)"); }
-  if (idx == 4) { min_v = -9; max_v = 22; init = p->tx_power_dbm; digits = 2; lv_label_set_text(s_edit_title, "TX Power (dBm)"); }
+  if (is_spinbox) {
+    int min_v = 0, max_v = 100, init = 0, digits = 2;
+    if (idx == 1) { min_v = 5;  max_v = 12; init = p->sf;           digits = 2; lv_label_set_text(s_edit_title, "Spreading Factor (SF)"); }
+    if (idx == 3) { min_v = 5;  max_v = 8;  init = p->cr;           digits = 1; lv_label_set_text(s_edit_title, "Coding Rate (CR)"); }
+    if (idx == 4) { min_v = -9; max_v = 22; init = p->tx_power_dbm; digits = 2; lv_label_set_text(s_edit_title, "TX Power (dBm)"); }
 
-  s_edit_widget = lv_spinbox_create(s_edit_popup);
-  lv_obj_set_width(s_edit_widget, 120);
-  lv_spinbox_set_range(s_edit_widget, min_v, max_v);
-  lv_spinbox_set_digit_format(s_edit_widget, digits, 0);
-  lv_spinbox_set_value(s_edit_widget, init);
-  // NOTE: leave the step at 1 (the default) — lv_spinbox_step_prev would
-  // bump it to tens and the encoder would jump 5 → 12 → 5.
-  lv_obj_align(s_edit_widget, LV_ALIGN_CENTER, 0, 0);
+    s_edit_widget = lv_spinbox_create(s_edit_popup);
+    lv_obj_set_width(s_edit_widget, 120);
+    lv_spinbox_set_range(s_edit_widget, min_v, max_v);
+    lv_spinbox_set_digit_format(s_edit_widget, digits, 0);
+    lv_spinbox_set_value(s_edit_widget, init);
+    // NOTE: leave the step at 1 (the default) — lv_spinbox_step_prev would
+    // bump it to tens and the encoder would jump 5 → 12 → 5.
+    lv_obj_align(s_edit_widget, LV_ALIGN_CENTER, 0, 0);
 
-  lv_obj_add_event_cb(s_edit_widget, [](lv_event_t*) {
-    close_edit_popup_apply();
-  }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(s_edit_widget, [](lv_event_t*) {
+      close_edit_popup_apply();
+    }, LV_EVENT_CLICKED, nullptr);
+  } else {  // dropdown
+    const char* opts = nullptr;
+    int sel = 0;
+    if (idx == 2) {
+      opts = BW_OPTIONS;
+      sel = bw_value_to_index(p->bw);
+      lv_label_set_text(s_edit_title, "Bandwidth (kHz)");
+    } else { // idx == 6
+      opts = PATH_HASH_OPTIONS;
+      sel = (int)p->path_hash_mode;
+      if (sel < 0 || sel > 2) sel = 0;
+      lv_label_set_text(s_edit_title, "Path-hash size");
+    }
+
+    s_edit_widget = lv_dropdown_create(s_edit_popup);
+    lv_dropdown_set_options(s_edit_widget, opts);
+    lv_dropdown_set_selected(s_edit_widget, sel);
+    lv_obj_set_width(s_edit_widget, 200);
+    lv_obj_align(s_edit_widget, LV_ALIGN_CENTER, 0, 0);
+
+    // Dropdown emits VALUE_CHANGED when the user commits a selection. We
+    // close the popup on commit so the click that selects an option also
+    // applies it — matches the spinbox UX (rotate to change, click to save).
+    lv_obj_add_event_cb(s_edit_widget, [](lv_event_t*) {
+      close_edit_popup_apply();
+    }, LV_EVENT_VALUE_CHANGED, nullptr);
+  }
 
   lv_group_add_obj(s_edit_group, s_edit_widget);
   lv_indev_t* enc = tpager_lvgl_get_encoder();
@@ -576,8 +665,19 @@ void UITask::loop() {
         tpager_power_off();
       } else if (held >= 600) {
         if (s_editing_idx >= 0) {
-          // Cancel edit popup without applying.
+          // Cancel edit popup without applying. For dropdown editors we
+          // must (a) close the expanded option list — otherwise it stays
+          // floating above the now-hidden popup and intercepts encoder
+          // events — and (b) drop the group out of editing mode, so the
+          // next encoder rotation drives the row-focus group instead of
+          // a destroyed widget. Without these two the encoder appears to
+          // "hang" after a cancel.
+          if (s_edit_widget && (s_editing_idx == 2 || s_editing_idx == 6)) {
+            lv_dropdown_close(s_edit_widget);
+          }
           lv_obj_add_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
+          if (s_edit_group)  lv_group_set_editing(s_edit_group, false);
+          if (s_radio_group) lv_group_set_editing(s_radio_group, false);
           lv_indev_t* enc2 = tpager_lvgl_get_encoder();
           if (enc2 && s_radio_group) lv_indev_set_group(enc2, s_radio_group);
           s_editing_idx = -1;

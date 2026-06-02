@@ -81,20 +81,30 @@ hands doesn't have to rediscover them:
   time. It bumps the step to 10, which collapses to the range bounds
   for small ranges (SF 5..12 only shows 5 or 12).
 
-## Status as of S3.3 phase 2a
+## Status as of S3.3 phase 2b
 
 - Tile carousel with 6 tiles, encoder navigation, click/long-press semantics.
 - Radio sub-screen renders the live `NodePrefs` values in a two-column
-  list (label + value, right-aligned).
-- Edit popup with spinbox for `SF`, `CR`, `TX power`. Apply path calls
-  the weak bridge `ui_apply_radio_changes()` defined by the example
-  main.cpp (sets radio params + persists prefs).
-- RX boost toggles inline.
-- After apply the just-edited row keeps focus.
+  list (label + value, right-aligned) with thin row separators.
+- Editor matrix per row:
+  - `SF`, `CR`, `TX power` → spinbox popup (encoder rotates value,
+    click saves)
+  - `BW` → dropdown over 10 standard LoRa bandwidths (7.81 … 500 kHz)
+  - `Path hash` → dropdown over the three valid path-hash modes
+    (1 byte / 2 bytes / 3 bytes)
+  - `RX boost` → inline toggle (no popup)
+- Apply path calls the weak bridge `ui_apply_radio_changes()` from
+  `examples/companion_radio/main.cpp` (`radio_set_params` +
+  `radio_set_tx_power` + `savePrefs`). Path-hash changes only need the
+  `savePrefs` (consumed inline on every send).
+- Long-press in the popup cancels without applying; dropdown list is
+  explicitly closed and the group drops out of edit mode so the
+  encoder doesn't hang.
+- The list auto-scrolls to keep the focused row in view
+  (`LV_OBJ_FLAG_SCROLL_ON_FOCUS`).
 
 ## TODO (next phases)
 
-- S3.3 phase 2b: dropdown for BW and path-hash-size.
 - S3.3 phase 2c: numeric keyboard entry for frequency.
 - S3.3 phase 2d: region scope picker (reads / writes RegionMap).
 - S3.3 phase 2e: duty-cycle indicator (likely top header, next to battery).
