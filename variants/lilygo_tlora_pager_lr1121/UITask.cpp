@@ -37,6 +37,7 @@ static const int NUM_TILES = sizeof(TILES) / sizeof(TILES[0]);
 static lv_obj_t* s_root;
 static lv_obj_t* s_header_label;
 static lv_obj_t* s_battery_label;
+static lv_obj_t* s_dc_label;          // duty-cycle % shown between name + battery
 static lv_obj_t* s_tile_row;
 static lv_obj_t* s_tile_buttons[NUM_TILES];
 static lv_obj_t* s_title_label;
@@ -111,6 +112,13 @@ static void close_edit_popup_apply();   // referenced from ui_input_char (Enter 
 
 extern "C" void tpager_power_off() __attribute__((weak));
 extern "C" void ui_apply_radio_changes() __attribute__((weak));
+// Tenths-of-percent (0..1000) of the duty-cycle quota that has been
+// consumed in the current hour-window. 0 = idle, 1000 = throttled.
+extern "C" int  ui_get_duty_cycle_used_tenths() __attribute__((weak));
+// Companion fills (used_seconds, max_seconds) of the current DC window.
+extern "C" void ui_get_duty_cycle_seconds(int* used_s, int* max_s) __attribute__((weak));
+// Battery state-of-charge from the BQ27220, 0..100. Negative = read error.
+extern "C" int  tpager_battery_percent() __attribute__((weak));
 
 // Defined in target.cpp — drains the TCA8418 FIFO and emits chars via
 // ui_input_char(). The upstream companion main loop doesn't know about
@@ -236,7 +244,7 @@ static void enter_subscreen(int idx) {
         lv_obj_set_style_text_color(s_input_label, lv_color_hex(0xc0c8d0), 0);
         lv_label_set_long_mode(s_input_label, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(s_input_label, lv_pct(94));
-        lv_obj_align(s_input_label, LV_ALIGN_TOP_LEFT, 6, 28);
+        lv_obj_align(s_input_label, LV_ALIGN_TOP_LEFT, 6, 48);
       }
       lv_obj_remove_flag(s_input_label, LV_OBJ_FLAG_HIDDEN);
       lv_label_set_text(s_input_label, "(type to test — FN + key = symbol layer, backspace deletes)");
@@ -559,16 +567,6 @@ static void build_ui() {
   lv_obj_set_style_bg_color(s_root, lv_color_hex(0x0e141b), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_root, LV_OPA_COVER, LV_PART_MAIN);
 
-  // Header — node name (left) + battery (right). We refresh content later.
-  s_header_label = lv_label_create(s_root);
-  lv_label_set_text(s_header_label, "T-Pager");
-  lv_obj_set_style_text_color(s_header_label, lv_color_hex(0xFAA61A), 0);
-  lv_obj_align(s_header_label, LV_ALIGN_TOP_LEFT, 6, 4);
-
-  s_battery_label = lv_label_create(s_root);
-  lv_label_set_text(s_battery_label, "");
-  lv_obj_set_style_text_color(s_battery_label, lv_color_hex(0xc0c8d0), 0);
-  lv_obj_align(s_battery_label, LV_ALIGN_TOP_RIGHT, -6, 4);
 
   // Tile row — flexbox with scroll snap so focused tile centres.
   s_tile_row = lv_obj_create(s_root);
@@ -639,25 +637,27 @@ static void build_ui() {
   lv_obj_set_style_bg_opa(s_subscreen_root, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_add_flag(s_subscreen_root, LV_OBJ_FLAG_HIDDEN);
 
+  // Subscreen content sits below the persistent header (y=0..20 reserved),
+  // so all sub-screen widgets start at y >= 22 to avoid overlapping it.
   s_subscreen_title = lv_label_create(s_subscreen_root);
   lv_label_set_text(s_subscreen_title, "...");
   lv_obj_set_style_text_color(s_subscreen_title, lv_color_hex(0xFAA61A), 0);
-  lv_obj_align(s_subscreen_title, LV_ALIGN_TOP_LEFT, 6, 4);
+  lv_obj_align(s_subscreen_title, LV_ALIGN_TOP_LEFT, 6, 24);
 
   s_subscreen_body = lv_label_create(s_subscreen_root);
   lv_label_set_text(s_subscreen_body, "");
   lv_obj_set_style_text_color(s_subscreen_body, lv_color_hex(0xc0c8d0), 0);
   lv_obj_set_width(s_subscreen_body, lv_pct(96));
   lv_label_set_long_mode(s_subscreen_body, LV_LABEL_LONG_WRAP);
-  lv_obj_align(s_subscreen_body, LV_ALIGN_TOP_LEFT, 6, 28);
+  lv_obj_align(s_subscreen_body, LV_ALIGN_TOP_LEFT, 6, 48);
 
   // Radio settings list — plain container with custom 2-column rows so the
   // value column lines up. Built once, hidden by default, repopulated on
   // every sub-screen entry.
   s_radio_list = lv_obj_create(s_subscreen_root);
   lv_obj_remove_style_all(s_radio_list);
-  lv_obj_set_size(s_radio_list, lv_pct(96), lv_pct(75));
-  lv_obj_align(s_radio_list, LV_ALIGN_TOP_LEFT, 6, 24);
+  lv_obj_set_size(s_radio_list, lv_pct(96), lv_pct(70));
+  lv_obj_align(s_radio_list, LV_ALIGN_TOP_LEFT, 6, 44);
   lv_obj_set_flex_flow(s_radio_list, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_bg_color(s_radio_list, lv_color_hex(0x0e141b), 0);
   lv_obj_set_style_pad_all(s_radio_list, 2, 0);
@@ -665,6 +665,27 @@ static void build_ui() {
   lv_obj_add_flag(s_radio_list, LV_OBJ_FLAG_HIDDEN);
 
   s_radio_group = lv_group_create();
+
+  // ---- Persistent header (always visible) ----
+  // Parented to the screen itself and built AFTER s_root + s_subscreen_root
+  // so it paints on top of both — node name, DC usage and battery stay
+  // visible whether the user is on the carousel or inside a tile.
+  // The edit popup is created after this block, so popups still overlay
+  // the header (we don't want the header eating popup pixels).
+  s_header_label = lv_label_create(scr);
+  lv_label_set_text(s_header_label, "T-Pager");
+  lv_obj_set_style_text_color(s_header_label, lv_color_hex(0xFAA61A), 0);
+  lv_obj_align(s_header_label, LV_ALIGN_TOP_LEFT, 6, 4);
+
+  s_dc_label = lv_label_create(scr);
+  lv_label_set_text(s_dc_label, "");
+  lv_obj_set_style_text_color(s_dc_label, lv_color_hex(0x80868f), 0);
+  lv_obj_align(s_dc_label, LV_ALIGN_TOP_MID, 0, 4);
+
+  s_battery_label = lv_label_create(scr);
+  lv_label_set_text(s_battery_label, "");
+  lv_obj_set_style_text_color(s_battery_label, lv_color_hex(0xc0c8d0), 0);
+  lv_obj_align(s_battery_label, LV_ALIGN_TOP_RIGHT, -6, 4);
 
   // Edit popup (overlay) — hidden by default, shown by radio_item_clicked.
   s_edit_popup = lv_obj_create(scr);
@@ -845,10 +866,28 @@ void UITask::loop() {
   if ((long)(millis() - s_next_status) > 0) {
     s_next_status = millis() + 1000;
     if (s_battery_label) {
-      uint16_t mv = getBattMilliVolts();
       char buf[16];
-      snprintf(buf, sizeof(buf), "%u mV", mv);
+      int p = tpager_battery_percent ? tpager_battery_percent() : -1;
+      if (p >= 0) {
+        snprintf(buf, sizeof(buf), "%d%%", p);
+      } else {
+        snprintf(buf, sizeof(buf), "%u mV", getBattMilliVolts());
+      }
       lv_label_set_text(s_battery_label, buf);
+    }
+    if (s_dc_label && ui_get_duty_cycle_used_tenths) {
+      int t = ui_get_duty_cycle_used_tenths();   // 0..1000 (0.0%..100.0%)
+      int used_s = 0, max_s = 0;
+      if (ui_get_duty_cycle_seconds) ui_get_duty_cycle_seconds(&used_s, &max_s);
+      char buf[32];
+      snprintf(buf, sizeof(buf), "DC %d.%d%% %ds/%ds",
+               t / 10, t % 10, used_s, max_s);
+      lv_label_set_text(s_dc_label, buf);
+      // Tint: amber over 70% used, red over 90%, otherwise low-contrast.
+      uint32_t col = (t > 900) ? 0xe05050
+                   : (t > 700) ? 0xFAA61A
+                                : 0x80868f;
+      lv_obj_set_style_text_color(s_dc_label, lv_color_hex(col), 0);
     }
     if (s_header_label && _prefs && _prefs->node_name[0]) {
       lv_label_set_text(s_header_label, _prefs->node_name);

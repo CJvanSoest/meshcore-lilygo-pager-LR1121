@@ -111,6 +111,36 @@ extern "C" void ui_apply_radio_changes() {
   the_mesh.savePrefs();
 }
 
+// Variant UIs read the duty-cycle USAGE as tenths-of-percent (0 = idle,
+// 1000 = quota fully consumed). The leaky-bucket starts full at boot
+// (= 0% used) and refills continuously, so a quiet hour will sink the
+// reading back toward 0 even after a burst of TX.
+extern "C" int ui_get_duty_cycle_used_tenths() {
+  auto* p = the_mesh.getNodePrefs();
+  float duty_cycle = 1.0f / (1.0f + p->airtime_factor);
+  unsigned long max_budget = (unsigned long)(3600000UL * duty_cycle);
+  if (max_budget == 0) return 0;
+  unsigned long budget = the_mesh.getRemainingTxBudget();
+  if (budget > max_budget) budget = max_budget;
+  unsigned long used = max_budget - budget;
+  return (int)((used * 1000UL) / max_budget);
+}
+
+// Same data exposed as "X seconds used out of Y seconds allowed per
+// hour-window", which is what the Tanmatsu UI also surfaces — easier
+// to interpret than a bare percentage when you're tracking your DC
+// quota live during a chat.
+extern "C" void ui_get_duty_cycle_seconds(int* used_s, int* max_s) {
+  auto* p = the_mesh.getNodePrefs();
+  float duty_cycle = 1.0f / (1.0f + p->airtime_factor);
+  unsigned long max_budget = (unsigned long)(3600000UL * duty_cycle);
+  unsigned long budget = the_mesh.getRemainingTxBudget();
+  if (budget > max_budget) budget = max_budget;
+  unsigned long used = max_budget - budget;
+  if (used_s) *used_s = (int)(used / 1000UL);
+  if (max_s)  *max_s  = (int)(max_budget / 1000UL);
+}
+
 void halt() {
   while (1) ;
 }

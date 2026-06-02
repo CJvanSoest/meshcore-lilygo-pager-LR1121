@@ -106,7 +106,7 @@ hands doesn't have to rediscover them:
   time. It bumps the step to 10, which collapses to the range bounds
   for small ranges (SF 5..12 only shows 5 or 12).
 
-## Status as of S3.3 phase 2c
+## Status as of S3.3 phase 2d
 
 - Tile carousel with 6 tiles, encoder navigation, click/long-press semantics.
 - Radio sub-screen renders the live `NodePrefs` values in a two-column
@@ -130,11 +130,15 @@ hands doesn't have to rediscover them:
   encoder doesn't hang.
 - The list auto-scrolls to keep the focused row in view
   (`LV_OBJ_FLAG_SCROLL_ON_FOCUS`).
+- Persistent top-row header (parented to the screen, not the carousel)
+  shows: **node name** (left, orange) — **DC X.X% Ns/Ms** (centre,
+  green→amber→red as the leaky bucket drains) — **battery %** (right,
+  read from the BQ27220 SoC register `0x2C`). Header stays visible on
+  every sub-screen, so DC and battery never require leaving the current
+  tile.
 
 ## TODO (next phases)
 
-- S3.3 phase 2d: duty-cycle indicator (likely top header, next to
-  battery).
 - S3.3 phase 2e: region scope picker (reads / writes RegionMap).
 - S3.3 phase 2d: region scope picker (reads / writes RegionMap).
 - S3.3 phase 2e: duty-cycle indicator (likely top header, next to battery).

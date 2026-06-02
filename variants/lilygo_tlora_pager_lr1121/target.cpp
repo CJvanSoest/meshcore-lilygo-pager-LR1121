@@ -327,6 +327,11 @@ uint16_t TLoraPagerBoard::getBattMilliVolts() {
   return v >= 0 ? (uint16_t)v : 0;
 }
 
+// C-linkage getter so UITask (a separate translation unit) can read the
+// fuel-gauge SoC without pulling in the BQ27220 driver. Returns 0..100
+// on success, or a negative debug marker on I²C failure.
+extern "C" int tpager_battery_percent();
+
 static int read_battery_percent() {
   // BQ27220 uses STOP-between-write-and-read (not repeated start) — pass
   // endTransmission(true), then requestFrom in a fresh transaction.
@@ -338,6 +343,13 @@ static int read_battery_percent() {
   uint8_t lo = Wire.read();
   uint8_t hi = Wire.read();
   return (int)((hi << 8) | lo);
+}
+
+extern "C" int tpager_battery_percent() {
+  int p = read_battery_percent();
+  if (p < 0) return -1;
+  if (p > 100) return 100;
+  return p;
 }
 
 // --- Variant status hook (called from UITask::renderCurrScreen home-screen) ---
