@@ -57,6 +57,11 @@ static lv_obj_t* s_disc_menu_popup;  // S3.6b click-popup (Add / Add fav / Cance
 static lv_group_t* s_disc_menu_group;
 static lv_obj_t* s_disc_menu_buttons[3]; // 0=Add, 1=Add fav, 2=Cancel
 static int       s_disc_menu_pubidx = -1;
+
+static lv_obj_t* s_con_menu_popup;   // S3.6c click-popup (Open DM / Unfav / Cancel)
+static lv_group_t* s_con_menu_group;
+static lv_obj_t* s_con_menu_buttons[3];
+static uint8_t   s_con_menu_pub_key[32]; // pub_key of clicked contact row
 static lv_group_t* s_group;          // carousel tiles
 static lv_group_t* s_radio_group;    // Radio settings list rows
 static lv_group_t* s_channel_group;  // Channels list rows
@@ -166,6 +171,8 @@ static void contacts_list_populate();
 static void discovered_list_populate();
 static void disc_menu_show(int disc_idx);
 static void disc_menu_close();
+static void con_menu_show(const uint8_t* pub_key);
+static void con_menu_close();
 
 extern "C" void tpager_power_off() __attribute__((weak));
 extern "C" void ui_apply_radio_changes() __attribute__((weak));
@@ -345,6 +352,7 @@ static void enter_subscreen(int idx) {
   if (s_contacts_list)   lv_obj_add_flag(s_contacts_list,   LV_OBJ_FLAG_HIDDEN);
   if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
   if (s_disc_menu_popup) lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
+  if (s_con_menu_popup)  lv_obj_add_flag(s_con_menu_popup,  LV_OBJ_FLAG_HIDDEN);
   if (s_input_label)     lv_obj_add_flag(s_input_label,     LV_OBJ_FLAG_HIDDEN);
   if (s_chat_history)    lv_obj_add_flag(s_chat_history,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose)    lv_obj_add_flag(s_chat_compose,    LV_OBJ_FLAG_HIDDEN);
@@ -423,6 +431,7 @@ static void leave_subscreen() {
   if (s_contacts_list)   lv_obj_add_flag(s_contacts_list,   LV_OBJ_FLAG_HIDDEN);
   if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
   if (s_disc_menu_popup) lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
+  if (s_con_menu_popup)  lv_obj_add_flag(s_con_menu_popup,  LV_OBJ_FLAG_HIDDEN);
   if (s_chat_history)    lv_obj_add_flag(s_chat_history,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose)    lv_obj_add_flag(s_chat_compose,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_counter)    lv_obj_add_flag(s_chat_counter,    LV_OBJ_FLAG_HIDDEN);
@@ -859,14 +868,31 @@ static void contacts_list_populate() {
   int count = ui_get_contact_count();
   if (count == 0) {
     lv_obj_t* empty = lv_label_create(s_contacts_list);
-    lv_label_set_text(empty, "(no contacts heard yet)");
+    lv_label_set_text(empty, "No favorites yet.\nOpen Discovered to add.");
     lv_obj_set_style_text_color(empty, lv_color_hex(0x707880), 0);
     return;
   }
 
+  // Click handler for contact rows — opens a 3-option popup. The
+  // handler only needs the pub_key, so we cache just that per row to
+  // stay light on DRAM (UiContact is ~80 bytes; pub_key is 32).
+  static auto contact_row_clicked = +[](lv_event_t* e) {
+    const uint8_t* pk = (const uint8_t*)lv_event_get_user_data(e);
+    if (!pk) return;
+    con_menu_show(pk);
+  };
+  // 6-entry cap on the click-popup pub_key cache (DRAM is at 88%+ on
+  // this build, can't afford a bigger static buffer). Above this you
+  // can still see + scroll the rows, the popup just won't open — and
+  // long-press still works to go back.
+  static uint8_t s_con_row_pubkeys[6][32];
+
   for (int i = 0; i < count; i++) {
     UiContact ci;
     if (!ui_get_contact_info(i, &ci)) continue;
+    if (i < (int)(sizeof(s_con_row_pubkeys)/sizeof(s_con_row_pubkeys[0]))) {
+      memcpy(s_con_row_pubkeys[i], ci.pub_key, 32);
+    }
 
     lv_obj_t* row = lv_obj_create(s_contacts_list);
     lv_obj_remove_style_all(row);
@@ -890,6 +916,10 @@ static void contacts_list_populate() {
                                 LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(row, 6, 0);
     lv_obj_add_event_cb(row, back_long_press_event, LV_EVENT_LONG_PRESSED, NULL);
+    if (i < (int)(sizeof(s_con_row_pubkeys)/sizeof(s_con_row_pubkeys[0]))) {
+      lv_obj_add_event_cb(row, contact_row_clicked, LV_EVENT_CLICKED,
+                          s_con_row_pubkeys[i]);
+    }
 
     // Role label (first column). Lowercase 4-letter word so all roles
     // share the column width regardless of which one is shown.
@@ -1108,6 +1138,31 @@ static void disc_menu_show(int disc_idx) {
   if (enc && s_disc_menu_group) {
     lv_indev_set_group(enc, s_disc_menu_group);
     if (s_disc_menu_buttons[0]) lv_group_focus_obj(s_disc_menu_buttons[0]);
+  }
+}
+
+// Contact-row popup (S3.6c) — Open DM (placeholder) / Unmark favorite /
+// Cancel. Caller passes the contact's full pub_key so the unmark action
+// can call ui_toggle_favorite() directly without re-iterating contacts[].
+static void con_menu_close() {
+  if (s_con_menu_popup) lv_obj_add_flag(s_con_menu_popup, LV_OBJ_FLAG_HIDDEN);
+  memset(s_con_menu_pub_key, 0, sizeof(s_con_menu_pub_key));
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (enc && s_contacts_group) {
+    lv_group_set_editing(s_contacts_group, false);
+    lv_indev_set_group(enc, s_contacts_group);
+  }
+}
+
+static void con_menu_show(const uint8_t* pub_key) {
+  if (!s_con_menu_popup || !pub_key) return;
+  memcpy(s_con_menu_pub_key, pub_key, 32);
+  lv_obj_remove_flag(s_con_menu_popup, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_con_menu_popup);
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (enc && s_con_menu_group) {
+    lv_indev_set_group(enc, s_con_menu_group);
+    if (s_con_menu_buttons[0]) lv_group_focus_obj(s_con_menu_buttons[0]);
   }
 }
 
@@ -1614,6 +1669,49 @@ static void build_ui() {
       disc_menu_close();
       discovered_list_populate();   // reflect new state (e.g. row could be
                                     // marked already-added next time)
+    }, LV_EVENT_CLICKED, nullptr);
+  }
+
+  // Contacts click-popup (S3.6c). Same shape as the discovered popup but
+  // with Open-DM / Unmark-fav / Cancel actions. Open DM is a phase-d
+  // placeholder for now.
+  s_con_menu_popup = lv_obj_create(scr);
+  lv_obj_set_size(s_con_menu_popup, lv_pct(80), 130);
+  lv_obj_center(s_con_menu_popup);
+  lv_obj_set_style_bg_color(s_con_menu_popup, lv_color_hex(0x1c2530), 0);
+  lv_obj_set_style_border_width(s_con_menu_popup, 2, 0);
+  lv_obj_set_style_border_color(s_con_menu_popup, lv_color_hex(0xFAA61A), 0);
+  lv_obj_set_style_radius(s_con_menu_popup, 8, 0);
+  lv_obj_set_style_text_color(s_con_menu_popup, lv_color_hex(0xffffff), 0);
+  lv_obj_set_flex_flow(s_con_menu_popup, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(s_con_menu_popup, LV_FLEX_ALIGN_SPACE_EVENLY,
+                                         LV_FLEX_ALIGN_CENTER,
+                                         LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(s_con_menu_popup, LV_OBJ_FLAG_HIDDEN);
+
+  s_con_menu_group = lv_group_create();
+  static const char* con_btn_labels[3] = {
+    "Open DM (S3.6d)",
+    "Unmark favorite",
+    "Cancel",
+  };
+  for (int b = 0; b < 3; b++) {
+    s_con_menu_buttons[b] = lv_button_create(s_con_menu_popup);
+    lv_obj_set_size(s_con_menu_buttons[b], lv_pct(80), 26);
+    lv_obj_t* lbl = lv_label_create(s_con_menu_buttons[b]);
+    lv_label_set_text(lbl, con_btn_labels[b]);
+    lv_obj_center(lbl);
+    lv_group_add_obj(s_con_menu_group, s_con_menu_buttons[b]);
+    lv_obj_add_event_cb(s_con_menu_buttons[b], [](lv_event_t* e) {
+      lv_obj_t* tgt = (lv_obj_t*)lv_event_get_target(e);
+      int which = -1;
+      for (int i = 0; i < 3; i++) if (s_con_menu_buttons[i] == tgt) which = i;
+      if (which == 1 && ui_toggle_favorite) {
+        ui_toggle_favorite(s_con_menu_pub_key);
+      }
+      // which==0 (Open DM) lands here in S3.6d.
+      con_menu_close();
+      contacts_list_populate();
     }, LV_EVENT_CLICKED, nullptr);
   }
 
