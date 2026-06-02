@@ -329,11 +329,12 @@ extern "C" void ui_input_char(char c) {
     chat_compose_render();
     return;
   }
-  // Text-input popup: freq (idx 0), scope (idx 7), or new-channel
-  // (EDIT_IDX_NEW_CHANNEL). Char filter is per-row — freq accepts
-  // digits + '.', scope and new-channel accept lowercase letters +
-  // digits + '-'. All accept '\b' (pop) and '\n' (commit).
-  if ((s_editing_idx == 0 || s_editing_idx == 7 ||
+  // Text-input popup: freq (idx 0), scope (idx 7), node name (idx 8),
+  // or new-channel (EDIT_IDX_NEW_CHANNEL). Char filter is per-row —
+  // freq accepts digits + '.', scope + new-channel accept lowercase
+  // letters + digits + '-', node name accepts mixed-case letters +
+  // digits + '-' + '_'. All accept '\b' (pop) and '\n' (commit).
+  if ((s_editing_idx == 0 || s_editing_idx == 7 || s_editing_idx == 8 ||
        s_editing_idx == EDIT_IDX_NEW_CHANNEL) && s_text_value_label) {
     if (c == '\n') {
       close_edit_popup_apply();
@@ -344,6 +345,9 @@ extern "C" void ui_input_char(char c) {
       bool allow;
       if (s_editing_idx == 0) {
         allow = (c >= '0' && c <= '9') || c == '.';
+      } else if (s_editing_idx == 8) {  // node name — wider set
+        allow = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '-' || c == '_';
       } else {  // scope or new-channel
         allow = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
       }
@@ -540,8 +544,9 @@ static void radio_list_populate(NodePrefs* p, int focus_row) {
     "RX boost",
     "Path hash",  // bytes (mode+1)
     "Scope",      // default region-scope name (e.g. nl-utrecht)
+    "Name",       // node_name (UX round 2 — Heltec / others see this)
   };
-  static const char* UNITS[]  = { " MHz", "", " kHz", "", " dBm", "", "", "" };
+  static const char* UNITS[]  = { " MHz", "", " kHz", "", " dBm", "", "", "", "" };
   const int ROW_COUNT = sizeof(LABELS) / sizeof(LABELS[0]);
   char val[24];
 
@@ -559,6 +564,7 @@ static void radio_list_populate(NodePrefs* p, int focus_row) {
         else snprintf(val, sizeof(val), "(none)");
         break;
       }
+      case 8: snprintf(val, sizeof(val), "%s", p->node_name); break;
     }
     char value_text[32];
     snprintf(value_text, sizeof(value_text), "%s%s", val, UNITS[i]);
@@ -567,9 +573,9 @@ static void radio_list_populate(NodePrefs* p, int focus_row) {
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 24);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
     lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
-    lv_obj_set_style_text_color(row, lv_color_hex(0x101418), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 8, 0);
     lv_obj_set_style_pad_ver(row, 2, 0);
     lv_obj_set_style_radius(row, 4, 0);
@@ -666,10 +672,10 @@ static void channels_list_populate(int focus_row) {
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 24);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
     lv_obj_set_style_text_color(row,
         is_add ? lv_color_hex(0xFAA61A) : lv_color_hex(0xc0c8d0), 0);
-    lv_obj_set_style_text_color(row, lv_color_hex(0x101418), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 8, 0);
     lv_obj_set_style_pad_ver(row, 2, 0);
     lv_obj_set_style_radius(row, 4, 0);
@@ -1085,9 +1091,9 @@ static void contacts_list_populate() {
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 22);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
     lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
-    lv_obj_set_style_text_color(row, lv_color_hex(0x101418), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_margin_bottom(row, 1, 0);
@@ -1205,9 +1211,9 @@ static void dm_list_populate() {
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 26);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
     lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
-    lv_obj_set_style_text_color(row, lv_color_hex(0x101418), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_margin_bottom(row, 1, 0);
@@ -1273,9 +1279,9 @@ static void discovered_list_populate() {
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 22);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), 0);
-    lv_obj_set_style_text_color(row, lv_color_hex(0x101418), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_margin_bottom(row, 1, 0);
@@ -1338,9 +1344,9 @@ static void discovered_list_populate() {
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 22);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
     lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
-    lv_obj_set_style_text_color(row, lv_color_hex(0x101418), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_margin_bottom(row, 1, 0);
@@ -1519,13 +1525,19 @@ static void close_edit_popup_apply() {
       if (ui_apply_default_scope) ui_apply_default_scope(s_text_buf);
       break;
     }
+    case 8: {
+      // Node name. Persisted via dedicated bridge that calls savePrefs.
+      if (ui_set_node_name) ui_set_node_name(s_text_buf);
+      break;
+    }
     default: break;
   }
 
   int idx_was = s_editing_idx;
-  // Skip the radio-params reapply for scope — already persisted by the
-  // dedicated bridge, and re-running radio_set_params would be redundant.
-  if (s_editing_idx != 7 && ui_apply_radio_changes) ui_apply_radio_changes();
+  // Skip the radio-params reapply for scope + name — both go through
+  // their own savePrefs path and re-running radio_set_params is redundant.
+  if (s_editing_idx != 7 && s_editing_idx != 8 && ui_apply_radio_changes)
+    ui_apply_radio_changes();
 
   lv_obj_add_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
   lv_indev_t* enc = tpager_lvgl_get_encoder();
@@ -1555,9 +1567,10 @@ static void radio_item_clicked(lv_event_t* e) {
   //   idx 2          → dropdown over standard LoRa BW values
   //   idx 6          → dropdown over path-hash modes (1 / 2 / 3 bytes)
   //   idx 7          → text-input (Scope, letters + digits + '-')
+  //   idx 8          → text-input (Name, mixed-case + digits + '-' + '_')
   bool is_spinbox  = (idx == 1 || idx == 3 || idx == 4);
   bool is_dropdown = (idx == 2 || idx == 6);
-  bool is_text     = (idx == 0 || idx == 7);
+  bool is_text     = (idx == 0 || idx == 7 || idx == 8);
   if (!is_spinbox && !is_dropdown && !is_text) return;
 
   s_editing_idx = idx;
@@ -1573,9 +1586,12 @@ static void radio_item_clicked(lv_event_t* e) {
     if (idx == 0) {
       snprintf(s_text_buf, sizeof(s_text_buf), "%.3f", p->freq);
       lv_label_set_text(s_edit_title, "Frequency (MHz)");
-    } else {  // idx == 7, scope
+    } else if (idx == 7) {
       snprintf(s_text_buf, sizeof(s_text_buf), "%s", p->default_scope_name);
       lv_label_set_text(s_edit_title, "Region scope");
+    } else {  // idx == 8, node name
+      snprintf(s_text_buf, sizeof(s_text_buf), "%s", p->node_name);
+      lv_label_set_text(s_edit_title, "Node name");
     }
     s_text_len = strlen(s_text_buf);
 
