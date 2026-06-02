@@ -103,6 +103,14 @@ void BaseChatMesh::populateContactFromAdvert(ContactInfo& ci, const mesh::Identi
   ci.lastmod = getRTCClock()->getCurrentTime();
 }
 
+// Variant-UI hook: deliver the per-packet RSSI/SNR alongside the identity
+// so a Contacts tile can show signal strength per node. C-linkage matters:
+// the definition (e.g. companion_radio/main.cpp) is `extern "C"`. A C++
+// decl would mangle to a different symbol and the weak resolution would
+// silently never fire. (Linkage-spec must be at namespace scope.)
+extern "C" void ui_on_advert_received(const uint8_t* pub_key, float snr, float rssi)
+    __attribute__((weak));
+
 void BaseChatMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len) {
   AdvertDataParser parser(app_data, app_data_len);
   if (!(parser.isValid() && parser.hasName())) {
@@ -177,12 +185,7 @@ void BaseChatMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, 
 
   onDiscoveredContact(*from, is_new, packet->path_len, packet->path);       // let UI know
 
-  // Variant-UI hook: deliver the per-packet RSSI/SNR alongside the
-  // identity so a Contacts tile can show signal strength per node.
-  // RSSI is read from the radio (per-packet, not per-contact) at this
-  // point — Dispatcher captured it on this very packet a few hops up.
-  extern void ui_on_advert_received(const uint8_t* pub_key, float snr, float rssi)
-      __attribute__((weak));
+  // Variant-UI hook (see file-scope decl above onAdvertRecv).
   if (ui_on_advert_received) {
     ui_on_advert_received(id.pub_key, packet->getSNR(), _radio->getLastRSSI());
   }

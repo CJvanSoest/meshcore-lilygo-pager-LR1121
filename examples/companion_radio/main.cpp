@@ -103,11 +103,16 @@ MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store
 
 // Bridge: variant UIs (e.g. T-Pager LVGL settings list) call this after
 // editing the NodePrefs in memory to push new radio parameters to the
-// LR1121 and persist the change to SPIFFS.
+// LR1121 and persist the change to SPIFFS. RX-boost included: the LR1121
+// LNA-boost register is NOT touched by radio_set_params (that call only
+// re-runs setFrequency/SF/BW/CR), so without the explicit
+// setRxBoostedGainMode() call below a UI-side toggle would only take
+// effect on the next reboot.
 extern "C" void ui_apply_radio_changes() {
   auto* p = the_mesh.getNodePrefs();
   radio_set_params(p->freq, p->bw, p->sf, p->cr);
   radio_set_tx_power(p->tx_power_dbm);
+  radio_driver.setRxBoostedGainMode(p->rx_boosted_gain);
   the_mesh.savePrefs();
 }
 
