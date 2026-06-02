@@ -172,9 +172,36 @@ hands doesn't have to rediscover them:
   the ring buffer and re-render the history if the matching channel
   is currently open.
 
+## Contacts (S3.5)
+
+* Contacts tile shows every node we've heard an advert from, in a
+  scrollable list with column headers `role | name | SNR | RSSI |
+  dist | age`.
+* Roles use 4-letter lowercase labels chosen to share a column width:
+  `chat` / `rptr` / `room` / `sens`.
+* Long names auto-scroll horizontally inside their column
+  (`LV_LABEL_LONG_SCROLL_CIRCULAR`), e.g. `NL-MET-PLANTAGE-RPT`
+  ticker-tapes through the visible name slot.
+* SNR + RSSI come from a 64-entry LRU cache keyed by the first 8
+  bytes of the contact's pub_key. The cache is updated by a new
+  weak `ui_on_advert_received(pub_key, snr, rssi)` hook appended
+  to `BaseChatMesh::onAdvertRecv` — RSSI is read from
+  `_radio->getLastRSSI()` on the same packet. Contacts we haven't
+  heard from this session show `-`.
+* Distance uses the haversine formula between our own GPS
+  (`SensorManager::node_lat/lon`) and the contact's advertised
+  lat/lon. Renders as `m` / `N.Nk` / `Nk`, or `-` if either side
+  has no fix.
+* Age is the relative time since the last advert, formatted as
+  `Ns` / `Nm` / `Nh` / `Nd`. List auto-refreshes every 5 s while
+  the tile is open.
+* A parallel-array approach indexed by `MAX_CONTACTS` (=350) blew
+  the DRAM segment by 72 bytes — the 64-entry LRU cache uses
+  ~1 KB instead and fits comfortably.
+
 ## TODO (next phases)
-- S3.5: contacts tile (heard adverts) with favourite flag and a
-  not-favourite-first eviction policy when the 350-contact cap is hit.
+- S3.5 follow-up: favourite flag + not-favourite-first eviction when
+  the 350-contact cap is hit.
 - S3.6: map renderer — XYZ raster tiles from microSD. Five base
   sources shipped with the firmware (OSM, PDOK for NL, OpenTopoMap,
   CyclOSM, Stamen Toner). See `MAPS.md` for the source list, tile-URL

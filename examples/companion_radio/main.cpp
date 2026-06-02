@@ -222,6 +222,108 @@ extern "C" bool ui_add_hashtag_channel(const char* name) {
   return true;
 }
 
+// ----------- Contacts (S3.5) -------------------------------------------------
+//
+// Per-contact SNR / RSSI cache. Keyed by an 8-byte prefix of the
+// contact's pub_key (PUB_KEY_SIZE=32 in MeshCore; first 8 bytes are
+// already used as the contact hash so collisions are vanishingly rare
+// among the few dozen nodes a single device hears at once). Fixed-size
+// + LRU eviction so we don't blow the DRAM budget — a per-contact
+// parallel array sized to MAX_CONTACTS (=350) overflowed the segment.
+
+#include <helpers/ContactInfo.h>
+
+struct UiSigEntry {
+  uint8_t  prefix[8];     // first 8 bytes of pub_key
+  int8_t   snr_q;
+  int16_t  rssi;
+  uint32_t last_ms;       // millis() at last update — used for LRU eviction
+};
+static const int UI_SIG_CACHE = 64;
+static UiSigEntry s_sig_cache[UI_SIG_CACHE];
+
+static UiSigEntry* sig_find(const uint8_t* pub_key) {
+  for (int i = 0; i < UI_SIG_CACHE; i++) {
+    if (s_sig_cache[i].last_ms == 0) continue;
+    if (memcmp(s_sig_cache[i].prefix, pub_key, 8) == 0) return &s_sig_cache[i];
+  }
+  return nullptr;
+}
+
+static UiSigEntry* sig_allocate(const uint8_t* pub_key) {
+  // Reuse a matching entry first (paranoia — sig_find should have hit).
+  UiSigEntry* hit = sig_find(pub_key);
+  if (hit) return hit;
+  // Else find empty / oldest entry (LRU by last_ms).
+  UiSigEntry* victim = &s_sig_cache[0];
+  uint32_t oldest = victim->last_ms;
+  for (int i = 1; i < UI_SIG_CACHE; i++) {
+    if (s_sig_cache[i].last_ms == 0) {
+      victim = &s_sig_cache[i];
+      break;
+    }
+    if (s_sig_cache[i].last_ms < oldest) {
+      oldest = s_sig_cache[i].last_ms;
+      victim = &s_sig_cache[i];
+    }
+  }
+  memcpy(victim->prefix, pub_key, 8);
+  return victim;
+}
+
+extern "C" void ui_on_advert_received(const uint8_t* pub_key, float snr, float rssi) {
+  UiSigEntry* e = sig_allocate(pub_key);
+  e->snr_q   = (int8_t)(snr * 4.0f);
+  e->rssi    = (int16_t)rssi;
+  e->last_ms = millis() ? millis() : 1;     // 0 reserved as "empty"
+}
+
+struct UiContact {
+  char     name[32];
+  uint8_t  type;            // ADV_TYPE_*
+  int32_t  gps_lat;         // x10^6
+  int32_t  gps_lon;
+  uint32_t last_advert;     // their clock (epoch seconds)
+  int8_t   snr_q;           // SNR * 4 (or 0x80 / -128 = unknown)
+  int16_t  rssi;            // dBm (or 0 = unknown)
+};
+
+extern "C" int ui_get_contact_count() {
+  int count = 0;
+  for (uint32_t i = 0; i < MAX_CONTACTS; i++) {
+    ContactInfo ci;
+    if (!the_mesh.getContactByIdx(i, ci)) break;
+    if (ci.name[0]) count++;
+  }
+  return count;
+}
+
+extern "C" bool ui_get_contact_info(int idx, UiContact* out) {
+  if (!out) return false;
+  ContactInfo ci;
+  if (!the_mesh.getContactByIdx((uint32_t)idx, ci)) return false;
+  if (!ci.name[0]) return false;
+  memset(out, 0, sizeof(*out));
+  StrHelper::strncpy(out->name, ci.name, sizeof(out->name));
+  out->type        = ci.type;
+  out->gps_lat     = ci.gps_lat;
+  out->gps_lon     = ci.gps_lon;
+  out->last_advert = ci.last_advert_timestamp;
+  UiSigEntry* sig  = sig_find(ci.id.pub_key);
+  out->snr_q       = sig ? sig->snr_q : (int8_t)-128;
+  out->rssi        = sig ? sig->rssi  : (int16_t)0;
+  return true;
+}
+
+extern "C" void ui_get_self_loc(double* lat, double* lon) {
+  if (lat) *lat = sensors.node_lat;
+  if (lon) *lon = sensors.node_lon;
+}
+
+extern "C" uint32_t ui_get_now_epoch() {
+  return the_mesh.getRTCClock()->getCurrentTime();
+}
+
 // Send a chat message to a channel by index. Returns false if the
 // channel is empty or sendGroupMessage rejects the payload. The
 // caller is responsible for the channel index — variant UIs find it

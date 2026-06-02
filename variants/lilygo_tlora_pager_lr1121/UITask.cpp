@@ -46,9 +46,12 @@ static lv_obj_t* s_subscreen_title;
 static lv_obj_t* s_subscreen_body;
 static lv_obj_t* s_radio_list;
 static lv_obj_t* s_channel_list;     // S3.4 channels list (Messages tile)
+static lv_obj_t* s_contacts_list;    // S3.5 contacts list (Contacts tile)
 static lv_group_t* s_group;          // carousel tiles
 static lv_group_t* s_radio_group;    // Radio settings list rows
 static lv_group_t* s_channel_group;  // Channels list rows
+static lv_group_t* s_contacts_group; // Contacts list rows
+static unsigned long s_contacts_next_refresh = 0;
 // Special s_editing_idx value used when the text-input popup is open for
 // "add new channel". Out-of-range w.r.t. radio rows so existing
 // per-row dispatch ignores it.
@@ -147,6 +150,7 @@ static void chat_view_close();
 static void chat_history_render();
 static void chat_compose_render();
 static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char* text);
+static void contacts_list_populate();
 
 extern "C" void tpager_power_off() __attribute__((weak));
 extern "C" void ui_apply_radio_changes() __attribute__((weak));
@@ -158,6 +162,21 @@ extern "C" int  ui_get_channel_count() __attribute__((weak));
 extern "C" bool ui_get_channel_name(int idx, char* buf, int buf_size) __attribute__((weak));
 extern "C" bool ui_add_hashtag_channel(const char* name) __attribute__((weak));
 extern "C" bool ui_send_group_text(int channel_idx, const char* text) __attribute__((weak));
+
+// Contacts bridges (S3.5)
+struct UiContact {
+  char     name[32];
+  uint8_t  type;
+  int32_t  gps_lat;
+  int32_t  gps_lon;
+  uint32_t last_advert;
+  int8_t   snr_q;
+  int16_t  rssi;
+};
+extern "C" int  ui_get_contact_count() __attribute__((weak));
+extern "C" bool ui_get_contact_info(int idx, UiContact* out) __attribute__((weak));
+extern "C" void ui_get_self_loc(double* lat, double* lon) __attribute__((weak));
+extern "C" uint32_t ui_get_now_epoch() __attribute__((weak));
 // Tenths-of-percent (0..1000) of the duty-cycle quota that has been
 // consumed in the current hour-window. 0 = idle, 1000 = throttled.
 extern "C" int  ui_get_duty_cycle_used_tenths() __attribute__((weak));
@@ -298,12 +317,13 @@ static void enter_subscreen(int idx) {
 
   // Default: simple body label visible, all per-tile containers hidden.
   lv_obj_remove_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
-  if (s_radio_list)   lv_obj_add_flag(s_radio_list,   LV_OBJ_FLAG_HIDDEN);
-  if (s_channel_list) lv_obj_add_flag(s_channel_list, LV_OBJ_FLAG_HIDDEN);
-  if (s_input_label)  lv_obj_add_flag(s_input_label,  LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_history) lv_obj_add_flag(s_chat_history, LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_compose) lv_obj_add_flag(s_chat_compose, LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_counter) lv_obj_add_flag(s_chat_counter, LV_OBJ_FLAG_HIDDEN);
+  if (s_radio_list)    lv_obj_add_flag(s_radio_list,    LV_OBJ_FLAG_HIDDEN);
+  if (s_channel_list)  lv_obj_add_flag(s_channel_list,  LV_OBJ_FLAG_HIDDEN);
+  if (s_contacts_list) lv_obj_add_flag(s_contacts_list, LV_OBJ_FLAG_HIDDEN);
+  if (s_input_label)   lv_obj_add_flag(s_input_label,   LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_history)  lv_obj_add_flag(s_chat_history,  LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_compose)  lv_obj_add_flag(s_chat_compose,  LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_counter)  lv_obj_add_flag(s_chat_counter,  LV_OBJ_FLAG_HIDDEN);
   s_input_active = false;
   s_chat_open = false;
   s_chat_channel_idx = -1;
@@ -334,9 +354,14 @@ static void enter_subscreen(int idx) {
     case 3:
       snprintf(body, sizeof(body), "Settings\n\n(global editable list later)");
       break;
-    case 4:
-      snprintf(body, sizeof(body), "Contacts\n\n(heard nodes: S3.5)");
-      break;
+    case 4: {  // Contacts → S3.5 list of heard nodes
+      lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
+      if (s_contacts_list) lv_obj_remove_flag(s_contacts_list, LV_OBJ_FLAG_HIDDEN);
+      contacts_list_populate();
+      s_contacts_next_refresh = millis() + 5000;
+      if (enc && s_contacts_group) lv_indev_set_group(enc, s_contacts_group);
+      return;
+    }
     case 5:
       snprintf(body, sizeof(body), "MeshCore T-Pager\n%s\n\nLVGL %d.%d.%d",
                FIRMWARE_VERSION, LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
@@ -355,11 +380,12 @@ static void leave_subscreen() {
   s_input_active = false;
   s_chat_open = false;
   s_chat_channel_idx = -1;
-  if (s_input_label)   lv_obj_add_flag(s_input_label,   LV_OBJ_FLAG_HIDDEN);
-  if (s_channel_list)  lv_obj_add_flag(s_channel_list,  LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_history)  lv_obj_add_flag(s_chat_history,  LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_compose)  lv_obj_add_flag(s_chat_compose,  LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_counter)  lv_obj_add_flag(s_chat_counter,  LV_OBJ_FLAG_HIDDEN);
+  if (s_input_label)    lv_obj_add_flag(s_input_label,    LV_OBJ_FLAG_HIDDEN);
+  if (s_channel_list)   lv_obj_add_flag(s_channel_list,   LV_OBJ_FLAG_HIDDEN);
+  if (s_contacts_list)  lv_obj_add_flag(s_contacts_list,  LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_history)   lv_obj_add_flag(s_chat_history,   LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_compose)   lv_obj_add_flag(s_chat_compose,   LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_counter)   lv_obj_add_flag(s_chat_counter,   LV_OBJ_FLAG_HIDDEN);
   s_active_tile = -1;
 }
 
@@ -698,6 +724,192 @@ extern "C" void ui_on_channel_message(int channel_idx, uint32_t timestamp, const
   chat_ring_push((uint8_t)channel_idx, timestamp, text);
   if (s_chat_open && s_chat_channel_idx == channel_idx) {
     chat_history_render();
+  }
+}
+
+// ---------- Contacts tile (S3.5) --------------------------------------------
+
+// Role labels — 4-letter lowercase to match the width of "chat" (the
+// shortest full word among ADV_TYPE_* values). Keeps the column width
+// uniform across all four roles.
+static const char* role_short(uint8_t type) {
+  switch (type) {
+    case 1: return "chat";   // Chat / Client
+    case 2: return "rptr";   // Repeater
+    case 3: return "room";   // Room
+    case 4: return "sens";   // Sensor
+    default: return "?";
+  }
+}
+
+// Pixel widths chosen to fit the labels in the default Montserrat-14
+// LVGL font on a 460-px content area. Name column takes the biggest
+// slice; everything else is just wide enough for the worst-case value.
+#define CON_COL_ROLE  40
+#define CON_COL_NAME  180
+#define CON_COL_SNR   42
+#define CON_COL_RSSI  44
+#define CON_COL_DIST  50
+#define CON_COL_AGE   34
+
+// Haversine — returns great-circle distance in km between two
+// (lat, lon) pairs (degrees). 0 if either side has no fix.
+static float haversine_km(double lat1, double lon1, double lat2, double lon2) {
+  if (lat1 == 0 && lon1 == 0) return 0;
+  if (lat2 == 0 && lon2 == 0) return 0;
+  static const double R = 6371.0;
+  double dLat = (lat2 - lat1) * 0.01745329252;  // π/180
+  double dLon = (lon2 - lon1) * 0.01745329252;
+  double a = sin(dLat / 2);
+  a = a * a;
+  double cl1 = cos(lat1 * 0.01745329252);
+  double cl2 = cos(lat2 * 0.01745329252);
+  double b = sin(dLon / 2);
+  a += cl1 * cl2 * b * b;
+  double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+  return (float)(R * c);
+}
+
+// Format a "Xs / Xm / Xh / Xd" relative-time string.
+static void rel_time_fmt(uint32_t ts, uint32_t now, char* out, int n) {
+  if (ts == 0 || now == 0 || ts > now) { snprintf(out, n, "-"); return; }
+  uint32_t s = now - ts;
+  if (s < 60)       snprintf(out, n, "%us", s);
+  else if (s < 3600) snprintf(out, n, "%um", s / 60);
+  else if (s < 86400) snprintf(out, n, "%uh", s / 3600);
+  else               snprintf(out, n, "%ud", s / 86400);
+}
+
+static void contacts_list_populate() {
+  if (!s_contacts_list || !ui_get_contact_count) return;
+  lv_obj_clean(s_contacts_list);
+  if (s_contacts_group) lv_group_remove_all_objs(s_contacts_group);
+
+  double self_lat = 0, self_lon = 0;
+  if (ui_get_self_loc) ui_get_self_loc(&self_lat, &self_lon);
+  uint32_t now = ui_get_now_epoch ? ui_get_now_epoch() : 0;
+
+  // Header row — same column widths as the data rows below. Non-
+  // focusable so the encoder skips it.
+  {
+    lv_obj_t* hdr = lv_obj_create(s_contacts_list);
+    lv_obj_remove_style_all(hdr);
+    lv_obj_set_size(hdr, lv_pct(100), 18);
+    lv_obj_set_style_bg_opa(hdr, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0x707880), 0);
+    lv_obj_set_style_pad_hor(hdr, 6, 0);
+    lv_obj_set_style_margin_bottom(hdr, 1, 0);
+    lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_START,
+                                LV_FLEX_ALIGN_CENTER,
+                                LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(hdr, 6, 0);
+    static const struct { const char* text; int w; } cols[] = {
+      {"role", CON_COL_ROLE}, {"name", CON_COL_NAME},
+      {"SNR",  CON_COL_SNR },  {"RSSI", CON_COL_RSSI},
+      {"dist", CON_COL_DIST},  {"age",  CON_COL_AGE },
+    };
+    for (auto& c : cols) {
+      lv_obj_t* l = lv_label_create(hdr);
+      lv_obj_set_width(l, c.w);
+      lv_label_set_text(l, c.text);
+    }
+  }
+
+  int count = ui_get_contact_count();
+  if (count == 0) {
+    lv_obj_t* empty = lv_label_create(s_contacts_list);
+    lv_label_set_text(empty, "(no contacts heard yet)");
+    lv_obj_set_style_text_color(empty, lv_color_hex(0x707880), 0);
+    return;
+  }
+
+  for (int i = 0; i < count; i++) {
+    UiContact ci;
+    if (!ui_get_contact_info(i, &ci)) continue;
+
+    lv_obj_t* row = lv_obj_create(s_contacts_list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), 22);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_pad_hor(row, 6, 0);
+    lv_obj_set_style_radius(row, 4, 0);
+    lv_obj_set_style_margin_bottom(row, 1, 0);
+    lv_obj_set_style_border_color(row, lv_color_hex(0x303a47), 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                                LV_FLEX_ALIGN_CENTER,
+                                LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 6, 0);
+    lv_obj_add_event_cb(row, back_long_press_event, LV_EVENT_LONG_PRESSED, NULL);
+
+    // Role label (first column). Lowercase 4-letter word so all roles
+    // share the column width regardless of which one is shown.
+    lv_obj_t* lbl_role = lv_label_create(row);
+    lv_obj_set_width(lbl_role, CON_COL_ROLE);
+    lv_label_set_text(lbl_role, role_short(ci.type));
+    lv_obj_set_style_text_color(lbl_role, lv_color_hex(0xFAA61A), 0);
+
+    // Name — auto-scrolls if it doesn't fit the column. Takes the
+    // bulk of the row width since names like NL-MET-PLANTAGE-RPT are
+    // common.
+    lv_obj_t* lbl_name = lv_label_create(row);
+    lv_obj_set_width(lbl_name, CON_COL_NAME);
+    lv_label_set_long_mode(lbl_name, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_label_set_text(lbl_name, ci.name);
+
+    // SNR (one decimal). Show `-` if we haven't heard from them yet
+    // this session (snr_q == -128 sentinel).
+    lv_obj_t* lbl_snr = lv_label_create(row);
+    lv_obj_set_width(lbl_snr, CON_COL_SNR);
+    char snr_buf[12];
+    if (ci.snr_q == (int8_t)-128) snprintf(snr_buf, sizeof(snr_buf), "-");
+    else {
+      float snr = (float)ci.snr_q / 4.0f;
+      snprintf(snr_buf, sizeof(snr_buf), "%+.1f", snr);
+    }
+    lv_label_set_text(lbl_snr, snr_buf);
+
+    // RSSI in dBm — sentinel rssi==0 means we have no measurement
+    // for this contact yet (real values are negative).
+    lv_obj_t* lbl_rssi = lv_label_create(row);
+    lv_obj_set_width(lbl_rssi, CON_COL_RSSI);
+    char rssi_buf[12];
+    if (ci.rssi == 0) snprintf(rssi_buf, sizeof(rssi_buf), "-");
+    else              snprintf(rssi_buf, sizeof(rssi_buf), "%d", (int)ci.rssi);
+    lv_label_set_text(lbl_rssi, rssi_buf);
+
+    // Distance — needs both fixes; falls back to `-`.
+    lv_obj_t* lbl_dist = lv_label_create(row);
+    lv_obj_set_width(lbl_dist, CON_COL_DIST);
+    double clat = ci.gps_lat / 1.0e6;
+    double clon = ci.gps_lon / 1.0e6;
+    float km = haversine_km(self_lat, self_lon, clat, clon);
+    char dist_buf[16];
+    if (km <= 0)        snprintf(dist_buf, sizeof(dist_buf), "-");
+    else if (km < 1.0f) snprintf(dist_buf, sizeof(dist_buf), "%dm", (int)(km * 1000));
+    else if (km < 10.0f) snprintf(dist_buf, sizeof(dist_buf), "%.1fk", km);
+    else                 snprintf(dist_buf, sizeof(dist_buf), "%dk", (int)km);
+    lv_label_set_text(lbl_dist, dist_buf);
+    lv_obj_set_style_text_color(lbl_dist, lv_color_hex(0x80868f), 0);
+
+    // Last advert (relative).
+    lv_obj_t* lbl_age = lv_label_create(row);
+    lv_obj_set_width(lbl_age, CON_COL_AGE);
+    char age_buf[12];
+    rel_time_fmt(ci.last_advert, now, age_buf, sizeof(age_buf));
+    lv_label_set_text(lbl_age, age_buf);
+    lv_obj_set_style_text_color(lbl_age, lv_color_hex(0x80868f), 0);
+
+    if (s_contacts_group) lv_group_add_obj(s_contacts_group, row);
   }
 }
 
@@ -1052,6 +1264,21 @@ static void build_ui() {
 
   s_channel_group = lv_group_create();
 
+  // Contacts list (S3.5) — same row pattern as channels list. Built
+  // once, hidden by default. Refilled on each enter from
+  // ui_get_contact_count + ui_get_contact_info.
+  s_contacts_list = lv_obj_create(s_subscreen_root);
+  lv_obj_remove_style_all(s_contacts_list);
+  lv_obj_set_size(s_contacts_list, lv_pct(96), lv_pct(70));
+  lv_obj_align(s_contacts_list, LV_ALIGN_TOP_LEFT, 6, 44);
+  lv_obj_set_flex_flow(s_contacts_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_bg_color(s_contacts_list, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_pad_all(s_contacts_list, 2, 0);
+  lv_obj_set_scroll_dir(s_contacts_list, LV_DIR_VER);
+  lv_obj_add_flag(s_contacts_list, LV_OBJ_FLAG_HIDDEN);
+
+  s_contacts_group = lv_group_create();
+
   // Chat-view widgets — history label (top, scrollable) + compose
   // label (bottom). Both hidden until chat_view_open() shows them.
   s_chat_history = lv_label_create(s_subscreen_root);
@@ -1303,6 +1530,14 @@ void UITask::loop() {
   if (s_lvgl_ready && (long)(millis() - s_next_tick) >= 0) {
     s_next_tick = millis() + 5;
     lv_timer_handler();
+  }
+
+  // Periodic refresh of the contacts list so the "last seen" column
+  // and any newly-heard nodes appear without needing to leave/re-enter.
+  if (s_active_tile == 4 && s_contacts_list &&
+      (long)(millis() - s_contacts_next_refresh) >= 0) {
+    s_contacts_next_refresh = millis() + 5000;
+    contacts_list_populate();
   }
 
   // Periodically refresh battery + header data on the carousel + sub-screen.
