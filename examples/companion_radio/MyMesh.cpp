@@ -12,6 +12,13 @@ extern "C" void ui_on_channel_message(int channel_idx, uint32_t timestamp,
                                       const char* text)
     __attribute__((weak));
 
+// Variant-UI hook for DM receive (S3.6d). Fires from MyMesh::onMessageRecv
+// AFTER queueMessage so the existing companion-app protocol still gets
+// served. pub_key is the full 32-byte sender id.
+extern "C" void ui_on_dm_message(const uint8_t* pub_key, uint32_t timestamp,
+                                 const char* text)
+    __attribute__((weak));
+
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
 #define CMD_SEND_CHANNEL_TXT_MSG      3
@@ -523,6 +530,9 @@ void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t 
                            const char *text) {
   markConnectionActive(from); // in case this is from a server, and we have a connection
   queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
+  if (ui_on_dm_message) {
+    ui_on_dm_message(from.id.pub_key, sender_timestamp, text);
+  }
 }
 
 void MyMesh::onCommandDataRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,

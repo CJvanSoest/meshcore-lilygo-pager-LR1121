@@ -473,6 +473,138 @@ extern "C" bool ui_add_discovered_to_contacts(int idx, bool favorite) {
   return true;
 }
 
+// ---- DM tile bridges (S3.6d) -----------------------------------------------
+//
+// DM tile lists chat-type contacts from contacts[] (regardless of
+// favorite — DM is for any chat contact). 32-entry shared ring buffer
+// in PSRAM, tagged by 8-byte pub_key prefix. Not persisted across
+// boots — S3.6d.2 will swap this for an AES-256-CTR-encrypted SD store.
+
+struct DmMsg {
+  uint8_t  pubkey8[8];      // first 8 bytes of contact's pub_key (tagging)
+  uint8_t  from_me;         // 1 = sent by us, 0 = received
+  char     text[120];       // Tanmatsu-compatible 120-char limit
+  uint32_t ts_ms;           // millis() at append (in-memory only)
+};
+static const int DM_RING_SIZE = 32;
+static DmMsg* s_dm_ring = nullptr;
+static int    s_dm_ring_head = 0;     // next write slot (wraps)
+static int    s_dm_ring_count = 0;    // # valid entries, ≤ DM_RING_SIZE
+
+static bool ensure_dm_ring() {
+  if (s_dm_ring) return true;
+  s_dm_ring = (DmMsg*)heap_caps_calloc(
+      DM_RING_SIZE, sizeof(DmMsg),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return s_dm_ring != nullptr;
+}
+
+static void dm_ring_push(const uint8_t* pub_key, bool from_me, const char* text) {
+  if (!ensure_dm_ring() || !text) return;
+  DmMsg& m = s_dm_ring[s_dm_ring_head];
+  memcpy(m.pubkey8, pub_key, 8);
+  m.from_me = from_me ? 1 : 0;
+  StrHelper::strncpy(m.text, text, sizeof(m.text));
+  m.ts_ms = millis();
+  s_dm_ring_head = (s_dm_ring_head + 1) % DM_RING_SIZE;
+  if (s_dm_ring_count < DM_RING_SIZE) s_dm_ring_count++;
+}
+
+extern "C" void ui_refresh_open_dm(const uint8_t* pub_key) __attribute__((weak));
+
+extern "C" void ui_on_dm_message(const uint8_t* pub_key, uint32_t timestamp,
+                                 const char* text) {
+  (void)timestamp;
+  dm_ring_push(pub_key, /*from_me=*/false, text);
+  if (ui_refresh_open_dm) ui_refresh_open_dm(pub_key);
+}
+
+// Chat-type contacts only. Distinguishes a "DM contact" from a repeater
+// or sensor in the same contacts[] table.
+extern "C" int ui_get_dm_contact_count() {
+  int count = 0;
+  for (uint32_t i = 0; i < MAX_CONTACTS; i++) {
+    ContactInfo ci;
+    if (!the_mesh.getContactByIdx(i, ci)) break;
+    if (!ci.name[0]) continue;
+    if (ci.type == 1 /* ADV_TYPE_CHAT */) count++;
+  }
+  return count;
+}
+
+extern "C" bool ui_get_dm_contact_info(int idx, UiContact* out) {
+  if (!out) return false;
+  int seen = 0;
+  for (uint32_t i = 0; i < MAX_CONTACTS; i++) {
+    ContactInfo ci;
+    if (!the_mesh.getContactByIdx(i, ci)) break;
+    if (!ci.name[0]) continue;
+    if (ci.type != 1) continue;
+    if (seen == idx) {
+      memset(out, 0, sizeof(*out));
+      StrHelper::strncpy(out->name, ci.name, sizeof(out->name));
+      out->type        = ci.type;
+      out->last_advert = ci.last_advert_timestamp;
+      memcpy(out->pub_key, ci.id.pub_key, 32);
+      out->flags       = ci.flags;
+      UiSigEntry* sig  = sig_find(ci.id.pub_key);
+      out->snr_q       = sig ? sig->snr_q : (int8_t)-128;
+      out->rssi        = sig ? sig->rssi  : (int16_t)0;
+      return true;
+    }
+    seen++;
+  }
+  return false;
+}
+
+extern "C" bool ui_send_dm(const uint8_t* pub_key, const char* text) {
+  if (!pub_key || !text || !text[0]) return false;
+  if (!the_mesh.uiSendDm(pub_key, text)) return false;
+  // Also append to the local ring so the user sees their own send.
+  dm_ring_push(pub_key, /*from_me=*/true, text);
+  return true;
+}
+
+// Variant UIs iterate the ring tagged by contact. `idx` is 0-indexed
+// over messages matching `pub_key8` (first 8 bytes of full pub_key),
+// returned oldest-first. Returns false past the end of the per-contact
+// list.
+struct UiDmMsg {
+  char     text[120];
+  uint8_t  from_me;
+  uint32_t age_s;       // seconds since this message was appended
+};
+
+extern "C" int ui_get_dm_msg_count(const uint8_t* pub_key) {
+  if (!s_dm_ring || !pub_key) return 0;
+  int n = 0;
+  for (int i = 0; i < s_dm_ring_count; i++) {
+    if (memcmp(s_dm_ring[i].pubkey8, pub_key, 8) == 0) n++;
+  }
+  return n;
+}
+
+extern "C" bool ui_get_dm_msg(const uint8_t* pub_key, int idx, UiDmMsg* out) {
+  if (!s_dm_ring || !pub_key || !out) return false;
+  // Iterate oldest-first: start at head and walk forward (head is the
+  // NEXT-write slot, so head itself is oldest once the ring is full).
+  int start = (s_dm_ring_count < DM_RING_SIZE) ? 0 : s_dm_ring_head;
+  int seen = 0;
+  uint32_t now = millis();
+  for (int k = 0; k < s_dm_ring_count; k++) {
+    int i = (start + k) % DM_RING_SIZE;
+    if (memcmp(s_dm_ring[i].pubkey8, pub_key, 8) != 0) continue;
+    if (seen == idx) {
+      StrHelper::strncpy(out->text, s_dm_ring[i].text, sizeof(out->text));
+      out->from_me = s_dm_ring[i].from_me;
+      out->age_s   = (now - s_dm_ring[i].ts_ms) / 1000;
+      return true;
+    }
+    seen++;
+  }
+  return false;
+}
+
 extern "C" void ui_get_self_loc(double* lat, double* lon) {
   if (lat) *lat = sensors.node_lat;
   if (lon) *lon = sensors.node_lon;

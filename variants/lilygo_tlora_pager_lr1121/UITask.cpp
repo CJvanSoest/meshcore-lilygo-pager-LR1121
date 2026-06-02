@@ -7,6 +7,7 @@
 #include "TPagerST7796Display.h"
 #include <lvgl.h>
 #include <cstring>
+#include <esp_heap_caps.h>     // heap_caps_calloc / MALLOC_CAP_SPIRAM (S3.6d)
 
 #ifndef AUTO_OFF_MILLIS
   #define AUTO_OFF_MILLIS  60000
@@ -52,6 +53,8 @@ static lv_obj_t* s_subscreen_body;
 static lv_obj_t* s_radio_list;
 static lv_obj_t* s_channel_list;     // S3.4 channels list (Messages tile)
 static lv_obj_t* s_contacts_list;    // S3.5 contacts list (Contacts tile)
+static lv_obj_t* s_dm_list;          // S3.6d DM contacts list (DM tile)
+static lv_group_t* s_dm_list_group;
 static lv_obj_t* s_discovered_list;  // S3.6b discovered list (Discovered tile)
 static lv_obj_t* s_disc_menu_popup;  // S3.6b click-popup (Add / Add fav / Cancel)
 static lv_group_t* s_disc_menu_group;
@@ -83,11 +86,27 @@ struct ChatMsg {
   char text[96];        // includes "sender: " prefix from the wire
 };
 #define CHAT_RING_SIZE 32
-static ChatMsg s_chat_ring[CHAT_RING_SIZE];
+// Heap-allocated in PSRAM (S3.6d). 32 × ~104 bytes = ~3.3 KB; pushing
+// this to DRAM with the DM ring buffer + click caches added in this
+// sprint overflowed the segment by ~80 bytes. The chat-view code
+// initializes it lazily; renders return safely if the alloc fails.
+static ChatMsg* s_chat_ring = nullptr;
+static bool ensure_chat_ring() {
+  if (s_chat_ring) return true;
+  s_chat_ring = (ChatMsg*)heap_caps_calloc(
+      CHAT_RING_SIZE, sizeof(ChatMsg),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return s_chat_ring != nullptr;
+}
 static int s_chat_head = 0;     // next slot to write
 static int s_chat_count = 0;    // populated entries (≤ CHAT_RING_SIZE)
 static bool s_chat_open = false;
 static int  s_chat_channel_idx = -1;
+// S3.6d DM mode flips the chat-view widget set: history pulls from
+// ui_get_dm_msg(s_dm_pubkey, ...), and Enter sends via ui_send_dm.
+static bool s_dm_mode = false;
+static uint8_t s_dm_pubkey[32] = {0};
+static char    s_dm_peer_name[32] = {0};
 static lv_obj_t* s_chat_history = nullptr;
 static lv_obj_t* s_chat_compose = nullptr;
 static lv_obj_t* s_chat_counter = nullptr;
@@ -108,7 +127,9 @@ static int s_editing_idx = -1;       // which radio row is being edited (-1 = no
 // from variant_loop -> ui_input_char while that tile is open, so the
 // user can visually verify QWERTY + FN symbol layer + backspace without
 // needing a working USB-serial monitor.
-static char s_input_buf[160] = {0};
+static char s_input_buf[64] = {0};  // keyboard test placeholder, no longer
+                                    // wired to a tile — kept small to free
+                                    // DRAM for S3.6d DM state.
 static int  s_input_len = 0;
 static lv_obj_t* s_input_label = nullptr;
 static bool s_input_active = false;
@@ -173,6 +194,10 @@ static void disc_menu_show(int disc_idx);
 static void disc_menu_close();
 static void con_menu_show(const uint8_t* pub_key);
 static void con_menu_close();
+static void dm_list_populate();
+static void dm_chat_view_open(const uint8_t* pub_key, const char* peer_name);
+// No per-row cache for the DM list — DRAM is tight (88%+) so the click
+// handler refetches contact info on-demand via ui_get_dm_contact_info(idx).
 
 extern "C" void tpager_power_off() __attribute__((weak));
 extern "C" void ui_apply_radio_changes() __attribute__((weak));
@@ -205,6 +230,17 @@ extern "C" bool ui_toggle_favorite(const uint8_t* pub_key) __attribute__((weak))
 extern "C" int  ui_get_discovered_count() __attribute__((weak));
 extern "C" bool ui_get_discovered_info(int idx, UiContact* out) __attribute__((weak));
 extern "C" bool ui_add_discovered_to_contacts(int idx, bool favorite) __attribute__((weak));
+// DM bridges (S3.6d).
+struct UiDmMsg {
+  char     text[120];
+  uint8_t  from_me;
+  uint32_t age_s;
+};
+extern "C" int  ui_get_dm_contact_count() __attribute__((weak));
+extern "C" bool ui_get_dm_contact_info(int idx, UiContact* out) __attribute__((weak));
+extern "C" bool ui_send_dm(const uint8_t* pub_key, const char* text) __attribute__((weak));
+extern "C" int  ui_get_dm_msg_count(const uint8_t* pub_key) __attribute__((weak));
+extern "C" bool ui_get_dm_msg(const uint8_t* pub_key, int idx, UiDmMsg* out) __attribute__((weak));
 extern "C" void ui_get_self_loc(double* lat, double* lon) __attribute__((weak));
 extern "C" uint32_t ui_get_now_epoch() __attribute__((weak));
 // Tenths-of-percent (0..1000) of the duty-cycle quota that has been
@@ -236,16 +272,24 @@ extern "C" void ui_input_char(char c) {
   // letters, digits, symbols and even '#' (FN+Space) all work.
   if (s_chat_open && s_chat_compose) {
     if (c == '\n') {
-      if (s_compose_len > 0 && ui_send_group_text) {
-        if (ui_send_group_text(s_chat_channel_idx, s_compose_buf)) {
-          // Show our own message in the history immediately. The wire
-          // payload is "<sender>: <msg>" — mirror that locally with a
-          // "(me)" prefix so it visually matches received messages.
-          char local[120];
-          snprintf(local, sizeof(local), "(me): %s", s_compose_buf);
-          chat_ring_push((uint8_t)s_chat_channel_idx, 0, local);
-          chat_history_render();
+      if (s_compose_len > 0) {
+        bool ok = false;
+        if (s_dm_mode) {
+          if (ui_send_dm) ok = ui_send_dm(s_dm_pubkey, s_compose_buf);
+          if (ok) chat_history_render();   // DM ring already has our own copy
+        } else if (ui_send_group_text) {
+          ok = ui_send_group_text(s_chat_channel_idx, s_compose_buf);
+          if (ok) {
+            // Show our own message in the history immediately. The wire
+            // payload is "<sender>: <msg>" — mirror that locally with a
+            // "(me)" prefix so it visually matches received messages.
+            char local[120];
+            snprintf(local, sizeof(local), "(me): %s", s_compose_buf);
+            chat_ring_push((uint8_t)s_chat_channel_idx, 0, local);
+            chat_history_render();
+          }
         }
+        (void)ok;
       }
       s_compose_buf[0] = 0;
       s_compose_len = 0;
@@ -349,6 +393,7 @@ static void enter_subscreen(int idx) {
   lv_obj_remove_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
   if (s_radio_list)      lv_obj_add_flag(s_radio_list,      LV_OBJ_FLAG_HIDDEN);
   if (s_channel_list)    lv_obj_add_flag(s_channel_list,    LV_OBJ_FLAG_HIDDEN);
+  if (s_dm_list)         lv_obj_add_flag(s_dm_list,         LV_OBJ_FLAG_HIDDEN);
   if (s_contacts_list)   lv_obj_add_flag(s_contacts_list,   LV_OBJ_FLAG_HIDDEN);
   if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
   if (s_disc_menu_popup) lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
@@ -381,11 +426,13 @@ static void enter_subscreen(int idx) {
       if (enc && s_channel_group) lv_indev_set_group(enc, s_channel_group);
       return;
     }
-    case 2:    // DM tile — placeholder (S3.6d will populate)
-      snprintf(body, sizeof(body),
-               "Direct messages\n\n(coming in S3.6d — per-contact threads,\n"
-               "SD-persisted history)");
-      break;
+    case 2: {  // DM (S3.6d) — chat-type contacts, click to open thread
+      lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
+      if (s_dm_list) lv_obj_remove_flag(s_dm_list, LV_OBJ_FLAG_HIDDEN);
+      dm_list_populate();
+      if (enc && s_dm_list_group) lv_indev_set_group(enc, s_dm_list_group);
+      return;
+    }
     case 3: {  // Contacts → favorites-only (S3.6c)
       lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
       if (s_contacts_list) lv_obj_remove_flag(s_contacts_list, LV_OBJ_FLAG_HIDDEN);
@@ -428,6 +475,7 @@ static void leave_subscreen() {
   s_chat_channel_idx = -1;
   if (s_input_label)     lv_obj_add_flag(s_input_label,     LV_OBJ_FLAG_HIDDEN);
   if (s_channel_list)    lv_obj_add_flag(s_channel_list,    LV_OBJ_FLAG_HIDDEN);
+  if (s_dm_list)         lv_obj_add_flag(s_dm_list,         LV_OBJ_FLAG_HIDDEN);
   if (s_contacts_list)   lv_obj_add_flag(s_contacts_list,   LV_OBJ_FLAG_HIDDEN);
   if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
   if (s_disc_menu_popup) lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
@@ -435,6 +483,9 @@ static void leave_subscreen() {
   if (s_chat_history)    lv_obj_add_flag(s_chat_history,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose)    lv_obj_add_flag(s_chat_compose,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_counter)    lv_obj_add_flag(s_chat_counter,    LV_OBJ_FLAG_HIDDEN);
+  // DM mode unset
+  s_dm_mode = false;
+  memset(s_dm_pubkey, 0, sizeof(s_dm_pubkey));
   s_active_tile = -1;
 }
 
@@ -649,21 +700,43 @@ static void open_add_channel_popup() {
 // either the raw "sender: text" payload from the wire or, for our own
 // sent messages, just "(me): text".
 static void chat_history_render() {
-  if (!s_chat_history || s_chat_channel_idx < 0) return;
+  if (!s_chat_history) return;
   char out[1200];
   int oi = 0;
   out[0] = 0;
-  // Walk the ring oldest-to-newest. s_chat_head points at the next slot
-  // to write; s_chat_count says how many entries are populated.
-  int start = (s_chat_head - s_chat_count + CHAT_RING_SIZE) % CHAT_RING_SIZE;
-  for (int n = 0; n < s_chat_count; n++) {
-    int i = (start + n) % CHAT_RING_SIZE;
-    if (s_chat_ring[i].channel_idx != (uint8_t)s_chat_channel_idx) continue;
-    int rem = (int)sizeof(out) - oi - 2;
-    if (rem <= 0) break;
-    int w = snprintf(&out[oi], rem, "%s\n", s_chat_ring[i].text);
-    if (w < 0) break;
-    oi += (w > rem) ? rem : w;
+
+  if (s_dm_mode) {
+    // Pull from the DM ring buffer in main.cpp via the bridge. Messages
+    // are returned oldest-first, prefixed with "(me): " for sent and
+    // "<peer>: " for received so the UI matches the channel chat layout.
+    if (ui_get_dm_msg_count && ui_get_dm_msg) {
+      int n = ui_get_dm_msg_count(s_dm_pubkey);
+      for (int k = 0; k < n; k++) {
+        UiDmMsg m;
+        if (!ui_get_dm_msg(s_dm_pubkey, k, &m)) break;
+        const char* who = m.from_me ? "(me)" : s_dm_peer_name;
+        int rem = (int)sizeof(out) - oi - 2;
+        if (rem <= 0) break;
+        int w = snprintf(&out[oi], rem, "%s: %s\n", who, m.text);
+        if (w < 0) break;
+        oi += (w > rem) ? rem : w;
+      }
+    }
+  } else {
+    if (s_chat_channel_idx < 0) return;
+    if (!s_chat_ring) return;
+    // Walk the channel ring oldest-to-newest. s_chat_head points at the
+    // next slot to write; s_chat_count says how many entries are populated.
+    int start = (s_chat_head - s_chat_count + CHAT_RING_SIZE) % CHAT_RING_SIZE;
+    for (int n = 0; n < s_chat_count; n++) {
+      int i = (start + n) % CHAT_RING_SIZE;
+      if (s_chat_ring[i].channel_idx != (uint8_t)s_chat_channel_idx) continue;
+      int rem = (int)sizeof(out) - oi - 2;
+      if (rem <= 0) break;
+      int w = snprintf(&out[oi], rem, "%s\n", s_chat_ring[i].text);
+      if (w < 0) break;
+      oi += (w > rem) ? rem : w;
+    }
   }
   if (oi == 0) {
     lv_label_set_text(s_chat_history, "(no messages yet)");
@@ -672,6 +745,29 @@ static void chat_history_render() {
     lv_label_set_text(s_chat_history, out);
   }
   lv_obj_scroll_to_y(s_chat_history, INT16_MAX, LV_ANIM_OFF);   // pin to bottom
+}
+
+// Open DM chat view with a contact (S3.6d). Mirror of chat_view_open
+// for channels but flips s_dm_mode + sets s_dm_pubkey instead of
+// s_chat_channel_idx.
+static void dm_chat_view_open(const uint8_t* pub_key, const char* peer_name) {
+  s_chat_open = true;
+  s_chat_channel_idx = -1;
+  s_dm_mode = true;
+  memcpy(s_dm_pubkey, pub_key, 32);
+  strncpy(s_dm_peer_name, peer_name ? peer_name : "?",
+          sizeof(s_dm_peer_name) - 1);
+  s_dm_peer_name[sizeof(s_dm_peer_name) - 1] = 0;
+  s_compose_buf[0] = 0;
+  s_compose_len = 0;
+  if (s_chat_history) lv_obj_remove_flag(s_chat_history, LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_compose) lv_obj_remove_flag(s_chat_compose, LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_counter) lv_obj_remove_flag(s_chat_counter, LV_OBJ_FLAG_HIDDEN);
+
+  lv_label_set_text(s_subscreen_title, s_dm_peer_name);
+
+  chat_history_render();
+  chat_compose_render();
 }
 
 static void chat_compose_render() {
@@ -736,24 +832,40 @@ static void chat_view_open(int channel_idx) {
 }
 
 static void chat_view_close() {
+  bool was_dm = s_dm_mode;
   s_chat_open = false;
   s_chat_channel_idx = -1;
+  s_dm_mode = false;
+  memset(s_dm_pubkey, 0, sizeof(s_dm_pubkey));
   if (s_chat_history) lv_obj_add_flag(s_chat_history, LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose) lv_obj_add_flag(s_chat_compose, LV_OBJ_FLAG_HIDDEN);
   if (s_chat_counter) lv_obj_add_flag(s_chat_counter, LV_OBJ_FLAG_HIDDEN);
-  // Return to channels list within the Messages sub-screen.
-  lv_label_set_text(s_subscreen_title, TILES[1].title);
-  if (s_channel_list) lv_obj_remove_flag(s_channel_list, LV_OBJ_FLAG_HIDDEN);
-  channels_list_populate(0);
+
   lv_indev_t* enc = tpager_lvgl_get_encoder();
-  if (enc && s_channel_group) {
-    lv_indev_set_group(enc, s_channel_group);
-    lv_group_set_editing(s_channel_group, false);
+  if (was_dm) {
+    // Return to the DM contacts list inside the DM sub-screen.
+    lv_label_set_text(s_subscreen_title, TILES[2].title);
+    if (s_dm_list) lv_obj_remove_flag(s_dm_list, LV_OBJ_FLAG_HIDDEN);
+    dm_list_populate();
+    if (enc && s_dm_list_group) {
+      lv_indev_set_group(enc, s_dm_list_group);
+      lv_group_set_editing(s_dm_list_group, false);
+    }
+  } else {
+    // Return to channels list within the Channels sub-screen.
+    lv_label_set_text(s_subscreen_title, TILES[1].title);
+    if (s_channel_list) lv_obj_remove_flag(s_channel_list, LV_OBJ_FLAG_HIDDEN);
+    channels_list_populate(0);
+    if (enc && s_channel_group) {
+      lv_indev_set_group(enc, s_channel_group);
+      lv_group_set_editing(s_channel_group, false);
+    }
   }
 }
 
 // Append a message to the ring buffer. Older entries are evicted FIFO.
 static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char* text) {
+  if (!ensure_chat_ring()) return;
   ChatMsg& slot = s_chat_ring[s_chat_head];
   slot.channel_idx = channel_idx;
   slot.timestamp = timestamp;
@@ -981,6 +1093,73 @@ static void contacts_list_populate() {
 
     if (s_contacts_group) lv_group_add_obj(s_contacts_group, row);
   }
+}
+
+// ---------- DM tile (S3.6d) -------------------------------------------------
+//
+// Lists chat-type contacts (any contact with ADV_TYPE_CHAT, regardless of
+// favorite flag). Clicking a row opens the chat view in DM mode —
+// history pulled from the per-contact-tagged ring buffer in main.cpp.
+
+static void dm_row_clicked(lv_event_t* e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  UiContact ci;
+  if (!ui_get_dm_contact_info || !ui_get_dm_contact_info(idx, &ci)) return;
+  dm_chat_view_open(ci.pub_key, ci.name);
+}
+
+static void dm_list_populate() {
+  if (!s_dm_list || !ui_get_dm_contact_count) return;
+  lv_obj_clean(s_dm_list);
+  if (s_dm_list_group) lv_group_remove_all_objs(s_dm_list_group);
+
+  int count = ui_get_dm_contact_count();
+  if (count == 0) {
+    lv_obj_t* empty = lv_label_create(s_dm_list);
+    lv_label_set_text(empty,
+        "No DM contacts.\nOpen Discovered to add a chat node.");
+    lv_obj_set_style_text_color(empty, lv_color_hex(0x707880), 0);
+    return;
+  }
+
+  for (int i = 0; i < count; i++) {
+    UiContact ci;
+    if (!ui_get_dm_contact_info(i, &ci)) continue;
+
+    lv_obj_t* row = lv_obj_create(s_dm_list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), 26);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_pad_hor(row, 6, 0);
+    lv_obj_set_style_radius(row, 4, 0);
+    lv_obj_set_style_margin_bottom(row, 1, 0);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    lv_obj_add_event_cb(row, back_long_press_event, LV_EVENT_LONG_PRESSED, NULL);
+    lv_obj_add_event_cb(row, dm_row_clicked, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)i);
+
+    lv_obj_t* lbl = lv_label_create(row);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(lbl, lv_pct(95));
+    lv_label_set_text(lbl, ci.name);
+
+    if (s_dm_list_group) lv_group_add_obj(s_dm_list_group, row);
+  }
+}
+
+// Helper for the receive-side hook in main.cpp: lets the UI refresh
+// the open chat view's history when a new DM arrives for the current
+// peer. Called from chat_history_render which checks s_chat_open
+// + s_dm_mode + matching pubkey via a separate weak hook.
+extern "C" void ui_refresh_open_dm(const uint8_t* pub_key) {
+  if (!s_chat_open || !s_dm_mode) return;
+  if (memcmp(s_dm_pubkey, pub_key, 32) != 0) return;
+  chat_history_render();
 }
 
 // ---------- Discovered tile (S3.6b) -----------------------------------------
@@ -1531,6 +1710,18 @@ static void build_ui() {
   lv_obj_add_flag(s_contacts_list, LV_OBJ_FLAG_HIDDEN);
 
   s_contacts_group = lv_group_create();
+
+  // DM list (S3.6d) — chat-type contacts. Click row → open chat thread.
+  s_dm_list = lv_obj_create(s_subscreen_root);
+  lv_obj_remove_style_all(s_dm_list);
+  lv_obj_set_size(s_dm_list, lv_pct(96), lv_pct(70));
+  lv_obj_align(s_dm_list, LV_ALIGN_TOP_LEFT, 6, 44);
+  lv_obj_set_flex_flow(s_dm_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_bg_color(s_dm_list, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_pad_all(s_dm_list, 2, 0);
+  lv_obj_set_scroll_dir(s_dm_list, LV_DIR_VER);
+  lv_obj_add_flag(s_dm_list, LV_OBJ_FLAG_HIDDEN);
+  s_dm_list_group = lv_group_create();
 
   // Discovered list (S3.6b) — same row pattern as channels/contacts list.
   // Driven by the ring buffer in companion_radio/main.cpp; populated on

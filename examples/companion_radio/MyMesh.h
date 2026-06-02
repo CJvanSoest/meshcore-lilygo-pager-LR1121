@@ -234,6 +234,24 @@ public:
     return false;
   }
 
+  // Variant-UI DM send (S3.6d). Looks up the contact by pub_key, calls
+  // sendMessage() with the current RTC time. Returns false if the
+  // contact isn't in contacts[] (DM requires a known contact —
+  // populateContactFromAdvert sets the basics, but a path is needed for
+  // sendDirect; sendMessage falls back to flood routing if path is
+  // OUT_PATH_UNKNOWN).
+  bool uiSendDm(const uint8_t* pub_key, const char* text) {
+    for (int i = 0; i < num_contacts; i++) {
+      if (memcmp(contacts[i].id.pub_key, pub_key, PUB_KEY_SIZE) == 0) {
+        uint32_t ack = 0, est = 0;
+        uint32_t now = getRTCClock()->getCurrentTime();
+        int r = sendMessage(contacts[i], now, 0, text, ack, est);
+        return r >= 0;
+      }
+    }
+    return false;
+  }
+
 #if ENV_INCLUDE_GPS == 1
   void applyGpsPrefs() {
     sensors.setSettingValue("gps", _prefs.gps_enabled ? "1" : "0");
