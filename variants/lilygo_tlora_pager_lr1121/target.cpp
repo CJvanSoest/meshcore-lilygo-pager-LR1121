@@ -167,9 +167,12 @@ static void kb_begin() {
   Serial.println("TCA8418: 4x10 matrix ready");
 }
 
-// Backspace key raw code per LilyGo T-Pager config (no ASCII letter mapped).
+// Backspace key raw code observed on the LR1121 hardware: 0x1E (row 2
+// col 9 by our (k-1)/10 decode). LilyGoLib lists 0x1D in their generic
+// config, but on this board the right-most key in row 2 emits 0x1E.
+// Verified via the freq-popup diag overlay.
 #ifndef TPAGER_KB_BACKSPACE_RAW
-  #define TPAGER_KB_BACKSPACE_RAW 0x1D
+  #define TPAGER_KB_BACKSPACE_RAW 0x1E
 #endif
 
 // Called from main loop() via the variant_loop weak hook. Drains pending
@@ -177,6 +180,18 @@ static void kb_begin() {
 // main.cpp's ui_input_char() (weak — null in non-UI builds) which routes
 // them to UITask when the compose screen is active.
 extern "C" void ui_input_char(char c) __attribute__((weak));
+
+// Last raw key event the TCA8418 emitted (low 7 bits = key code, bit 7 =
+// press flag). Read via tpager_kb_last_raw() — used by the freq-editor
+// debug overlay to identify mystery keys that don't map to anything in
+// kb_keymap. Cleared on read so a slow UI sees each event once.
+static volatile uint8_t s_kb_last_raw_event = 0;
+
+extern "C" uint8_t tpager_kb_last_raw() {
+  uint8_t v = s_kb_last_raw_event;
+  s_kb_last_raw_event = 0;
+  return v;
+}
 
 extern "C" void variant_loop() {
   if (!_kb_ok) { kb_begin(); return; }   // try late init if I2C wasn't ready
@@ -189,6 +204,10 @@ extern "C" void variant_loop() {
     uint8_t ev = _kb.getEvent();
     bool pressed = (ev & 0x80) != 0;
     uint8_t k = ev & 0x7F;
+
+    // Stash for the diag overlay (Freq popup), whether or not we end up
+    // emitting a char. Most-recent event wins; UI clears on read.
+    if (pressed) s_kb_last_raw_event = ev;
 
     // FN modifier (orange key next to Z) — track press/release, no char.
     if (k == TPAGER_KB_FN_RAW) {

@@ -62,6 +62,13 @@ static int  s_input_len = 0;
 static lv_obj_t* s_input_label = nullptr;
 static bool s_input_active = false;
 
+// Freq-editor buffer. Used while s_editing_idx == 0 (the Radio→Freq row
+// popup). Digits and '.' append, '\b' pops, '\n' commits, encoder click
+// on the OK widget also commits, encoder long-press cancels.
+static char s_freq_buf[16] = {0};
+static int  s_freq_len = 0;
+static lv_obj_t* s_freq_value_label = nullptr;
+
 // Standard LoRa bandwidths (kHz). Cover the full SX12xx / LR11xx range so
 // users can match repeaters using narrow profiles (e.g. NL "EU/UK Narrow"
 // at 62.5 kHz) as well as the original wide MeshCore default (125 kHz).
@@ -100,6 +107,7 @@ static int bw_value_to_index(float bw) {
 static void radio_list_populate(NodePrefs* p, int focus_row = 0);
 static void radio_item_clicked(lv_event_t* e);
 static void back_long_press_event(lv_event_t* e);
+static void close_edit_popup_apply();   // referenced from ui_input_char (Enter commits)
 
 extern "C" void tpager_power_off() __attribute__((weak));
 extern "C" void ui_apply_radio_changes() __attribute__((weak));
@@ -108,12 +116,35 @@ extern "C" void ui_apply_radio_changes() __attribute__((weak));
 // ui_input_char(). The upstream companion main loop doesn't know about
 // our variant, so we drive the keyboard scan from UITask::loop instead.
 extern "C" void variant_loop();
+// Last raw TCA8418 event (low 7 bits = key, bit 7 = press). Returned
+// once then cleared — lets the freq popup show keys that don't map to
+// any kb_keymap slot, so we can identify unknown special keys.
+extern "C" uint8_t tpager_kb_last_raw();
 
 // Sink for chars produced by the TCA8418 keyboard (variant_loop in
-// target.cpp). When the Messages input-test sub-screen is active we
-// append the char to s_input_buf and refresh the label so the user
-// sees their keystrokes appear live on the display.
+// target.cpp). Routes to whichever screen is currently capturing input:
+//   * freq-editor popup  (s_editing_idx == 0)  — digits + '.' + backspace
+//   * Messages tester    (s_input_active)      — anything goes
 extern "C" void ui_input_char(char c) {
+  // Freq editor: only accept digits, '.', backspace, Enter (commit).
+  if (s_editing_idx == 0 && s_freq_value_label) {
+    if (c == '\n') {
+      close_edit_popup_apply();
+      return;
+    } else if (c == '\b') {
+      if (s_freq_len > 0) { s_freq_len--; s_freq_buf[s_freq_len] = 0; }
+    } else if ((c >= '0' && c <= '9') || c == '.') {
+      if (s_freq_len < (int)sizeof(s_freq_buf) - 1) {
+        s_freq_buf[s_freq_len++] = c;
+        s_freq_buf[s_freq_len] = 0;
+      }
+    } else {
+      return;  // reject other chars silently
+    }
+    lv_label_set_text(s_freq_value_label, s_freq_len == 0 ? "_" : s_freq_buf);
+    return;
+  }
+  // Messages input tester (S3.4 placeholder).
   if (!s_input_active || !s_input_label) return;
   if (c == '\b') {
     if (s_input_len > 0) {
@@ -124,8 +155,6 @@ extern "C" void ui_input_char(char c) {
     s_input_buf[s_input_len++] = c;
     s_input_buf[s_input_len] = 0;
   }
-  // Show a placeholder hint while the buffer is empty so the screen
-  // doesn't look broken before the first keystroke.
   lv_label_set_text(s_input_label, s_input_len == 0
     ? "(type to test — FN + key = symbol layer, backspace deletes)"
     : s_input_buf);
@@ -342,6 +371,15 @@ static void close_edit_popup_apply() {
   if (!p) return;
 
   switch (s_editing_idx) {
+    case 0: {
+      // Freq from text buffer. Validate before assigning so a stray
+      // empty/invalid input doesn't park the radio at 0 MHz.
+      float v = atof(s_freq_buf);
+      if (v >= 400.0f && v <= 960.0f) {
+        p->freq = v;
+      }
+      break;
+    }
     case 1: p->sf = lv_spinbox_get_value(s_edit_widget); break;
     case 2: {
       int sel = lv_dropdown_get_selected(s_edit_widget);
@@ -384,21 +422,49 @@ static void radio_item_clicked(lv_event_t* e) {
   }
 
   // Editor matrix per row:
+  //   idx 0          → text-input (Freq, typed via FN+digits + '.')
   //   idx 1 / 3 / 4  → spinbox (SF, CR, TX power)
   //   idx 2          → dropdown over standard LoRa BW values
   //   idx 6          → dropdown over path-hash modes (1 / 2 / 3 bytes)
-  // Freq (idx 0) gets the numeric-keyboard editor in S3.3 phase 2c.
   bool is_spinbox  = (idx == 1 || idx == 3 || idx == 4);
   bool is_dropdown = (idx == 2 || idx == 6);
-  if (!is_spinbox && !is_dropdown) return;
+  bool is_text     = (idx == 0);
+  if (!is_spinbox && !is_dropdown && !is_text) return;
 
   s_editing_idx = idx;
   lv_obj_remove_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
 
   if (s_edit_widget) { lv_obj_del(s_edit_widget); s_edit_widget = nullptr; }
+  if (s_freq_value_label) { lv_obj_del(s_freq_value_label); s_freq_value_label = nullptr; }
   lv_group_remove_all_objs(s_edit_group);
 
-  if (is_spinbox) {
+  if (is_text) {
+    // Pre-fill the buffer with the current freq so users see the value
+    // they're editing instead of an empty field.
+    snprintf(s_freq_buf, sizeof(s_freq_buf), "%.3f", p->freq);
+    s_freq_len = strlen(s_freq_buf);
+    lv_label_set_text(s_edit_title, "Frequency (MHz)");
+
+    s_freq_value_label = lv_label_create(s_edit_popup);
+    lv_obj_set_style_text_color(s_freq_value_label, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(s_freq_value_label, &lv_font_montserrat_24, 0);
+    lv_label_set_text(s_freq_value_label, s_freq_buf);
+    lv_obj_align(s_freq_value_label, LV_ALIGN_CENTER, 0, -12);
+
+
+    // Focusable OK button so encoder-click commits. Enter on the
+    // keyboard also commits via ui_input_char below.
+    s_edit_widget = lv_button_create(s_edit_popup);
+    lv_obj_set_size(s_edit_widget, 60, 24);
+    lv_obj_align(s_edit_widget, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_t* okl = lv_label_create(s_edit_widget);
+    lv_label_set_text(okl, "OK");
+    lv_obj_center(okl);
+
+    lv_obj_add_event_cb(s_edit_widget, [](lv_event_t*) {
+      close_edit_popup_apply();
+    }, LV_EVENT_CLICKED, nullptr);
+  } else if (is_spinbox) {
     int min_v = 0, max_v = 100, init = 0, digits = 2;
     if (idx == 1) { min_v = 5;  max_v = 12; init = p->sf;           digits = 2; lv_label_set_text(s_edit_title, "Spreading Factor (SF)"); }
     if (idx == 3) { min_v = 5;  max_v = 8;  init = p->cr;           digits = 1; lv_label_set_text(s_edit_title, "Coding Rate (CR)"); }
@@ -676,6 +742,7 @@ void UITask::loop() {
   // any variant hook, so we do it here. variant_loop() is cheap when the
   // FIFO is empty and self-initialises on first call.
   variant_loop();
+
 
 #if defined(PIN_ENCODER_A) && defined(PIN_ENCODER_B)
   // Full quadrature state-table decoder. Each mechanical detent moves the

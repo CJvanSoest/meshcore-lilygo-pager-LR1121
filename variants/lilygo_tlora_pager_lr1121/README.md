@@ -106,12 +106,15 @@ hands doesn't have to rediscover them:
   time. It bumps the step to 10, which collapses to the range bounds
   for small ranges (SF 5..12 only shows 5 or 12).
 
-## Status as of S3.3 phase 2b
+## Status as of S3.3 phase 2c
 
 - Tile carousel with 6 tiles, encoder navigation, click/long-press semantics.
 - Radio sub-screen renders the live `NodePrefs` values in a two-column
   list (label + value, right-aligned) with thin row separators.
 - Editor matrix per row:
+  - `Freq` → text-input popup (type digits + `.` via FN+QWERTY symbol
+    layer; Enter or encoder-click commits; long-press cancels; range
+    validated to 400.0…960.0 MHz)
   - `SF`, `CR`, `TX power` → spinbox popup (encoder rotates value,
     click saves)
   - `BW` → dropdown over 10 standard LoRa bandwidths (7.81 … 500 kHz)
@@ -130,8 +133,9 @@ hands doesn't have to rediscover them:
 
 ## TODO (next phases)
 
-- S3.3 phase 2c: numeric keyboard entry for frequency (now that the
-  symbol layer is wired, digits are typable directly via FN+Q..P).
+- S3.3 phase 2d: duty-cycle indicator (likely top header, next to
+  battery).
+- S3.3 phase 2e: region scope picker (reads / writes RegionMap).
 - S3.3 phase 2d: region scope picker (reads / writes RegionMap).
 - S3.3 phase 2e: duty-cycle indicator (likely top header, next to battery).
 - S3.4 prereq: symbol layer on the QWERTY keyboard (`Space + key`) — needed
