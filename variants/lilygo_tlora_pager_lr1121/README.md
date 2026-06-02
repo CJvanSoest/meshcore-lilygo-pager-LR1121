@@ -106,7 +106,7 @@ hands doesn't have to rediscover them:
   time. It bumps the step to 10, which collapses to the range bounds
   for small ranges (SF 5..12 only shows 5 or 12).
 
-## Status as of S3.3 phase 2d
+## Status as of S3.3 phase 2e (all 2.x phases done)
 
 - Tile carousel with 6 tiles, encoder navigation, click/long-press semantics.
 - Radio sub-screen renders the live `NodePrefs` values in a two-column
@@ -121,6 +121,9 @@ hands doesn't have to rediscover them:
   - `Path hash` → dropdown over the three valid path-hash modes
     (1 byte / 2 bytes / 3 bytes)
   - `RX boost` → inline toggle (no popup)
+  - `Scope` → text-input popup (letters + digits + `-`), commits via
+    `ui_apply_default_scope()` which derives the HMAC key from
+    `"#"+name` and writes NodePrefs. Empty name = wildcard (no scope).
 - Apply path calls the weak bridge `ui_apply_radio_changes()` from
   `examples/companion_radio/main.cpp` (`radio_set_params` +
   `radio_set_tx_power` + `savePrefs`). Path-hash changes only need the
@@ -139,11 +142,6 @@ hands doesn't have to rediscover them:
 
 ## TODO (next phases)
 
-- S3.3 phase 2e: region scope picker (reads / writes RegionMap).
-- S3.3 phase 2d: region scope picker (reads / writes RegionMap).
-- S3.3 phase 2e: duty-cycle indicator (likely top header, next to battery).
-- S3.4 prereq: symbol layer on the QWERTY keyboard (`Space + key`) — needed
-  before chat / channel-name input can land any digit or `#`.
 - S3.4: channel list + message history viewer (with `+ Add channel`
   via text-input — no hardcoded NL-specific channel names in the
   upstream code).

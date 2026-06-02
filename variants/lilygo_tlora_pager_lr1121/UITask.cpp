@@ -63,12 +63,13 @@ static int  s_input_len = 0;
 static lv_obj_t* s_input_label = nullptr;
 static bool s_input_active = false;
 
-// Freq-editor buffer. Used while s_editing_idx == 0 (the Radio→Freq row
-// popup). Digits and '.' append, '\b' pops, '\n' commits, encoder click
-// on the OK widget also commits, encoder long-press cancels.
-static char s_freq_buf[16] = {0};
-static int  s_freq_len = 0;
-static lv_obj_t* s_freq_value_label = nullptr;
+// Shared text-input buffer used by the Freq popup (digits + '.') AND
+// the Scope popup (letters + digits + '-'). Allowed-char set is gated
+// per-row in ui_input_char. '\b' pops, '\n' commits, encoder click on
+// the OK widget also commits, encoder long-press cancels.
+static char s_text_buf[32] = {0};
+static int  s_text_len = 0;
+static lv_obj_t* s_text_value_label = nullptr;
 
 // Standard LoRa bandwidths (kHz). Cover the full SX12xx / LR11xx range so
 // users can match repeaters using narrow profiles (e.g. NL "EU/UK Narrow"
@@ -112,6 +113,9 @@ static void close_edit_popup_apply();   // referenced from ui_input_char (Enter 
 
 extern "C" void tpager_power_off() __attribute__((weak));
 extern "C" void ui_apply_radio_changes() __attribute__((weak));
+// Companion writes the new default-scope name + derived HMAC key into
+// NodePrefs and persists. Empty name = wildcard / no scope.
+extern "C" void ui_apply_default_scope(const char* name) __attribute__((weak));
 // Tenths-of-percent (0..1000) of the duty-cycle quota that has been
 // consumed in the current hour-window. 0 = idle, 1000 = throttled.
 extern "C" int  ui_get_duty_cycle_used_tenths() __attribute__((weak));
@@ -134,22 +138,29 @@ extern "C" uint8_t tpager_kb_last_raw();
 //   * freq-editor popup  (s_editing_idx == 0)  — digits + '.' + backspace
 //   * Messages tester    (s_input_active)      — anything goes
 extern "C" void ui_input_char(char c) {
-  // Freq editor: only accept digits, '.', backspace, Enter (commit).
-  if (s_editing_idx == 0 && s_freq_value_label) {
+  // Text-input popup: freq (idx 0) or scope (idx 7). Char filter is
+  // per-row — freq accepts digits + '.', scope accepts lowercase
+  // letters + digits + '-'. Both accept '\b' (pop) and '\n' (commit).
+  if ((s_editing_idx == 0 || s_editing_idx == 7) && s_text_value_label) {
     if (c == '\n') {
       close_edit_popup_apply();
       return;
     } else if (c == '\b') {
-      if (s_freq_len > 0) { s_freq_len--; s_freq_buf[s_freq_len] = 0; }
-    } else if ((c >= '0' && c <= '9') || c == '.') {
-      if (s_freq_len < (int)sizeof(s_freq_buf) - 1) {
-        s_freq_buf[s_freq_len++] = c;
-        s_freq_buf[s_freq_len] = 0;
-      }
+      if (s_text_len > 0) { s_text_len--; s_text_buf[s_text_len] = 0; }
     } else {
-      return;  // reject other chars silently
+      bool allow;
+      if (s_editing_idx == 0) {
+        allow = (c >= '0' && c <= '9') || c == '.';
+      } else {  // scope
+        allow = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+      }
+      if (!allow) return;   // reject other chars silently
+      if (s_text_len < (int)sizeof(s_text_buf) - 1) {
+        s_text_buf[s_text_len++] = c;
+        s_text_buf[s_text_len] = 0;
+      }
     }
-    lv_label_set_text(s_freq_value_label, s_freq_len == 0 ? "_" : s_freq_buf);
+    lv_label_set_text(s_text_value_label, s_text_len == 0 ? "_" : s_text_buf);
     return;
   }
   // Messages input tester (S3.4 placeholder).
@@ -304,8 +315,9 @@ static void radio_list_populate(NodePrefs* p, int focus_row) {
     "TX power",   // dBm
     "RX boost",
     "Path hash",  // bytes (mode+1)
+    "Scope",      // default region-scope name (e.g. nl-utrecht)
   };
-  static const char* UNITS[]  = { " MHz", "", " kHz", "", " dBm", "", "" };
+  static const char* UNITS[]  = { " MHz", "", " kHz", "", " dBm", "", "", "" };
   const int ROW_COUNT = sizeof(LABELS) / sizeof(LABELS[0]);
   char val[24];
 
@@ -318,6 +330,11 @@ static void radio_list_populate(NodePrefs* p, int focus_row) {
       case 4: snprintf(val, sizeof(val), "%d", p->tx_power_dbm); break;
       case 5: snprintf(val, sizeof(val), "%s", p->rx_boosted_gain ? "on" : "off"); break;
       case 6: snprintf(val, sizeof(val), "%d B", p->path_hash_mode + 1); break;
+      case 7: {
+        if (p->default_scope_name[0]) snprintf(val, sizeof(val), "%s", p->default_scope_name);
+        else snprintf(val, sizeof(val), "(none)");
+        break;
+      }
     }
     char value_text[32];
     snprintf(value_text, sizeof(value_text), "%s%s", val, UNITS[i]);
@@ -382,7 +399,7 @@ static void close_edit_popup_apply() {
     case 0: {
       // Freq from text buffer. Validate before assigning so a stray
       // empty/invalid input doesn't park the radio at 0 MHz.
-      float v = atof(s_freq_buf);
+      float v = atof(s_text_buf);
       if (v >= 400.0f && v <= 960.0f) {
         p->freq = v;
       }
@@ -401,11 +418,20 @@ static void close_edit_popup_apply() {
       if (sel >= 0 && sel <= 2) p->path_hash_mode = (uint8_t)sel;
       break;
     }
+    case 7: {
+      // Scope rewrite goes through its own bridge — it has to derive
+      // the HMAC key from the name AND persist, which ui_apply_radio_changes
+      // (radio-params only) does not do.
+      if (ui_apply_default_scope) ui_apply_default_scope(s_text_buf);
+      break;
+    }
     default: break;
   }
 
   int idx_was = s_editing_idx;
-  if (ui_apply_radio_changes) ui_apply_radio_changes();
+  // Skip the radio-params reapply for scope — already persisted by the
+  // dedicated bridge, and re-running radio_set_params would be redundant.
+  if (s_editing_idx != 7 && ui_apply_radio_changes) ui_apply_radio_changes();
 
   lv_obj_add_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
   lv_indev_t* enc = tpager_lvgl_get_encoder();
@@ -434,30 +460,36 @@ static void radio_item_clicked(lv_event_t* e) {
   //   idx 1 / 3 / 4  → spinbox (SF, CR, TX power)
   //   idx 2          → dropdown over standard LoRa BW values
   //   idx 6          → dropdown over path-hash modes (1 / 2 / 3 bytes)
+  //   idx 7          → text-input (Scope, letters + digits + '-')
   bool is_spinbox  = (idx == 1 || idx == 3 || idx == 4);
   bool is_dropdown = (idx == 2 || idx == 6);
-  bool is_text     = (idx == 0);
+  bool is_text     = (idx == 0 || idx == 7);
   if (!is_spinbox && !is_dropdown && !is_text) return;
 
   s_editing_idx = idx;
   lv_obj_remove_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
 
   if (s_edit_widget) { lv_obj_del(s_edit_widget); s_edit_widget = nullptr; }
-  if (s_freq_value_label) { lv_obj_del(s_freq_value_label); s_freq_value_label = nullptr; }
+  if (s_text_value_label) { lv_obj_del(s_text_value_label); s_text_value_label = nullptr; }
   lv_group_remove_all_objs(s_edit_group);
 
   if (is_text) {
-    // Pre-fill the buffer with the current freq so users see the value
+    // Pre-fill the buffer with the current value so users see what
     // they're editing instead of an empty field.
-    snprintf(s_freq_buf, sizeof(s_freq_buf), "%.3f", p->freq);
-    s_freq_len = strlen(s_freq_buf);
-    lv_label_set_text(s_edit_title, "Frequency (MHz)");
+    if (idx == 0) {
+      snprintf(s_text_buf, sizeof(s_text_buf), "%.3f", p->freq);
+      lv_label_set_text(s_edit_title, "Frequency (MHz)");
+    } else {  // idx == 7, scope
+      snprintf(s_text_buf, sizeof(s_text_buf), "%s", p->default_scope_name);
+      lv_label_set_text(s_edit_title, "Region scope");
+    }
+    s_text_len = strlen(s_text_buf);
 
-    s_freq_value_label = lv_label_create(s_edit_popup);
-    lv_obj_set_style_text_color(s_freq_value_label, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(s_freq_value_label, &lv_font_montserrat_24, 0);
-    lv_label_set_text(s_freq_value_label, s_freq_buf);
-    lv_obj_align(s_freq_value_label, LV_ALIGN_CENTER, 0, -12);
+    s_text_value_label = lv_label_create(s_edit_popup);
+    lv_obj_set_style_text_color(s_text_value_label, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(s_text_value_label, &lv_font_montserrat_24, 0);
+    lv_label_set_text(s_text_value_label, s_text_buf);
+    lv_obj_align(s_text_value_label, LV_ALIGN_CENTER, 0, -12);
 
 
     // Focusable OK button so encoder-click commits. Enter on the

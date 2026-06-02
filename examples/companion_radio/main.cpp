@@ -141,6 +141,31 @@ extern "C" void ui_get_duty_cycle_seconds(int* used_s, int* max_s) {
   if (max_s)  *max_s  = (int)(max_budget / 1000UL);
 }
 
+// Apply a new default-scope name from the variant UI. The HMAC key
+// is derived from "#"+name via TransportKeyStore::getAutoKeyFor — same
+// pattern MyMesh uses at first-boot from DEFAULT_FLOOD_SCOPE_NAME.
+// Empty name zeroes the key (= wildcard / no scope).
+#include <helpers/TransportKeyStore.h>
+extern "C" void ui_apply_default_scope(const char* name) {
+  auto* p = the_mesh.getNodePrefs();
+  if (!name) name = "";
+  size_t n = strlen(name);
+  if (n >= sizeof(p->default_scope_name)) n = sizeof(p->default_scope_name) - 1;
+  memcpy(p->default_scope_name, name, n);
+  p->default_scope_name[n] = 0;
+  if (n == 0) {
+    memset(p->default_scope_key, 0, sizeof(p->default_scope_key));
+  } else {
+    TransportKeyStore temp;
+    TransportKey key;
+    char hashtagged[40];
+    snprintf(hashtagged, sizeof(hashtagged), "#%s", p->default_scope_name);
+    temp.getAutoKeyFor(0, hashtagged, key);
+    memcpy(p->default_scope_key, key.key, sizeof(p->default_scope_key));
+  }
+  the_mesh.savePrefs();
+}
+
 void halt() {
   while (1) ;
 }
