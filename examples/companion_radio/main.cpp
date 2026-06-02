@@ -118,17 +118,18 @@ extern "C" void ui_apply_radio_changes() {
 }
 
 // Variant UIs read the duty-cycle USAGE as tenths-of-percent (0 = idle,
-// 1000 = quota fully consumed). The leaky-bucket starts full at boot
-// (= 0% used) and refills continuously, so a quiet hour will sink the
-// reading back toward 0 even after a burst of TX.
+// 1000 = quota fully consumed). Reports CUMULATIVE TX airtime since boot
+// against the per-hour DC quota: monotonically rising so each advert /
+// message TX visibly moves the counter. Previously this returned the
+// leaky-bucket "remaining" derivative, which refilled back to 0 within
+// seconds of a TX — confusing on a UI that refreshes at 1 Hz.
 extern "C" int ui_get_duty_cycle_used_tenths() {
   auto* p = the_mesh.getNodePrefs();
   float duty_cycle = 1.0f / (1.0f + p->airtime_factor);
   unsigned long max_budget = (unsigned long)(3600000UL * duty_cycle);
   if (max_budget == 0) return 0;
-  unsigned long budget = the_mesh.getRemainingTxBudget();
-  if (budget > max_budget) budget = max_budget;
-  unsigned long used = max_budget - budget;
+  unsigned long used = the_mesh.getTotalAirTime();
+  if (used > max_budget) used = max_budget;        // cap at 100%
   return (int)((used * 1000UL) / max_budget);
 }
 
@@ -140,9 +141,7 @@ extern "C" void ui_get_duty_cycle_seconds(int* used_s, int* max_s) {
   auto* p = the_mesh.getNodePrefs();
   float duty_cycle = 1.0f / (1.0f + p->airtime_factor);
   unsigned long max_budget = (unsigned long)(3600000UL * duty_cycle);
-  unsigned long budget = the_mesh.getRemainingTxBudget();
-  if (budget > max_budget) budget = max_budget;
-  unsigned long used = max_budget - budget;
+  unsigned long used = the_mesh.getTotalAirTime();
   if (used_s) *used_s = (int)(used / 1000UL);
   if (max_s)  *max_s  = (int)(max_budget / 1000UL);
 }

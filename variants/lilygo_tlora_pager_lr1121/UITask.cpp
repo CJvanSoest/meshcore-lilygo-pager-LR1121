@@ -815,13 +815,25 @@ static void chat_history_append_line(const char* line) {
   for (const char* p = body; *p; p++) {
     if (*p == '@') {
       flush_grey();
-      // Collect mention token including the '@'.
-      char mention[40];
+      // Collect mention token including the '@'. MeshCore wire format is
+      // `@[name]` (square brackets around the target's name); we also
+      // accept the bare `@name` form as a fallback. Bracketed form runs
+      // until the closing ']' (inclusive). Bare form runs until the
+      // first non-name char.
+      char mention[42];
       int mi = 0;
       mention[mi++] = '@';
       p++;
-      while (*p && is_name_char(*p) && mi < (int)sizeof(mention) - 1) {
-        mention[mi++] = *p++;
+      if (*p == '[') {
+        while (*p && mi < (int)sizeof(mention) - 1) {
+          mention[mi++] = *p;
+          if (*p == ']') { p++; break; }
+          p++;
+        }
+      } else {
+        while (*p && is_name_char(*p) && mi < (int)sizeof(mention) - 1) {
+          mention[mi++] = *p++;
+        }
       }
       mention[mi] = 0;
       lv_span_t* sp = lv_spangroup_new_span(s_chat_history);
@@ -830,10 +842,8 @@ static void chat_history_append_line(const char* line) {
         lv_style_set_text_color(&sp->style, lv_color_hex(0x5ab8ff));
       }
       if (!*p) break;
-      // The non-name char that broke the token still needs to be emitted
-      // — fall through and the outer loop will pick it up next iteration.
-      // p currently points at it, but the loop's p++ would skip past;
-      // back up one so the increment lands on this char.
+      // The char that broke the token still needs to be emitted. Back up
+      // one so the outer loop's p++ lands on it.
       p--;
       continue;
     }
