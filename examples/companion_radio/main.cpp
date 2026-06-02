@@ -228,6 +228,12 @@ extern "C" bool ui_add_hashtag_channel(const char* name) {
   return true;
 }
 
+extern "C" bool ui_delete_channel(int populated_idx) {
+  if (!the_mesh.uiDeleteChannel(populated_idx)) return false;
+  the_mesh.uiSaveChannels();
+  return true;
+}
+
 // ----------- Contacts (S3.5) -------------------------------------------------
 //
 // Per-contact SNR / RSSI cache. Keyed by an 8-byte prefix of the
@@ -519,15 +525,29 @@ extern "C" void ui_on_dm_message(const uint8_t* pub_key, uint32_t timestamp,
   if (ui_refresh_open_dm) ui_refresh_open_dm(pub_key);
 }
 
-// Chat-type contacts only. Distinguishes a "DM contact" from a repeater
-// or sensor in the same contacts[] table.
+// DM tile lists only ACTIVE DM threads: chat-type contacts where we
+// either have ring-buffer history OR which are marked as favorite
+// (so a "start DM" via Contacts → Open DM has somewhere to land).
+// This avoids cluttering the tile with every chat-type advert ever
+// heard (which is what the Discovered tile is for).
+static bool dm_has_active_history(const uint8_t* pub_key) {
+  if (!s_dm_ring) return false;
+  for (int i = 0; i < s_dm_ring_count; i++) {
+    if (memcmp(s_dm_ring[i].pubkey8, pub_key, 8) == 0) return true;
+  }
+  return false;
+}
+
 extern "C" int ui_get_dm_contact_count() {
   int count = 0;
   for (uint32_t i = 0; i < MAX_CONTACTS; i++) {
     ContactInfo ci;
     if (!the_mesh.getContactByIdx(i, ci)) break;
     if (!ci.name[0]) continue;
-    if (ci.type == 1 /* ADV_TYPE_CHAT */) count++;
+    if (ci.type != 1 /* ADV_TYPE_CHAT */) continue;
+    bool fav    = (ci.flags & 0x01) != 0;
+    bool active = dm_has_active_history(ci.id.pub_key);
+    if (fav || active) count++;
   }
   return count;
 }
@@ -540,6 +560,9 @@ extern "C" bool ui_get_dm_contact_info(int idx, UiContact* out) {
     if (!the_mesh.getContactByIdx(i, ci)) break;
     if (!ci.name[0]) continue;
     if (ci.type != 1) continue;
+    bool fav    = (ci.flags & 0x01) != 0;
+    bool active = dm_has_active_history(ci.id.pub_key);
+    if (!fav && !active) continue;
     if (seen == idx) {
       memset(out, 0, sizeof(*out));
       StrHelper::strncpy(out->name, ci.name, sizeof(out->name));

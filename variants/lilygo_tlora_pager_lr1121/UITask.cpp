@@ -28,8 +28,8 @@ struct TileDef {
 // the switch in sync if you reorder.
 static const TileDef TILES[] = {
   { LV_SYMBOL_WIFI,      "Radio"      },   // 0 — ((•))
-  { LV_SYMBOL_ENVELOPE,  "Channels"   },   // 1 — group chats (S3.4)
-  { LV_SYMBOL_USB,       "DM"         },   // 2 — direct messages (S3.6d)
+  { LV_SYMBOL_BELL,      "Channels"   },   // 1 — group chats / broadcast feel
+  { LV_SYMBOL_ENVELOPE,  "DM"         },   // 2 — direct messages (per-contact)
   { LV_SYMBOL_LIST,      "Contacts"   },   // 3 — favorites only (S3.6c)
   { LV_SYMBOL_EYE_OPEN,  "Discovered" },   // 4 — every advert heard (S3.6b)
   { LV_SYMBOL_GPS,       "Map"        },   // 5 — placeholder
@@ -65,6 +65,12 @@ static lv_obj_t* s_con_menu_popup;   // S3.6c click-popup (Open DM / Unfav / Can
 static lv_group_t* s_con_menu_group;
 static lv_obj_t* s_con_menu_buttons[3];
 static uint8_t   s_con_menu_pub_key[32]; // pub_key of clicked contact row
+
+// Channels-row click popup (Open chat / Delete channel / Cancel).
+static lv_obj_t* s_ch_menu_popup;
+static lv_group_t* s_ch_menu_group;
+static lv_obj_t* s_ch_menu_buttons[3];
+static int       s_ch_menu_idx = -1;     // populated channel index
 static lv_group_t* s_group;          // carousel tiles
 static lv_group_t* s_radio_group;    // Radio settings list rows
 static lv_group_t* s_channel_group;  // Channels list rows
@@ -196,6 +202,8 @@ static void con_menu_show(const uint8_t* pub_key);
 static void con_menu_close();
 static void dm_list_populate();
 static void dm_chat_view_open(const uint8_t* pub_key, const char* peer_name);
+static void ch_menu_show(int populated_idx);
+static void ch_menu_close();
 // No per-row cache for the DM list — DRAM is tight (88%+) so the click
 // handler refetches contact info on-demand via ui_get_dm_contact_info(idx).
 
@@ -208,6 +216,7 @@ extern "C" void ui_apply_default_scope(const char* name) __attribute__((weak));
 extern "C" int  ui_get_channel_count() __attribute__((weak));
 extern "C" bool ui_get_channel_name(int idx, char* buf, int buf_size) __attribute__((weak));
 extern "C" bool ui_add_hashtag_channel(const char* name) __attribute__((weak));
+extern "C" bool ui_delete_channel(int populated_idx) __attribute__((weak));
 extern "C" bool ui_send_group_text(int channel_idx, const char* text) __attribute__((weak));
 
 // Contacts bridges (S3.5 — S3.6c filters to favorites; S3.6b adds the
@@ -398,6 +407,7 @@ static void enter_subscreen(int idx) {
   if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
   if (s_disc_menu_popup) lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
   if (s_con_menu_popup)  lv_obj_add_flag(s_con_menu_popup,  LV_OBJ_FLAG_HIDDEN);
+  if (s_ch_menu_popup)   lv_obj_add_flag(s_ch_menu_popup,   LV_OBJ_FLAG_HIDDEN);
   if (s_input_label)     lv_obj_add_flag(s_input_label,     LV_OBJ_FLAG_HIDDEN);
   if (s_chat_history)    lv_obj_add_flag(s_chat_history,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose)    lv_obj_add_flag(s_chat_compose,    LV_OBJ_FLAG_HIDDEN);
@@ -480,6 +490,7 @@ static void leave_subscreen() {
   if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
   if (s_disc_menu_popup) lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
   if (s_con_menu_popup)  lv_obj_add_flag(s_con_menu_popup,  LV_OBJ_FLAG_HIDDEN);
+  if (s_ch_menu_popup)   lv_obj_add_flag(s_ch_menu_popup,   LV_OBJ_FLAG_HIDDEN);
   if (s_chat_history)    lv_obj_add_flag(s_chat_history,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose)    lv_obj_add_flag(s_chat_compose,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_counter)    lv_obj_add_flag(s_chat_counter,    LV_OBJ_FLAG_HIDDEN);
@@ -597,7 +608,36 @@ static void channel_row_clicked(lv_event_t* e) {
     open_add_channel_popup();
     return;
   }
-  chat_view_open(idx);
+  // 3-option popup: Open chat / Delete channel / Cancel. Skip the popup
+  // for "Public" (slot 0) because deleting the built-in public channel
+  // would just be re-created by MyMesh on next boot — confusing UX.
+  if (idx == 0) {
+    chat_view_open(idx);
+    return;
+  }
+  ch_menu_show(idx);
+}
+
+static void ch_menu_close() {
+  if (s_ch_menu_popup) lv_obj_add_flag(s_ch_menu_popup, LV_OBJ_FLAG_HIDDEN);
+  s_ch_menu_idx = -1;
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (enc && s_channel_group) {
+    lv_group_set_editing(s_channel_group, false);
+    lv_indev_set_group(enc, s_channel_group);
+  }
+}
+
+static void ch_menu_show(int populated_idx) {
+  if (!s_ch_menu_popup) return;
+  s_ch_menu_idx = populated_idx;
+  lv_obj_remove_flag(s_ch_menu_popup, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_ch_menu_popup);
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (enc && s_ch_menu_group) {
+    lv_indev_set_group(enc, s_ch_menu_group);
+    if (s_ch_menu_buttons[0]) lv_group_focus_obj(s_ch_menu_buttons[0]);
+  }
 }
 
 static void channels_list_populate(int focus_row) {
@@ -760,11 +800,28 @@ static void dm_chat_view_open(const uint8_t* pub_key, const char* peer_name) {
   s_dm_peer_name[sizeof(s_dm_peer_name) - 1] = 0;
   s_compose_buf[0] = 0;
   s_compose_len = 0;
+  // Hide the DM contacts list (and the Contacts/Discovered ones in case
+  // the chat is opened from those — would otherwise paint behind the
+  // chat history).
+  if (s_dm_list)         lv_obj_add_flag(s_dm_list,         LV_OBJ_FLAG_HIDDEN);
+  if (s_contacts_list)   lv_obj_add_flag(s_contacts_list,   LV_OBJ_FLAG_HIDDEN);
+  if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
   if (s_chat_history) lv_obj_remove_flag(s_chat_history, LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose) lv_obj_remove_flag(s_chat_compose, LV_OBJ_FLAG_HIDDEN);
   if (s_chat_counter) lv_obj_remove_flag(s_chat_counter, LV_OBJ_FLAG_HIDDEN);
 
   lv_label_set_text(s_subscreen_title, s_dm_peer_name);
+
+  // Encoder follows the chat widget. The history label is scrollable;
+  // chat compose is keyboard-driven so encoder rotation only scrolls
+  // history (handled in UITask::loop).
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (enc && s_channel_group) {
+    // Reuse the channel chat's group (no widgets bound — empty group is
+    // fine; loop() takes over scroll handling for both modes).
+    lv_indev_set_group(enc, s_channel_group);
+    lv_group_set_editing(s_channel_group, false);
+  }
 
   chat_history_render();
   chat_compose_render();
@@ -805,6 +862,8 @@ static void chat_compose_render() {
 static void chat_view_open(int channel_idx) {
   s_chat_open = true;
   s_chat_channel_idx = channel_idx;
+  s_dm_mode = false;        // make sure render takes the channel branch
+  memset(s_dm_pubkey, 0, sizeof(s_dm_pubkey));
   s_compose_buf[0] = 0;
   s_compose_len = 0;
   // Hide the channels list while the chat is active.
@@ -1882,7 +1941,7 @@ static void build_ui() {
 
   s_con_menu_group = lv_group_create();
   static const char* con_btn_labels[3] = {
-    "Open DM (S3.6d)",
+    "Open DM",
     "Unmark favorite",
     "Cancel",
   };
@@ -1897,12 +1956,80 @@ static void build_ui() {
       lv_obj_t* tgt = (lv_obj_t*)lv_event_get_target(e);
       int which = -1;
       for (int i = 0; i < 3; i++) if (s_con_menu_buttons[i] == tgt) which = i;
+      if (which == 0) {
+        // Look up the contact name for the popup title and open DM.
+        char peer_name[32] = "?";
+        if (ui_get_contact_count && ui_get_contact_info) {
+          int n = ui_get_contact_count();
+          for (int i = 0; i < n; i++) {
+            UiContact ci;
+            if (!ui_get_contact_info(i, &ci)) continue;
+            if (memcmp(ci.pub_key, s_con_menu_pub_key, 32) == 0) {
+              strncpy(peer_name, ci.name, sizeof(peer_name) - 1);
+              peer_name[sizeof(peer_name) - 1] = 0;
+              break;
+            }
+          }
+        }
+        uint8_t pk[32];
+        memcpy(pk, s_con_menu_pub_key, 32);
+        con_menu_close();
+        dm_chat_view_open(pk, peer_name);
+        return;
+      }
       if (which == 1 && ui_toggle_favorite) {
         ui_toggle_favorite(s_con_menu_pub_key);
       }
-      // which==0 (Open DM) lands here in S3.6d.
       con_menu_close();
       contacts_list_populate();
+    }, LV_EVENT_CLICKED, nullptr);
+  }
+
+  // Channels click-popup (S3.6 round 2). Open chat / Delete channel /
+  // Cancel. "Public" (slot 0) skips the popup — chat opens immediately
+  // — because deleting it would just be re-created at next boot.
+  s_ch_menu_popup = lv_obj_create(scr);
+  lv_obj_set_size(s_ch_menu_popup, lv_pct(80), 130);
+  lv_obj_center(s_ch_menu_popup);
+  lv_obj_set_style_bg_color(s_ch_menu_popup, lv_color_hex(0x1c2530), 0);
+  lv_obj_set_style_border_width(s_ch_menu_popup, 2, 0);
+  lv_obj_set_style_border_color(s_ch_menu_popup, lv_color_hex(0xFAA61A), 0);
+  lv_obj_set_style_radius(s_ch_menu_popup, 8, 0);
+  lv_obj_set_style_text_color(s_ch_menu_popup, lv_color_hex(0xffffff), 0);
+  lv_obj_set_flex_flow(s_ch_menu_popup, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(s_ch_menu_popup, LV_FLEX_ALIGN_SPACE_EVENLY,
+                                        LV_FLEX_ALIGN_CENTER,
+                                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(s_ch_menu_popup, LV_OBJ_FLAG_HIDDEN);
+
+  s_ch_menu_group = lv_group_create();
+  static const char* ch_btn_labels[3] = {
+    "Open chat",
+    "Delete channel",
+    "Cancel",
+  };
+  for (int b = 0; b < 3; b++) {
+    s_ch_menu_buttons[b] = lv_button_create(s_ch_menu_popup);
+    lv_obj_set_size(s_ch_menu_buttons[b], lv_pct(80), 26);
+    lv_obj_t* lbl = lv_label_create(s_ch_menu_buttons[b]);
+    lv_label_set_text(lbl, ch_btn_labels[b]);
+    lv_obj_center(lbl);
+    lv_group_add_obj(s_ch_menu_group, s_ch_menu_buttons[b]);
+    lv_obj_add_event_cb(s_ch_menu_buttons[b], [](lv_event_t* e) {
+      lv_obj_t* tgt = (lv_obj_t*)lv_event_get_target(e);
+      int which = -1;
+      for (int i = 0; i < 3; i++) if (s_ch_menu_buttons[i] == tgt) which = i;
+      int idx = s_ch_menu_idx;
+      if (which == 0) {                          // Open chat
+        ch_menu_close();
+        if (idx >= 0) chat_view_open(idx);
+        return;
+      }
+      if (which == 1 && ui_delete_channel) {     // Delete channel
+        ui_delete_channel(idx);
+      }
+      ch_menu_close();
+      channels_list_populate(0);
     }, LV_EVENT_CLICKED, nullptr);
   }
 

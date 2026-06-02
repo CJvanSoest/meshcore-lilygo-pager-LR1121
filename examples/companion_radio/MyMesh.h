@@ -193,6 +193,31 @@ public:
   // Variant-UI bridges for the Discovered + Contacts tiles (S3.6b/c).
   void uiSaveContacts() { _store->saveContacts(this); }
 
+  // Variant-UI channel delete (S3.6 round 2). Walks channels[] to find
+  // the Nth POPULATED slot (matching how the UI lists channels via
+  // ui_get_channel_name), zeroes it, then compacts the table so
+  // populated-index == slot-index stays true (otherwise subsequent
+  // sends through getChannel(slot) would hit empty slots).
+  bool uiDeleteChannel(int populated_idx) {
+    int seen = 0, target_slot = -1;
+    for (int slot = 0; slot < MAX_GROUP_CHANNELS; slot++) {
+      if (channels[slot].name[0] == 0) continue;
+      if (seen == populated_idx) { target_slot = slot; break; }
+      seen++;
+    }
+    if (target_slot < 0) return false;
+    // Compact: shift later populated entries down by one.
+    for (int slot = target_slot; slot + 1 < MAX_GROUP_CHANNELS; slot++) {
+      channels[slot] = channels[slot + 1];
+    }
+    memset(&channels[MAX_GROUP_CHANNELS - 1], 0,
+           sizeof(channels[MAX_GROUP_CHANNELS - 1]));
+    while (num_channels > 0 && channels[num_channels - 1].name[0] == 0) {
+      num_channels--;
+    }
+    return true;
+  }
+
   // Add a discovered node into contacts[]. Caller passes the cached
   // pub_key + name + type from the Discovered tile ring buffer. We can't
   // recover the full advert blob (path, lat/lon, signed payload) without
