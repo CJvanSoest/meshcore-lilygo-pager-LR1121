@@ -1,7 +1,18 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <SD.h>
 #include <Adafruit_TCA8418.h>
 #include "target.h"
+
+// SD card wiring (LilyGoLib upstream pins_arduino.h for the T-Pager).
+// CS sits on a dedicated GPIO; SCLK/MISO/MOSI share the LR1121's SPI
+// bus. Power-enable + card-detect run through the XL9555 expander.
+#ifndef SD_CS_PIN
+  #define SD_CS_PIN 21
+#endif
+#define EXPANDS_SD_DET    10
+#define EXPANDS_SD_PULLEN 11
+#define EXPANDS_SD_EN     12
 
 TLoraPagerBoard board;
 
@@ -77,6 +88,43 @@ static bool xl9555_set_output(uint8_t pin, bool high) {
   Wire.write(port_reg_out);
   Wire.write(out);
   return Wire.endTransmission() == 0;
+}
+
+// --- SD card bringup ----------------------------------------------------------
+
+static bool s_sd_mounted = false;
+
+bool sd_init() {
+  if (s_sd_mounted) return true;
+
+  // Power the SD slot via XL9555 EXPANDS_SD_EN (pin 12). Without this,
+  // the SD socket has no Vcc and SD.begin() fails with "no card".
+  if (!xl9555_set_output(EXPANDS_SD_EN, true)) {
+    Serial.println("WARN: XL9555 SD_EN write failed (expander reachable?)");
+    return false;
+  }
+  delay(10);  // settle for the regulator
+
+  // CS idle HIGH so the SD doesn't latch a stray transaction while the
+  // LR1121 is talking on the same SPI bus.
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+
+  // Make sure the shared SPI bus is up. spi.begin() is idempotent on the
+  // Arduino-ESP32 core, so calling it here makes sd_init() standalone
+  // even when radio_init() has not run yet.
+  spi.begin(P_LORA_SCLK, P_LORA_MISO, P_LORA_MOSI);
+
+  // 4 MHz matches LilyGoLib upstream. The Adafruit SD library negotiates
+  // the actual clock down for cards that can't keep up.
+  if (!SD.begin(SD_CS_PIN, spi, 4000000U, "/sd")) {
+    Serial.println("ERROR: SD.begin failed (no card / unformatted / wiring?)");
+    return false;
+  }
+  uint64_t mb = SD.cardSize() / (1024ULL * 1024ULL);
+  Serial.printf("SD: mounted at /sd, %llu MB\n", mb);
+  s_sd_mounted = true;
+  return true;
 }
 
 void TLoraPagerBoard::begin() {

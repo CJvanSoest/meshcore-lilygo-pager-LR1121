@@ -35,3 +35,9 @@ uint32_t radio_get_rng_seed();
 void radio_set_params(float freq, float bw, uint8_t sf, uint8_t cr);
 void radio_set_tx_power(int8_t dbm);
 mesh::LocalIdentity radio_new_identity();
+
+// Lazy SD bringup. Idempotent: first call powers the XL9555 SD rail,
+// ensures the shared LoRa SPI bus is up, and mounts the FAT volume on
+// `/sd`. Returns true on success or if already mounted; false on a
+// missing/unreadable card. Call site decides when to retry.
+bool sd_init();
