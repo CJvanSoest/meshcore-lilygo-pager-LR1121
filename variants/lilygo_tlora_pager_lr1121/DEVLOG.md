@@ -84,3 +84,30 @@ tiles win over the legacy fallback when both exist for the same
 This also unblocks Phase 0 §2.2 (PNG decode latency) and §2.4 (SD
 throughput) — the existing z=10 tiles are real-world 256×256 PNGs
 suitable for the spike.
+
+## 2026-06-18 — Blocker: SD card not mounted in firmware
+
+Visual test of Phase 1 on hardware passed (placeholder body renders,
+CLICK + back-gesture work). Tried to scope Phase 2 raster path and
+hit a missing prerequisite:
+
+- `lv_conf.h` has `LV_USE_FS_POSIX = 1`, drive letter `'A'`, base path
+  `/sd`. So LVGL paths would be `"A:/tiles/<z>/<x>/<y>.png"`, **not**
+  `"S:/..."` as written in the plan. PLAN_MAP_VIEW.md §4 Phase 2 will
+  need updating to use the `A:` prefix.
+- BUT `/sd` is not actually mounted. `grep -r SD.begin|SD_MMC|sdmmc`
+  across the variant + companion examples returns zero hits. The
+  Pager README (`§S3.6d.2`, `§S3.7`) already lists SD bringup as a
+  prereq for both DM persistence and the map renderer.
+- SD pinmap (LilyGoLib upstream): `SD_CS=21`, SPI bus shared with the
+  LR1121 (`SCLK=35 MOSI=34 MISO=33`); power-enable + detect through
+  the XL9555 I2C expander (`EXPANDS_SD_EN=12`, `EXPANDS_SD_DET=10`,
+  `EXPANDS_SD_PULLEN=11`).
+
+Bringing SD up safely against a shared LoRa SPI bus is its own
+sprint — it needs CS-arbitration with the radio, power-sequencing
+via the expander, and a card-detect path. That work belongs in
+S3.6d.2 (already on the README backlog), not inside this Phase 2.
+
+Phase 2 raster path will resume once SD mount lands. The slippy
+math + path helpers from earlier commits are ready to plug in.
