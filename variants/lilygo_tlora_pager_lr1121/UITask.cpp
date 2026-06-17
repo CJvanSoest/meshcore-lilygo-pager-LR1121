@@ -5,6 +5,7 @@
 #include "UITask.h"
 #include "TPagerLVGL.h"
 #include "TPagerST7796Display.h"
+#include "map_screen.h"
 #include <lvgl.h>
 #include <cstring>
 #include <esp_heap_caps.h>     // heap_caps_calloc / MALLOC_CAP_SPIRAM (S3.6d)
@@ -432,6 +433,7 @@ static void enter_subscreen(int idx) {
   if (s_chat_history)    lv_obj_add_flag(s_chat_history,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose)    lv_obj_add_flag(s_chat_compose,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_counter)    lv_obj_add_flag(s_chat_counter,    LV_OBJ_FLAG_HIDDEN);
+  map_screen_hide();
   s_input_active = false;
   s_chat_open = false;
   s_chat_channel_idx = -1;
@@ -479,9 +481,11 @@ static void enter_subscreen(int idx) {
       if (enc && s_discovered_group) lv_indev_set_group(enc, s_discovered_group);
       return;
     }
-    case 5:
-      snprintf(body, sizeof(body), "GPS view\n\n(coords + sat count: later)");
-      break;
+    case 5: {  // Map (S3.6 — Phase 1 placeholder, Phase 2 brings tile raster)
+      lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
+      map_screen_show();
+      return;
+    }
     case 6:
       snprintf(body, sizeof(body), "Settings\n\n(global editable list later)");
       break;
@@ -514,6 +518,7 @@ static void leave_subscreen() {
   if (s_chat_history)    lv_obj_add_flag(s_chat_history,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose)    lv_obj_add_flag(s_chat_compose,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_counter)    lv_obj_add_flag(s_chat_counter,    LV_OBJ_FLAG_HIDDEN);
+  map_screen_hide();
   // DM mode unset
   s_dm_mode = false;
   memset(s_dm_pubkey, 0, sizeof(s_dm_pubkey));
@@ -1885,6 +1890,9 @@ static void build_ui() {
   lv_obj_set_width(s_subscreen_body, lv_pct(96));
   lv_label_set_long_mode(s_subscreen_body, LV_LABEL_LONG_WRAP);
   lv_obj_align(s_subscreen_body, LV_ALIGN_TOP_LEFT, 6, 48);
+
+  // Map view container — built once, hidden until the Map tile opens.
+  map_screen_create(s_subscreen_root);
 
   // Radio settings list — plain container with custom 2-column rows so the
   // value column lines up. Built once, hidden by default, repopulated on
