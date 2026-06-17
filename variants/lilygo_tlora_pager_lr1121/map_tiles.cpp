@@ -1,6 +1,7 @@
 #include "map_tiles.h"
 
 #include <math.h>
+#include <stdio.h>
 
 namespace map_tiles {
 
@@ -36,6 +37,20 @@ int wrap_tile_x(int tile_x, int zoom) {
   int r          = tile_x % span;
   if (r < 0) r += span;
   return r;
+}
+
+int format_tile_path(char* out, int cap, const char* prefix,
+                     const char* source, int zoom, int tile_x, int tile_y) {
+  const int n = snprintf(out, cap, "%s/tiles/%s/%d/%d/%d.png",
+                         prefix, source, zoom, tile_x, tile_y);
+  return (n < 0 || n >= cap) ? -1 : n;
+}
+
+int format_tile_path_legacy(char* out, int cap, const char* prefix,
+                            int zoom, int tile_x, int tile_y) {
+  const int n = snprintf(out, cap, "%s/tiles/%d/%d/%d.png",
+                         prefix, zoom, tile_x, tile_y);
+  return (n < 0 || n >= cap) ? -1 : n;
 }
 
 }  // namespace map_tiles

@@ -102,3 +102,28 @@ A header badge in the map view shows the current source ("OSM",
 the config-array. The chosen source persists across reboots via
 SPIFFS. Adding a new source = add an entry to `MAP_SOURCES[]` in the
 variant code + a folder under `/tiles/`. No SD-side metadata required.
+
+## Legacy fallback (Ripple Radio Europe tileset)
+
+For backwards compatibility with the Ripple Radio Europe SD image, the
+tile loader falls back to a source-less path when the primary path is
+missing:
+
+```
+primary : /tiles/<source>/<z>/<x>/<y>.png
+fallback: /tiles/<z>/<x>/<y>.png
+```
+
+Behaviour:
+1. Tile loader tries `<primary>` first using the active source.
+2. If that file is missing, it tries `<fallback>`.
+3. Only if both are missing does the tile render as a grey rect.
+
+This lets a SD card prepared for the Ripple firmware work on the Pager
+without reorganising the folder tree, while new downloads via
+`tools/download_tiles.py` go to the `<source>/` layout. When both
+exist for the same `(z, x, y)`, the source-specific tile wins.
+
+The header badge still shows the active source name (e.g. "OSM") even
+when the rendered tile came from the fallback path — the badge
+reflects the user-chosen source, not the actual file origin.

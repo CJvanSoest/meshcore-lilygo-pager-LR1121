@@ -45,4 +45,18 @@ void tile_to_latlon(int tile_x, int tile_y, int zoom,
 // Always returns a value in [0, 2^zoom).
 int wrap_tile_x(int tile_x, int zoom);
 
+// Path formatters. `out` must hold at least PATH_BUF_MIN chars.
+// Returns the number of chars written excluding the terminator, or -1
+// on overflow. `prefix` is typically "/sd" or LVGL's "S:".
+inline constexpr int PATH_BUF_MIN = 64;
+
+// Primary path per MAPS.md: <prefix>/tiles/<source>/<z>/<x>/<y>.png
+int format_tile_path(char* out, int cap, const char* prefix,
+                     const char* source, int zoom, int tile_x, int tile_y);
+
+// Legacy fallback: <prefix>/tiles/<z>/<x>/<y>.png (Ripple Radio Europe
+// tileset has this layout — no <source> directory).
+int format_tile_path_legacy(char* out, int cap, const char* prefix,
+                            int zoom, int tile_x, int tile_y);
+
 }  // namespace map_tiles

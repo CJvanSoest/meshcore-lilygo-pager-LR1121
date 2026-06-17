@@ -60,3 +60,27 @@ Recording: code-only Phase 0 decisions (§2.1, §2.3) are landed in this
 devlog; Phase 1 plumbing follows in the next commit. The §2.2/§2.4
 spikes get their own devlog entry once measured on the Pager with the
 first test tile available.
+
+## 2026-06-18 — Pager SD inspection
+
+User mounted the Pager's 32 GB microSD. It is **not fresh** as the
+plan §5 assumed — it already carries the Ripple Radio Europe tileset
+from a prior firmware:
+
+```
+/tiles/<z>/<x>/<y>.png   (Ripple-style, no <source> directory)
+z=1..10, ~25.8k tiles total, 256×256 PNG 8-bit colormap, ~2-16 KB each
+```
+
+No z=11..14 tiles — street-name scale will need a fresh download via
+`tools/download_tiles.py` later.
+
+Decision: **firmware accepts both schemas**. MAPS.md updated with the
+fallback section; `map_tiles::format_tile_path` / `_legacy` provide
+the two snprintf shapes Phase 2 will try in order. Source-specific
+tiles win over the legacy fallback when both exist for the same
+(z, x, y). No SD-side mutation — the Ripple tiles stay in place.
+
+This also unblocks Phase 0 §2.2 (PNG decode latency) and §2.4 (SD
+throughput) — the existing z=10 tiles are real-world 256×256 PNGs
+suitable for the spike.
