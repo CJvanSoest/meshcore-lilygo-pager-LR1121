@@ -111,3 +111,49 @@ S3.6d.2 (already on the README backlog), not inside this Phase 2.
 
 Phase 2 raster path will resume once SD mount lands. The slippy
 math + path helpers from earlier commits are ready to plug in.
+
+## 2026-06-18 — Phase 2 single-tile renders on hardware
+
+SD bringup landed (S3.6d.2) and the Map view now displays the Den
+Haag z=10 OSM tile from the existing Ripple Radio Europe set on the
+Pager SD. Pipeline confirmed end-to-end:
+
+```
+slippy(52.080, 4.310, 10) -> tile (524, 337, px 66, 223)
+-> /sd/tiles/10/524/337.png (legacy schema)
+-> A:/tiles/10/524/337.png (LVGL drive)
+-> lv_image_set_src -> lv_lodepng -> ARGB8888 256x256
+-> blit to 480x222 ST7796
+```
+
+Two LVGL config defaults were silent blockers — both fixed in
+`lv_conf.h`:
+
+1. **`LV_CACHE_DEF_SIZE` was `0`.** With cache disabled, lodepng
+   releases the decoded buffer after the first draw. Image widget
+   renders nothing on subsequent frames. Bumped to **1 MB** so we
+   can keep ~4 decoded 256x256 ARGB tiles around — enough for the
+   Phase 2 single-tile path and the eventual 2x1 raster from §2.1.
+2. **`LV_USE_STDLIB_MALLOC` was `LV_STDLIB_BUILTIN`.** The builtin
+   pool is a 64 KB internal-RAM static array; a single 256 KB ARGB
+   tile alloc immediately fails with no surface error other than
+   `Error decoding PNG` (lodepng error code is swallowed by the
+   draw_buf alloc wrapper). Switched to **`LV_STDLIB_CLIB`** so
+   malloc falls back to PSRAM for big chunks — required for any
+   `lv_image` work that touches a PSRAM device.
+
+Debug timeline (kept for future LVGL allocator headaches):
+- `lv_fs_open` returns OK + 35.7 KB → FS driver fine.
+- `lv_image_decoder_open` returns `LV_RESULT_INVALID` → decoder fails
+  before producing a header.
+- `LV_USE_LOG=1` + `LV_LOG_PRINTF=1` reveal
+  `lv_lodepng.c:173 Error decoding PNG` (generic; the inner code
+  from `lodepng_decode32` is lost).
+- After cache + malloc fix: same diagnostic prints disappear and the
+  tile renders.
+
+Phase 2 minimum acceptance: ✅ on-screen Den Haag tile. The 2x1 raster
+from plan §2.1 Option A + a status strip / GPS lock are still to come
+in Phase 3-5. The Phase 0 §2.2 / §2.4 timing spikes can now be folded
+into the next session since real-world tile decode + SD read are
+working.
