@@ -157,3 +157,41 @@ from plan §2.1 Option A + a status strip / GPS lock are still to come
 in Phase 3-5. The Phase 0 §2.2 / §2.4 timing spikes can now be folded
 into the next session since real-world tile decode + SD read are
 working.
+
+## 2026-06-19 — Phase 2 finishing: 2x1 raster + Map-aware top row
+
+Hardware-confirmed the full Option A layout: two adjacent z=10 OSM
+tiles render with the seam at viewport centre, antimeridian-safe via
+`map_tiles::wrap_tile_x`. Status strip + DC + battery readouts share
+the top 22 px without overlap on the 480 px display.
+
+Layout reorganisation in `UITask.cpp`:
+- Map case 5 hides `s_header_label` (Pager-name) and the bottom
+  `s_back_hint` (edit-mode hint is meaningless inside the Map view).
+  Both restore in `leave_subscreen`.
+- `s_dc_label` is re-anchored from `TOP_MID` to the left of
+  `s_battery_label` on Map open so the orange "MAP - osm  z=N
+  (X-X+1, Y)" string has the left half to itself.
+- `s_back_hint` was promoted from a `build_ui` local to a file-static
+  so the toggle stays cheap.
+
+`map_screen.cpp`:
+- Split `s_tile_img` into `s_tile_img_l` / `s_tile_img_r`, each
+  resolved independently (primary `<source>/` first, legacy fallback
+  second). One missing tile blanks only its half.
+- Status strip drawn after the tiles, opaque black background, so the
+  orange text stays legible against any tile colours below.
+
+## 2026-06-19 — BQ25896 power-off requires USB unplug first
+
+Spent ~30 min thinking the encoder ≥3 s power-off gesture was broken
+after the Phase 2 work. It wasn't. The polling code fires correctly
+and `tpager_power_off()` (target.cpp:371) writes `BATFET_DIS` (bit 5
+of REG09H) on the BQ25896 — which **only** disconnects the battery
+from the PMID system rail. With USB plugged in, VBUS keeps the rail
+alive, so the call appears to do nothing.
+
+Procedure: unplug USB, then hold encoder ≥3 s and release. Display
+goes black. Captured in
+[bq25896_poweroff_usb_quirk](../../../../../.claude/projects/-Users-cjvs/memory/bq25896_poweroff_usb_quirk.md)
+auto-memory for the next BQ25896-board debug session.
