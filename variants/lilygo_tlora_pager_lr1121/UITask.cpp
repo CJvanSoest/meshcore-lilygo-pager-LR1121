@@ -45,6 +45,7 @@ static lv_obj_t* s_root;
 static lv_obj_t* s_header_label;
 static lv_obj_t* s_battery_label;
 static lv_obj_t* s_dc_label;          // duty-cycle % shown between name + battery
+static lv_obj_t* s_back_hint = nullptr;  // bottom hint on every sub-screen (Map hides it)
 static lv_obj_t* s_tile_row;
 static lv_obj_t* s_tile_buttons[NUM_TILES];
 static lv_obj_t* s_title_label;
@@ -481,8 +482,18 @@ static void enter_subscreen(int idx) {
       if (enc && s_discovered_group) lv_indev_set_group(enc, s_discovered_group);
       return;
     }
-    case 5: {  // Map (S3.6 — Phase 1 placeholder, Phase 2 brings tile raster)
+    case 5: {  // Map (S3.6 — Phase 2 raster, status strip owns the top row)
       lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
+      // Hide the per-subscreen Pager name (the Map status strip takes
+      // its place) and the bottom edit-hint (no editable widgets in
+      // the Map view). Slide DC next to battery on the right so it
+      // doesn't collide with the MAP text on the left.
+      if (s_header_label) lv_obj_add_flag(s_header_label, LV_OBJ_FLAG_HIDDEN);
+      if (s_back_hint)    lv_obj_add_flag(s_back_hint,    LV_OBJ_FLAG_HIDDEN);
+      if (s_dc_label && s_battery_label) {
+        lv_obj_align_to(s_dc_label, s_battery_label,
+                        LV_ALIGN_OUT_LEFT_MID, -8, 0);
+      }
       map_screen_show();
       return;
     }
@@ -519,6 +530,10 @@ static void leave_subscreen() {
   if (s_chat_compose)    lv_obj_add_flag(s_chat_compose,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_counter)    lv_obj_add_flag(s_chat_counter,    LV_OBJ_FLAG_HIDDEN);
   map_screen_hide();
+  // Restore the labels + DC position the Map tile takes over.
+  if (s_header_label) lv_obj_remove_flag(s_header_label, LV_OBJ_FLAG_HIDDEN);
+  if (s_back_hint)    lv_obj_remove_flag(s_back_hint,    LV_OBJ_FLAG_HIDDEN);
+  if (s_dc_label)     lv_obj_align(s_dc_label, LV_ALIGN_TOP_MID, 0, 4);
   // DM mode unset
   s_dm_mode = false;
   memset(s_dm_pubkey, 0, sizeof(s_dm_pubkey));
@@ -2211,10 +2226,10 @@ static void build_ui() {
     }, LV_EVENT_CLICKED, nullptr);
   }
 
-  lv_obj_t* back_hint = lv_label_create(s_subscreen_root);
-  lv_label_set_text(back_hint, "click or dbl-click: edit   long-press: back");
-  lv_obj_set_style_text_color(back_hint, lv_color_hex(0x707880), 0);
-  lv_obj_align(back_hint, LV_ALIGN_BOTTOM_MID, 0, -4);
+  s_back_hint = lv_label_create(s_subscreen_root);
+  lv_label_set_text(s_back_hint, "click or dbl-click: edit   long-press: back");
+  lv_obj_set_style_text_color(s_back_hint, lv_color_hex(0x707880), 0);
+  lv_obj_align(s_back_hint, LV_ALIGN_BOTTOM_MID, 0, -4);
 
   // ---- Encoder group ----
   s_group = lv_group_create();
