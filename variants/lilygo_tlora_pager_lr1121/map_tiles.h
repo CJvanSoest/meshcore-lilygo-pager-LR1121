@@ -17,7 +17,7 @@ inline constexpr int TILE_PX = 256;
 // Zoom bounds. MIN matches the Ripple Europe tileset's lower edge that
 // the Tanmatsu side already used; MAX is street-name scale.
 inline constexpr int ZOOM_MIN = 6;
-inline constexpr int ZOOM_MAX = 14;
+inline constexpr int ZOOM_MAX = 17;
 
 // Web-Mercator pole clamp. Lat outside this range is mathematically
 // outside the projection — the formula diverges at ±90°.

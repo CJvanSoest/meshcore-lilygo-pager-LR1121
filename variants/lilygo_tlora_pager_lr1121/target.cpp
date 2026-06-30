@@ -42,6 +42,22 @@ AutoDiscoverRTCClock rtc_clock(fallback_clock);
   EnvironmentSensorManager sensors;
 #endif
 
+// GPS status bridges for the Map status strip (UITask / map_screen).
+extern "C" int ui_get_sat_count() {
+#if ENV_INCLUDE_GPS
+  return (int)nmea.satellitesCount();
+#else
+  return -1;
+#endif
+}
+extern "C" bool ui_get_gps_valid() {
+#if ENV_INCLUDE_GPS
+  return nmea.isValid();
+#else
+  return false;
+#endif
+}
+
 #ifndef LORA_CR
   #define LORA_CR 5
 #endif

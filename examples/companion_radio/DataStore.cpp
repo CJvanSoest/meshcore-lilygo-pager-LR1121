@@ -233,6 +233,11 @@ void DataStore::loadPrefsInt(const char *filename, NodePrefs& _prefs, double& no
     file.read((uint8_t *)&_prefs.rx_boosted_gain, sizeof(_prefs.rx_boosted_gain));         // 89
     file.read((uint8_t *)_prefs.default_scope_name, sizeof(_prefs.default_scope_name));    // 90
     file.read((uint8_t *)_prefs.default_scope_key, sizeof(_prefs.default_scope_key));     // 121
+    // Home location — appended tail. Older files end here; read past EOF
+    // is a no-op so home_lat/home_lon keep their pre-zeroed (unset) value.
+    _prefs.home_lat = 0; _prefs.home_lon = 0;
+    file.read((uint8_t *)&_prefs.home_lat, sizeof(_prefs.home_lat));                       // 137
+    file.read((uint8_t *)&_prefs.home_lon, sizeof(_prefs.home_lon));                       // 145
 
     file.close();
   }
@@ -273,6 +278,8 @@ void DataStore::savePrefs(const NodePrefs& _prefs, double node_lat, double node_
     file.write((uint8_t *)&_prefs.rx_boosted_gain, sizeof(_prefs.rx_boosted_gain));         // 89
     file.write((uint8_t *)_prefs.default_scope_name, sizeof(_prefs.default_scope_name));    // 90
     file.write((uint8_t *)_prefs.default_scope_key, sizeof(_prefs.default_scope_key));     // 121
+    file.write((uint8_t *)&_prefs.home_lat, sizeof(_prefs.home_lat));                       // 137
+    file.write((uint8_t *)&_prefs.home_lon, sizeof(_prefs.home_lon));                       // 145
 
     file.close();
   }

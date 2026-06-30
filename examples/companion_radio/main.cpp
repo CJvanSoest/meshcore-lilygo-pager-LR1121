@@ -410,6 +410,10 @@ static UiDiscovered* disc_find(const uint8_t* pub_key) {
   return nullptr;
 }
 
+// SD persistence for the discovered cache (defined below ui_on_advert_seen).
+void disc_persist_save();
+void disc_persist_load();
+
 static UiDiscovered* disc_allocate(const uint8_t* pub_key) {
   if (!ensure_disc_cache()) return nullptr;
   UiDiscovered* hit = disc_find(pub_key);
@@ -440,6 +444,47 @@ extern "C" void ui_on_advert_seen(const uint8_t* pub_key, const char* name,
   e->rssi     = (int16_t)rssi;
   e->path_len = path_len;
   e->last_ms  = millis() ? millis() : 1;
+
+  // Throttled persist of the whole cache to SD (item: save discovered nodes).
+  static unsigned long s_disc_save_next = 0;
+  unsigned long now = millis();
+  if ((long)(now - s_disc_save_next) >= 0) {
+    s_disc_save_next = now + 15000;
+    disc_persist_save();
+  }
+}
+
+// ---- Discovered-nodes SD persistence (whole-cache binary dump) -------------
+void disc_persist_save() {
+  if (!s_disc_cache || !sd_init()) return;
+  FILE* f = fopen("/sd/disc.dat", "wb");
+  if (!f) return;
+  uint32_t magic = 0x43534944;   // 'DISC'
+  fwrite(&magic, 4, 1, f);
+  for (int i = 0; i < UI_DISC_CACHE; i++) {
+    if (s_disc_cache[i].last_ms == 0) continue;
+    fwrite(&s_disc_cache[i], sizeof(UiDiscovered), 1, f);
+  }
+  fclose(f);
+}
+
+void disc_persist_load() {
+  if (!ensure_disc_cache() || !sd_init()) return;
+  FILE* f = fopen("/sd/disc.dat", "rb");
+  if (!f) return;
+  uint32_t magic = 0;
+  if (fread(&magic, 4, 1, f) != 1 || magic != 0x43534944) { fclose(f); return; }
+  int idx = 0;
+  UiDiscovered e;
+  while (idx < UI_DISC_CACHE && fread(&e, sizeof(e), 1, f) == 1) {
+    memcpy(&s_disc_cache[idx], &e, sizeof(e));
+    // millis() fields are meaningless across a reboot; mark the slot
+    // occupied with a tiny age so it sorts as "old/loaded".
+    s_disc_cache[idx].first_ms = 1;
+    s_disc_cache[idx].last_ms  = 1;
+    idx++;
+  }
+  fclose(f);
 }
 
 extern "C" int ui_get_discovered_count() {
@@ -533,10 +578,65 @@ static void dm_ring_push(const uint8_t* pub_key, bool from_me, const char* text)
 
 extern "C" void ui_refresh_open_dm(const uint8_t* pub_key) __attribute__((weak));
 
+// ---- DM history SD persistence --------------------------------------------
+// One append-log per peer at /sd/dm_<hex8>.dat. Each record is
+// [uint8 from_me][uint8 len][len bytes]. Loaded into the ring on chat open.
+bool sd_init();   // from target.cpp
+static bool dm_has_active_history(const uint8_t* pub_key);   // fwd
+
+static void dm_hist_path(const uint8_t* pub_key, char* out, size_t cap) {
+  static const char* H = "0123456789abcdef";
+  char hx[17];
+  for (int i = 0; i < 8; i++) { hx[i*2] = H[pub_key[i] >> 4]; hx[i*2+1] = H[pub_key[i] & 0x0f]; }
+  hx[16] = 0;
+  snprintf(out, cap, "/sd/dm_%s.dat", hx);
+}
+
+static void dm_persist_append(const uint8_t* pub_key, bool from_me, const char* text) {
+  if (!text || !sd_init()) return;
+  char path[40]; dm_hist_path(pub_key, path, sizeof(path));
+  FILE* f = fopen(path, "ab");
+  if (!f) return;
+  uint8_t fm = from_me ? 1 : 0;
+  size_t L = strlen(text); if (L > 119) L = 119;
+  uint8_t len = (uint8_t)L;
+  fwrite(&fm, 1, 1, f); fwrite(&len, 1, 1, f); fwrite(text, 1, L, f);
+  fclose(f);
+}
+
+// Restore a peer's history into the ring (oldest-first, last DM_RING_SIZE).
+// No-op if the ring already holds messages for the peer.
+extern "C" void ui_load_dm_history(const uint8_t* pub_key) {
+  if (dm_has_active_history(pub_key) || !sd_init()) return;
+  char path[40]; dm_hist_path(pub_key, path, sizeof(path));
+  FILE* f = fopen(path, "rb");
+  if (!f) return;
+  static char texts[DM_RING_SIZE][120];
+  static uint8_t fms[DM_RING_SIZE];
+  int n = 0;
+  uint8_t fm, len;
+  while (fread(&fm, 1, 1, f) == 1 && fread(&len, 1, 1, f) == 1) {
+    if (len > 119) break;
+    char buf[120];
+    if (fread(buf, 1, len, f) != len) break;
+    buf[len] = 0;
+    int s = n % DM_RING_SIZE;
+    fms[s] = fm; memcpy(texts[s], buf, len + 1);
+    n++;
+  }
+  fclose(f);
+  int start = n > DM_RING_SIZE ? n - DM_RING_SIZE : 0;
+  for (int i = start; i < n; i++) {
+    int s = i % DM_RING_SIZE;
+    dm_ring_push(pub_key, fms[s] != 0, texts[s]);   // ring only — no re-persist
+  }
+}
+
 extern "C" void ui_on_dm_message(const uint8_t* pub_key, uint32_t timestamp,
                                  const char* text) {
   (void)timestamp;
   dm_ring_push(pub_key, /*from_me=*/false, text);
+  dm_persist_append(pub_key, /*from_me=*/false, text);
   if (ui_refresh_open_dm) ui_refresh_open_dm(pub_key);
 }
 
@@ -600,6 +700,7 @@ extern "C" bool ui_send_dm(const uint8_t* pub_key, const char* text) {
   if (!the_mesh.uiSendDm(pub_key, text)) return false;
   // Also append to the local ring so the user sees their own send.
   dm_ring_push(pub_key, /*from_me=*/true, text);
+  dm_persist_append(pub_key, /*from_me=*/true, text);
   return true;
 }
 
@@ -646,6 +747,23 @@ extern "C" bool ui_get_dm_msg(const uint8_t* pub_key, int idx, UiDmMsg* out) {
 extern "C" void ui_get_self_loc(double* lat, double* lon) {
   if (lat) *lat = sensors.node_lat;
   if (lon) *lon = sensors.node_lon;
+}
+
+// Saved "home" location (T-Pager Settings tile). ui_get_home_loc returns
+// true only when a home has been stored (non-zero). ui_set_home_loc stores
+// + persists; (0,0) clears it.
+extern "C" bool ui_get_home_loc(double* lat, double* lon) {
+  NodePrefs* p = the_mesh.getNodePrefs();
+  if (lat) *lat = p->home_lat;
+  if (lon) *lon = p->home_lon;
+  return (p->home_lat != 0.0 || p->home_lon != 0.0);
+}
+
+extern "C" void ui_set_home_loc(double lat, double lon) {
+  NodePrefs* p = the_mesh.getNodePrefs();
+  p->home_lat = lat;
+  p->home_lon = lon;
+  the_mesh.savePrefs();
 }
 
 extern "C" uint32_t ui_get_now_epoch() {
@@ -811,6 +929,10 @@ void setup() {
 #endif
 
   sensors.begin();
+
+  // Restore the discovered-nodes cache from SD (DM/channel history load
+  // lazily on chat open). Safe no-op if there's no card / no file.
+  disc_persist_load();
 
 #if ENV_INCLUDE_GPS == 1
   the_mesh.applyGpsPrefs();

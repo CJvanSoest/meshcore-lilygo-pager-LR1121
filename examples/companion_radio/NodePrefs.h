@@ -34,4 +34,9 @@ struct NodePrefs {  // persisted to file
   uint8_t autoadd_max_hops;  // 0 = no limit, 1 = direct (0 hops), N = up to N-1 hops (max 64)
   char default_scope_name[31];
   uint8_t default_scope_key[16];
+  // Saved "home" location for distance reference (T-Pager Settings tile).
+  // (0,0) = unset. Appended to the prefs-file tail so older files (which
+  // lack these bytes) load them as 0 = unset.
+  double home_lat;
+  double home_lon;
 };

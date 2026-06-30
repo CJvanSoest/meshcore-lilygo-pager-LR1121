@@ -16,3 +16,17 @@ lv_obj_t* map_screen_create(lv_obj_t* parent);
 // Visibility — called by UITask.cpp on tile enter/leave.
 void map_screen_show();
 void map_screen_hide();
+
+// Set the map centre (decimal degrees). If the map is currently visible it
+// re-renders immediately. UITask centres on saved Home on open, then hands
+// off to live GPS after a few seconds. A (0,0) centre is ignored.
+void map_screen_set_center(double lat_deg, double lon_deg);
+
+// Manual navigation (keyboard-driven from UITask). Pan by whole tiles
+// (dx east, dy south); zoom by dz (clamped to the on-card z16..z17 band).
+void map_screen_pan(int dx, int dy);
+void map_screen_zoom(int dz);
+
+// Refresh only the status strip (sat count / coords) without reloading
+// tiles — call on a timer while the Map view is open.
+void map_screen_refresh_status();

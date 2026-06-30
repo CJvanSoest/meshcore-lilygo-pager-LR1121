@@ -8,7 +8,10 @@
 #include "map_screen.h"
 #include <lvgl.h>
 #include <cstring>
+#include <cstdio>              // fopen/fread/fwrite for SD chat-history store
 #include <esp_heap_caps.h>     // heap_caps_calloc / MALLOC_CAP_SPIRAM (S3.6d)
+
+bool sd_init();                // from target.cpp — mounts /sd (idempotent)
 
 #ifndef AUTO_OFF_MILLIS
   #define AUTO_OFF_MILLIS  60000
@@ -33,11 +36,19 @@ static const TileDef TILES[] = {
   { LV_SYMBOL_ENVELOPE,  "DM"         },   // 2 — direct messages (per-contact)
   { LV_SYMBOL_LIST,      "Contacts"   },   // 3 — favorites only (S3.6c)
   { LV_SYMBOL_EYE_OPEN,  "Discovered" },   // 4 — every advert heard (S3.6b)
-  { LV_SYMBOL_GPS,       "Map"        },   // 5 — placeholder
-  { LV_SYMBOL_SETTINGS,  "Settings"   },   // 6 — placeholder
-  { LV_SYMBOL_HOME,      "About"      },   // 7 — build info
+  { LV_SYMBOL_UPLOAD,    "Advert"     },   // 5 — send self-advert (direct/flood)
+  { LV_SYMBOL_GPS,       "Map"        },   // 6 — SD raster tiles
+  { LV_SYMBOL_SETTINGS,  "Settings"   },   // 7 — device settings list
+  { LV_SYMBOL_HOME,      "About"      },   // 8 — build info
 };
 static const int NUM_TILES = sizeof(TILES) / sizeof(TILES[0]);
+
+// Named tile indices — referenced by enter_subscreen(), the unread badges
+// and the map refresh. Keep in sync with TILES[] above if you reorder.
+enum {
+  TILE_RADIO = 0, TILE_CHANNELS, TILE_DM, TILE_CONTACTS, TILE_DISCOVERED,
+  TILE_ADVERT, TILE_MAP, TILE_SETTINGS, TILE_ABOUT,
+};
 
 // ---------- UI state ---------------------------------------------------------
 
@@ -48,9 +59,10 @@ static lv_obj_t* s_dc_label;          // duty-cycle % shown between name + batte
 static lv_obj_t* s_back_hint = nullptr;  // bottom hint on every sub-screen (Map hides it)
 static lv_obj_t* s_tile_row;
 static lv_obj_t* s_tile_buttons[NUM_TILES];
-static lv_obj_t* s_title_label;
+static lv_obj_t* s_tile_badges[NUM_TILES] = {0};  // unread-count badge per tile (item 7)
 static lv_obj_t* s_subscreen_root;
 static lv_obj_t* s_subscreen_title;
+static lv_obj_t* s_title_rule[2] = {0};   // separator rules around the title (item 3)
 static lv_obj_t* s_subscreen_body;
 static lv_obj_t* s_radio_list;
 static lv_obj_t* s_channel_list;     // S3.4 channels list (Messages tile)
@@ -80,6 +92,94 @@ static lv_group_t* s_contacts_group; // Contacts list rows
 static unsigned long s_contacts_next_refresh = 0;
 static lv_group_t* s_discovered_group; // Discovered list rows
 static unsigned long s_discovered_next_refresh = 0;
+
+// ---- Map Home→GPS handoff (item 5) ----
+#define MAP_GPS_SWITCH_MS 4000
+static unsigned long s_map_gps_switch_at = 0;   // 0 = no handoff pending
+static unsigned long s_map_status_next = 0;     // live sat-count refresh tick
+
+// ---- Settings tile (item 8) ----
+static lv_obj_t*   s_settings_list = nullptr;
+static lv_group_t* s_settings_group = nullptr;
+// Runtime-adjustable display sleep timeout (battery saver). Cycled from the
+// Settings list; not persisted (resets to the compile-time default on boot).
+static unsigned long s_screen_off_ms = AUTO_OFF_MILLIS;
+
+// ---- Advert subscreen (item 2) — two big buttons: Direct / Flood ----
+static lv_obj_t*   s_advert_root = nullptr;
+static lv_group_t* s_advert_group = nullptr;
+
+// ---- Toast popup (item 2) — centered label that auto-closes after 3 s ----
+static lv_obj_t* s_toast_popup = nullptr;
+static lv_obj_t* s_toast_label = nullptr;
+static lv_timer_t* s_toast_timer = nullptr;
+
+// ---- Unread counters (item 7) -----------------------------------------------
+// Per-channel unread keyed by channel index; per-DM unread keyed by the first
+// 8 bytes of the peer pub_key (same key the DM ring in main.cpp uses).
+#define UI_MAX_CHANNELS 40
+static uint16_t s_unread_ch[UI_MAX_CHANNELS] = {0};
+#define UI_MAX_DM_THREADS 32
+struct DmUnread { uint8_t pubkey8[8]; uint16_t count; bool used; };
+static DmUnread s_unread_dm[UI_MAX_DM_THREADS] = {0};
+
+static int dm_unread_find(const uint8_t* pk8, bool create) {
+  int free_slot = -1;
+  for (int i = 0; i < UI_MAX_DM_THREADS; i++) {
+    if (s_unread_dm[i].used) {
+      if (memcmp(s_unread_dm[i].pubkey8, pk8, 8) == 0) return i;
+    } else if (free_slot < 0) {
+      free_slot = i;
+    }
+  }
+  if (create && free_slot >= 0) {
+    memcpy(s_unread_dm[free_slot].pubkey8, pk8, 8);
+    s_unread_dm[free_slot].count = 0;
+    s_unread_dm[free_slot].used = true;
+    return free_slot;
+  }
+  return -1;
+}
+static uint16_t dm_unread_get(const uint8_t* pk) {
+  int i = dm_unread_find(pk, false);
+  return i >= 0 ? s_unread_dm[i].count : 0;
+}
+static void dm_unread_bump(const uint8_t* pk) {
+  int i = dm_unread_find(pk, true);
+  if (i >= 0 && s_unread_dm[i].count < 0xFFFF) s_unread_dm[i].count++;
+}
+static void dm_unread_clear(const uint8_t* pk) {
+  int i = dm_unread_find(pk, false);
+  if (i >= 0) s_unread_dm[i].count = 0;
+}
+static uint32_t unread_total_dm() {
+  uint32_t t = 0;
+  for (int i = 0; i < UI_MAX_DM_THREADS; i++)
+    if (s_unread_dm[i].used) t += s_unread_dm[i].count;
+  return t;
+}
+static uint32_t unread_total_ch() {
+  uint32_t t = 0;
+  for (int i = 0; i < UI_MAX_CHANNELS; i++) t += s_unread_ch[i];
+  return t;
+}
+// Set a tile's unread badge (a small label child of the tile button). Hidden
+// when count == 0. s_tile_badges[] is filled in build_ui().
+static void update_tile_badge(int tile, uint32_t count) {
+  if (tile < 0 || tile >= NUM_TILES) return;
+  lv_obj_t* badge = s_tile_badges[tile];
+  if (!badge) return;
+  if (count == 0) { lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN); return; }
+  char buf[8];
+  if (count > 99) snprintf(buf, sizeof(buf), "99+");
+  else            snprintf(buf, sizeof(buf), "%lu", (unsigned long)count);
+  lv_label_set_text(badge, buf);
+  lv_obj_remove_flag(badge, LV_OBJ_FLAG_HIDDEN);
+}
+static void update_tile_badges() {
+  update_tile_badge(TILE_CHANNELS, unread_total_ch());
+  update_tile_badge(TILE_DM, unread_total_dm());
+}
 // Special s_editing_idx value used when the text-input popup is open for
 // "add new channel". Out-of-range w.r.t. radio rows so existing
 // per-row dispatch ignores it.
@@ -115,6 +215,7 @@ static int  s_chat_channel_idx = -1;
 static bool s_dm_mode = false;
 static uint8_t s_dm_pubkey[32] = {0};
 static char    s_dm_peer_name[32] = {0};
+static lv_obj_t* s_chat_scroll  = nullptr;  // scrollable wrapper around the spangroup
 static lv_obj_t* s_chat_history = nullptr;
 static lv_obj_t* s_chat_compose = nullptr;
 static lv_obj_t* s_chat_counter = nullptr;
@@ -196,8 +297,11 @@ static void chat_view_close();
 static void chat_history_render();
 static void chat_compose_render();
 static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char* text);
+static void chan_persist_load(uint8_t idx);
+static bool chan_ring_has(uint8_t idx);
 static void contacts_list_populate();
 static void discovered_list_populate();
+static void settings_list_populate();
 static void disc_menu_show(int disc_idx);
 static void disc_menu_close();
 static void con_menu_show(const uint8_t* pub_key);
@@ -269,7 +373,23 @@ extern "C" bool ui_send_dm(const uint8_t* pub_key, const char* text) __attribute
 extern "C" int  ui_get_dm_msg_count(const uint8_t* pub_key) __attribute__((weak));
 extern "C" bool ui_get_dm_msg(const uint8_t* pub_key, int idx, UiDmMsg* out) __attribute__((weak));
 extern "C" void ui_get_self_loc(double* lat, double* lon) __attribute__((weak));
+// Saved "home" location (item 8). Returns true if a home has been stored.
+extern "C" bool ui_get_home_loc(double* lat, double* lon) __attribute__((weak));
+// Restore a peer's DM history from SD into the ring (no-op if already loaded).
+extern "C" void ui_load_dm_history(const uint8_t* pub_key) __attribute__((weak));
+extern "C" void ui_set_home_loc(double lat, double lon) __attribute__((weak));
 extern "C" uint32_t ui_get_now_epoch() __attribute__((weak));
+
+// Reference location for distance-to-contact: live GPS if we have a fix,
+// otherwise the saved Home (item 8). (0,0) if neither is available.
+static void ui_ref_loc(double* lat, double* lon) {
+  double glat = 0, glon = 0;
+  if (ui_get_self_loc) ui_get_self_loc(&glat, &glon);
+  if (glat || glon) { *lat = glat; *lon = glon; return; }
+  double hlat = 0, hlon = 0;
+  if (ui_get_home_loc && ui_get_home_loc(&hlat, &hlon)) { *lat = hlat; *lon = hlon; return; }
+  *lat = 0; *lon = 0;
+}
 // Tenths-of-percent (0..1000) of the duty-cycle quota that has been
 // consumed in the current hour-window. 0 = idle, 1000 = throttled.
 extern "C" int  ui_get_duty_cycle_used_tenths() __attribute__((weak));
@@ -292,6 +412,25 @@ extern "C" uint8_t tpager_kb_last_raw();
 //   * freq-editor popup  (s_editing_idx == 0)  — digits + '.' + backspace
 //   * Messages tester    (s_input_active)      — anything goes
 extern "C" void ui_input_char(char c) {
+  // Map navigation (item: map controls). While the Map tile is open the
+  // QWERTY keys drive pan/zoom: W/A/S/D pan north/west/south/east, Z zooms
+  // in, X zooms out. Any handled key cancels the pending auto-GPS recenter
+  // so the view stays where the user put it.
+  if (s_active_tile == TILE_MAP) {
+    char k = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    bool handled = true;
+    switch (k) {
+      case 'w': map_screen_pan(0, -1); break;
+      case 's': map_screen_pan(0, +1); break;
+      case 'a': map_screen_pan(-1, 0); break;
+      case 'd': map_screen_pan(+1, 0); break;
+      case 'z': map_screen_zoom(+1); break;
+      case 'x': map_screen_zoom(-1); break;
+      default:  handled = false; break;
+    }
+    if (handled) { s_map_gps_switch_at = 0; return; }
+  }
+
   // Chat compose: when a chat view is open, the keyboard feeds the
   // compose buffer instead of any popup. Enter sends via the bridge;
   // '\b' pops; everything else (printable from the QWERTY + symbol
@@ -419,6 +558,11 @@ static void enter_subscreen(int idx) {
   lv_obj_add_flag(s_root, LV_OBJ_FLAG_HIDDEN);
   lv_obj_remove_flag(s_subscreen_root, LV_OBJ_FLAG_HIDDEN);
   lv_label_set_text(s_subscreen_title, TILES[idx].title);
+  // Title + its separator rules are shown by default; the Map case hides
+  // them (the map has its own status strip).
+  lv_obj_remove_flag(s_subscreen_title, LV_OBJ_FLAG_HIDDEN);
+  if (s_title_rule[0]) lv_obj_remove_flag(s_title_rule[0], LV_OBJ_FLAG_HIDDEN);
+  if (s_title_rule[1]) lv_obj_remove_flag(s_title_rule[1], LV_OBJ_FLAG_HIDDEN);
 
   // Default: simple body label visible, all per-tile containers hidden.
   lv_obj_remove_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
@@ -427,11 +571,13 @@ static void enter_subscreen(int idx) {
   if (s_dm_list)         lv_obj_add_flag(s_dm_list,         LV_OBJ_FLAG_HIDDEN);
   if (s_contacts_list)   lv_obj_add_flag(s_contacts_list,   LV_OBJ_FLAG_HIDDEN);
   if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
+  if (s_advert_root)     lv_obj_add_flag(s_advert_root,     LV_OBJ_FLAG_HIDDEN);
+  if (s_settings_list)   lv_obj_add_flag(s_settings_list,   LV_OBJ_FLAG_HIDDEN);
   if (s_disc_menu_popup) lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
   if (s_con_menu_popup)  lv_obj_add_flag(s_con_menu_popup,  LV_OBJ_FLAG_HIDDEN);
   if (s_ch_menu_popup)   lv_obj_add_flag(s_ch_menu_popup,   LV_OBJ_FLAG_HIDDEN);
   if (s_input_label)     lv_obj_add_flag(s_input_label,     LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_history)    lv_obj_add_flag(s_chat_history,    LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_scroll)     lv_obj_add_flag(s_chat_scroll,     LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose)    lv_obj_add_flag(s_chat_compose,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_counter)    lv_obj_add_flag(s_chat_counter,    LV_OBJ_FLAG_HIDDEN);
   map_screen_hide();
@@ -482,25 +628,53 @@ static void enter_subscreen(int idx) {
       if (enc && s_discovered_group) lv_indev_set_group(enc, s_discovered_group);
       return;
     }
-    case 5: {  // Map (S3.6 — Phase 2 raster, status strip owns the top row)
+    case 5: {  // Advert (item 2) — two buttons: Direct / Flood
       lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
-      // Hide the per-subscreen Pager name (the Map status strip takes
-      // its place) and the bottom edit-hint (no editable widgets in
-      // the Map view). Slide DC next to battery on the right so it
-      // doesn't collide with the MAP text on the left.
+      if (s_advert_root) lv_obj_remove_flag(s_advert_root, LV_OBJ_FLAG_HIDDEN);
+      if (enc && s_advert_group) {
+        lv_indev_set_group(enc, s_advert_group);
+        lv_group_focus_obj(lv_obj_get_child(s_advert_root, 0));
+      }
+      return;
+    }
+    case 6: {  // Map (S3.6 — Phase 2 raster, status strip owns the top row)
+      lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
+      // Hide the per-subscreen Pager name + title + rules (the Map status
+      // strip takes their place) and the bottom edit-hint (no editable
+      // widgets in the Map view). Slide DC next to battery on the right so
+      // it doesn't collide with the MAP text on the left.
       if (s_header_label) lv_obj_add_flag(s_header_label, LV_OBJ_FLAG_HIDDEN);
       if (s_back_hint)    lv_obj_add_flag(s_back_hint,    LV_OBJ_FLAG_HIDDEN);
+      if (s_subscreen_title) lv_obj_add_flag(s_subscreen_title, LV_OBJ_FLAG_HIDDEN);
+      if (s_title_rule[0]) lv_obj_add_flag(s_title_rule[0], LV_OBJ_FLAG_HIDDEN);
+      if (s_title_rule[1]) lv_obj_add_flag(s_title_rule[1], LV_OBJ_FLAG_HIDDEN);
       if (s_dc_label && s_battery_label) {
         lv_obj_align_to(s_dc_label, s_battery_label,
                         LV_ALIGN_OUT_LEFT_MID, -8, 0);
       }
+      // Centre on saved Home first (instant); fall back to live GPS if no
+      // Home is set. The loop hands off to live GPS after MAP_GPS_SWITCH_MS.
+      double clat = 0, clon = 0;
+      bool have_center = false;
+      if (ui_get_home_loc && ui_get_home_loc(&clat, &clon) && (clat || clon)) {
+        have_center = true;
+      } else if (ui_get_self_loc) {
+        ui_get_self_loc(&clat, &clon);
+        have_center = (clat || clon);
+      }
+      if (have_center) map_screen_set_center(clat, clon);
       map_screen_show();
+      s_map_gps_switch_at = millis() + MAP_GPS_SWITCH_MS;
       return;
     }
-    case 6:
-      snprintf(body, sizeof(body), "Settings\n\n(global editable list later)");
-      break;
-    case 7:
+    case 7: {  // Settings (item 8) — action-row list
+      lv_obj_add_flag(s_subscreen_body, LV_OBJ_FLAG_HIDDEN);
+      if (s_settings_list) lv_obj_remove_flag(s_settings_list, LV_OBJ_FLAG_HIDDEN);
+      settings_list_populate();
+      if (enc && s_settings_group) lv_indev_set_group(enc, s_settings_group);
+      return;
+    }
+    case 8:
       snprintf(body, sizeof(body), "MeshCore T-Pager\n%s\n\nLVGL %d.%d.%d",
                FIRMWARE_VERSION, LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
       break;
@@ -523,10 +697,12 @@ static void leave_subscreen() {
   if (s_dm_list)         lv_obj_add_flag(s_dm_list,         LV_OBJ_FLAG_HIDDEN);
   if (s_contacts_list)   lv_obj_add_flag(s_contacts_list,   LV_OBJ_FLAG_HIDDEN);
   if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
+  if (s_advert_root)     lv_obj_add_flag(s_advert_root,     LV_OBJ_FLAG_HIDDEN);
+  if (s_settings_list)   lv_obj_add_flag(s_settings_list,   LV_OBJ_FLAG_HIDDEN);
   if (s_disc_menu_popup) lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
   if (s_con_menu_popup)  lv_obj_add_flag(s_con_menu_popup,  LV_OBJ_FLAG_HIDDEN);
   if (s_ch_menu_popup)   lv_obj_add_flag(s_ch_menu_popup,   LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_history)    lv_obj_add_flag(s_chat_history,    LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_scroll)     lv_obj_add_flag(s_chat_scroll,     LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose)    lv_obj_add_flag(s_chat_compose,    LV_OBJ_FLAG_HIDDEN);
   if (s_chat_counter)    lv_obj_add_flag(s_chat_counter,    LV_OBJ_FLAG_HIDDEN);
   map_screen_hide();
@@ -611,6 +787,7 @@ static void radio_list_populate(NodePrefs* p, int focus_row) {
                                 LV_FLEX_ALIGN_CENTER);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);  // single-click (item 6)
     // The radio list is taller than the visible viewport (7 rows × ~26 px
     // each ≈ 182 px vs ~166 px of container). LVGL doesn't auto-scroll on
     // focus by default — add this flag so the focused row is always
@@ -705,10 +882,25 @@ static void channels_list_populate(int focus_row) {
     lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);  // single-click (item 6)
     lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
 
     lv_obj_t* lbl = lv_label_create(row);
     lv_label_set_text(lbl, text);
+
+    // Per-channel unread count (item 7), right-aligned in the row.
+    if (!is_add && data >= 0 && data < UI_MAX_CHANNELS && s_unread_ch[data] > 0) {
+      lv_obj_t* cnt = lv_label_create(row);
+      char cbuf[8];
+      snprintf(cbuf, sizeof(cbuf), "%u", (unsigned)s_unread_ch[data]);
+      lv_label_set_text(cnt, cbuf);
+      lv_obj_set_style_bg_color(cnt, lv_color_hex(0xe05050), 0);
+      lv_obj_set_style_bg_opa(cnt, LV_OPA_COVER, 0);
+      lv_obj_set_style_text_color(cnt, lv_color_hex(0xffffff), 0);
+      lv_obj_set_style_radius(cnt, 8, 0);
+      lv_obj_set_style_pad_hor(cnt, 5, 0);
+      lv_obj_align(cnt, LV_ALIGN_RIGHT_MID, -2, 0);
+    }
 
     lv_obj_add_event_cb(row, channel_row_clicked, LV_EVENT_CLICKED,
                         (void*)(intptr_t)data);
@@ -916,7 +1108,13 @@ static void chat_history_render() {
       lv_style_set_text_color(&sp->style, lv_color_hex(0x707880));
     }
   }
-  lv_obj_scroll_to_y(s_chat_history, INT16_MAX, LV_ANIM_OFF);   // pin to bottom
+  // Pin to bottom — force a layout pass first so the spangroup's content
+  // height (and thus the scroll extent) is up to date before scrolling.
+  if (s_chat_scroll) {
+    lv_spangroup_refr_mode(s_chat_history);
+    lv_obj_update_layout(s_chat_scroll);
+    lv_obj_scroll_to_y(s_chat_scroll, LV_COORD_MAX, LV_ANIM_OFF);
+  }
 }
 
 // Open DM chat view with a contact (S3.6d). Mirror of chat_view_open
@@ -927,6 +1125,9 @@ static void dm_chat_view_open(const uint8_t* pub_key, const char* peer_name) {
   s_chat_channel_idx = -1;
   s_dm_mode = true;
   memcpy(s_dm_pubkey, pub_key, 32);
+  if (ui_load_dm_history) ui_load_dm_history(pub_key);  // restore from SD
+  dm_unread_clear(pub_key);       // reading this thread clears its badge
+  update_tile_badges();
   strncpy(s_dm_peer_name, peer_name ? peer_name : "?",
           sizeof(s_dm_peer_name) - 1);
   s_dm_peer_name[sizeof(s_dm_peer_name) - 1] = 0;
@@ -938,7 +1139,7 @@ static void dm_chat_view_open(const uint8_t* pub_key, const char* peer_name) {
   if (s_dm_list)         lv_obj_add_flag(s_dm_list,         LV_OBJ_FLAG_HIDDEN);
   if (s_contacts_list)   lv_obj_add_flag(s_contacts_list,   LV_OBJ_FLAG_HIDDEN);
   if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_history) lv_obj_remove_flag(s_chat_history, LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_scroll) lv_obj_remove_flag(s_chat_scroll, LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose) lv_obj_remove_flag(s_chat_compose, LV_OBJ_FLAG_HIDDEN);
   if (s_chat_counter) lv_obj_remove_flag(s_chat_counter, LV_OBJ_FLAG_HIDDEN);
 
@@ -996,11 +1197,18 @@ static void chat_view_open(int channel_idx) {
   s_chat_channel_idx = channel_idx;
   s_dm_mode = false;        // make sure render takes the channel branch
   memset(s_dm_pubkey, 0, sizeof(s_dm_pubkey));
+  if (channel_idx >= 0 && channel_idx < UI_MAX_CHANNELS) {
+    s_unread_ch[channel_idx] = 0;   // reading clears this channel's badge
+    update_tile_badges();
+  }
+  // Restore persisted history from SD if the ring doesn't already hold it
+  // (e.g. first open after a reboot).
+  if (!chan_ring_has((uint8_t)channel_idx)) chan_persist_load((uint8_t)channel_idx);
   s_compose_buf[0] = 0;
   s_compose_len = 0;
   // Hide the channels list while the chat is active.
   if (s_channel_list) lv_obj_add_flag(s_channel_list, LV_OBJ_FLAG_HIDDEN);
-  if (s_chat_history) lv_obj_remove_flag(s_chat_history, LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_scroll) lv_obj_remove_flag(s_chat_scroll, LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose) lv_obj_remove_flag(s_chat_compose, LV_OBJ_FLAG_HIDDEN);
   if (s_chat_counter) lv_obj_remove_flag(s_chat_counter, LV_OBJ_FLAG_HIDDEN);
 
@@ -1028,7 +1236,7 @@ static void chat_view_close() {
   s_chat_channel_idx = -1;
   s_dm_mode = false;
   memset(s_dm_pubkey, 0, sizeof(s_dm_pubkey));
-  if (s_chat_history) lv_obj_add_flag(s_chat_history, LV_OBJ_FLAG_HIDDEN);
+  if (s_chat_scroll) lv_obj_add_flag(s_chat_scroll, LV_OBJ_FLAG_HIDDEN);
   if (s_chat_compose) lv_obj_add_flag(s_chat_compose, LV_OBJ_FLAG_HIDDEN);
   if (s_chat_counter) lv_obj_add_flag(s_chat_counter, LV_OBJ_FLAG_HIDDEN);
 
@@ -1055,6 +1263,25 @@ static void chat_view_close() {
 }
 
 // Append a message to the ring buffer. Older entries are evicted FIFO.
+// ---- Channel chat-history SD persistence -----------------------------------
+// One append-log per channel at /sd/ch_<idx>.dat. Each record is
+// [uint8 len][len bytes of text]. Loaded back into the ring on chat open.
+static bool s_chan_loading = false;   // suppress re-persist while loading
+
+static void chan_persist_append(uint8_t idx, const char* text) {
+  if (s_chan_loading || !text || !sd_init()) return;
+  char path[24];
+  snprintf(path, sizeof(path), "/sd/ch_%u.dat", (unsigned)idx);
+  FILE* f = fopen(path, "ab");
+  if (!f) return;
+  size_t L = strlen(text);
+  if (L > 95) L = 95;                 // matches ChatMsg.text[96]
+  uint8_t len = (uint8_t)L;
+  fwrite(&len, 1, 1, f);
+  fwrite(text, 1, L, f);
+  fclose(f);
+}
+
 static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char* text) {
   if (!ensure_chat_ring()) return;
   ChatMsg& slot = s_chat_ring[s_chat_head];
@@ -1066,6 +1293,42 @@ static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char* 
   slot.text[n] = 0;
   s_chat_head = (s_chat_head + 1) % CHAT_RING_SIZE;
   if (s_chat_count < CHAT_RING_SIZE) s_chat_count++;
+  chan_persist_append(channel_idx, text);
+}
+
+// Load a channel's persisted history into the ring (oldest-first), keeping
+// only the last CHAT_RING_SIZE records. Called when opening a channel chat
+// whose history isn't already in the ring (e.g. after reboot).
+static void chan_persist_load(uint8_t idx) {
+  if (!sd_init()) return;
+  char path[24];
+  snprintf(path, sizeof(path), "/sd/ch_%u.dat", (unsigned)idx);
+  FILE* f = fopen(path, "rb");
+  if (!f) return;
+  static char ring[CHAT_RING_SIZE][96];
+  int n = 0;
+  uint8_t len;
+  while (fread(&len, 1, 1, f) == 1) {
+    if (len > 95) break;
+    char buf[96];
+    if (fread(buf, 1, len, f) != len) break;
+    buf[len] = 0;
+    memcpy(ring[n % CHAT_RING_SIZE], buf, len + 1);
+    n++;
+  }
+  fclose(f);
+  int start = n > CHAT_RING_SIZE ? n - CHAT_RING_SIZE : 0;
+  s_chan_loading = true;
+  for (int i = start; i < n; i++) chat_ring_push(idx, 0, ring[i % CHAT_RING_SIZE]);
+  s_chan_loading = false;
+}
+
+// True if the ring already holds at least one message for this channel.
+static bool chan_ring_has(uint8_t idx) {
+  if (!s_chat_ring) return false;
+  for (int i = 0; i < s_chat_count; i++)
+    if (s_chat_ring[i].channel_idx == idx) return true;
+  return false;
 }
 
 // Called by MyMesh::onChannelMessageRecv. Single-threaded with the LVGL
@@ -1074,8 +1337,12 @@ static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char* 
 extern "C" void ui_on_channel_message(int channel_idx, uint32_t timestamp, const char* text) {
   if (!text) return;
   chat_ring_push((uint8_t)channel_idx, timestamp, text);
-  if (s_chat_open && s_chat_channel_idx == channel_idx) {
+  bool viewing = s_chat_open && !s_dm_mode && s_chat_channel_idx == channel_idx;
+  if (viewing) {
     chat_history_render();
+  } else if (channel_idx >= 0 && channel_idx < UI_MAX_CHANNELS) {
+    if (s_unread_ch[channel_idx] < 0xFFFF) s_unread_ch[channel_idx]++;
+    update_tile_badges();
   }
 }
 
@@ -1138,7 +1405,7 @@ static void contacts_list_populate() {
   if (s_contacts_group) lv_group_remove_all_objs(s_contacts_group);
 
   double self_lat = 0, self_lon = 0;
-  if (ui_get_self_loc) ui_get_self_loc(&self_lat, &self_lon);
+  ui_ref_loc(&self_lat, &self_lon);   // GPS, else saved Home (item 8)
   uint32_t now = ui_get_now_epoch ? ui_get_now_epoch() : 0;
 
   // Header row — same column widths as the data rows below. Non-
@@ -1212,6 +1479,7 @@ static void contacts_list_populate() {
     lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);  // single-click (item 6)
     lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
@@ -1329,15 +1597,32 @@ static void dm_list_populate() {
     lv_obj_set_style_margin_bottom(row, 1, 0);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);  // single-click (item 6)
     lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
     lv_obj_add_event_cb(row, back_long_press_event, LV_EVENT_LONG_PRESSED, NULL);
     lv_obj_add_event_cb(row, dm_row_clicked, LV_EVENT_CLICKED,
                         (void*)(intptr_t)i);
 
+    uint16_t unread = dm_unread_get(ci.pub_key);
+
     lv_obj_t* lbl = lv_label_create(row);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(lbl, lv_pct(95));
+    lv_obj_set_width(lbl, lv_pct(unread > 0 ? 80 : 95));
     lv_label_set_text(lbl, ci.name);
+
+    // Per-DM unread count (item 7), right-aligned in the row.
+    if (unread > 0) {
+      lv_obj_t* cnt = lv_label_create(row);
+      char cbuf[8];
+      snprintf(cbuf, sizeof(cbuf), "%u", (unsigned)unread);
+      lv_label_set_text(cnt, cbuf);
+      lv_obj_set_style_bg_color(cnt, lv_color_hex(0xe05050), 0);
+      lv_obj_set_style_bg_opa(cnt, LV_OPA_COVER, 0);
+      lv_obj_set_style_text_color(cnt, lv_color_hex(0xffffff), 0);
+      lv_obj_set_style_radius(cnt, 8, 0);
+      lv_obj_set_style_pad_hor(cnt, 5, 0);
+      lv_obj_align(cnt, LV_ALIGN_RIGHT_MID, -2, 0);
+    }
 
     if (s_dm_list_group) lv_group_add_obj(s_dm_list_group, row);
   }
@@ -1348,9 +1633,16 @@ static void dm_list_populate() {
 // peer. Called from chat_history_render which checks s_chat_open
 // + s_dm_mode + matching pubkey via a separate weak hook.
 extern "C" void ui_refresh_open_dm(const uint8_t* pub_key) {
-  if (!s_chat_open || !s_dm_mode) return;
-  if (memcmp(s_dm_pubkey, pub_key, 32) != 0) return;
-  chat_history_render();
+  bool viewing = s_chat_open && s_dm_mode &&
+                 memcmp(s_dm_pubkey, pub_key, 32) == 0;
+  if (viewing) {
+    chat_history_render();
+  } else {
+    // New DM for a peer we're not currently looking at — bump its unread
+    // counter (keyed by the first 8 bytes of the pub_key) + refresh badges.
+    dm_unread_bump(pub_key);
+    update_tile_badges();
+  }
 }
 
 // ---------- Discovered tile (S3.6b) -----------------------------------------
@@ -1366,11 +1658,35 @@ static void disc_row_clicked(lv_event_t* e) {
   disc_menu_show(idx);
 }
 
-// "+ Send advert" row click handler. user_data carries 0 for zero-hop,
-// 1 for flood.
-static void send_advert_row_clicked(lv_event_t* e) {
+// ---- Toast (item 2) — transient centered message, auto-closes after 3 s ----
+static void toast_timer_cb(lv_timer_t* t) {
+  if (s_toast_popup) lv_obj_add_flag(s_toast_popup, LV_OBJ_FLAG_HIDDEN);
+  lv_timer_delete(t);
+  s_toast_timer = nullptr;
+}
+
+static void ui_toast(const char* msg) {
+  if (!s_toast_popup || !s_toast_label) return;
+  lv_label_set_text(s_toast_label, msg);
+  lv_obj_remove_flag(s_toast_popup, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_toast_popup);
+  // Restart the 3 s one-shot if a previous toast is still up. The callback
+  // deletes the timer itself (so no repeat-count auto-delete — that would
+  // double-free).
+  if (s_toast_timer) lv_timer_delete(s_toast_timer);
+  s_toast_timer = lv_timer_create(toast_timer_cb, 3000, nullptr);
+}
+
+// Advert button click (item 2). user_data carries 0 for direct (zero-hop),
+// 1 for flood. Fires the self-advert and shows a 3 s confirmation toast.
+static void advert_btn_clicked(lv_event_t* e) {
   bool flood = (bool)(intptr_t)lv_event_get_user_data(e);
-  if (ui_send_self_advert) ui_send_self_advert(flood);
+  bool ok = ui_send_self_advert ? ui_send_self_advert(flood) : false;
+  if (ok) {
+    ui_toast(flood ? "Advert verstuurd\n(flood)" : "Advert verstuurd\n(direct)");
+  } else {
+    ui_toast("Advert mislukt");
+  }
 }
 
 static void discovered_list_populate() {
@@ -1379,40 +1695,9 @@ static void discovered_list_populate() {
   if (s_discovered_group) lv_group_remove_all_objs(s_discovered_group);
 
   double self_lat = 0, self_lon = 0;
-  if (ui_get_self_loc) ui_get_self_loc(&self_lat, &self_lon);
+  ui_ref_loc(&self_lat, &self_lon);   // GPS, else saved Home (item 8)
 
-  // "+ Send advert" action rows — top of list so they're always reachable
-  // even with a long node list. Two variants: direct (zero-hop, neighbours
-  // only) and flood (relayed beyond direct reach).
-  auto add_action_row = [&](const char* text, bool flood) {
-    lv_obj_t* row = lv_obj_create(s_discovered_list);
-    lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, lv_pct(100), 22);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
-    // Match the data-row text color (light grey normal, orange focused)
-    // so the focus transition is visible — otherwise orange-on-grey
-    // looks identical to orange-on-grey when focused.
-    lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
-    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
-    lv_obj_set_style_pad_hor(row, 6, 0);
-    lv_obj_set_style_radius(row, 4, 0);
-    lv_obj_set_style_margin_bottom(row, 1, 0);
-    lv_obj_set_style_border_color(row, lv_color_hex(0x303a47), 0);
-    lv_obj_set_style_border_width(row, 1, 0);
-    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
-    lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
-    lv_obj_add_event_cb(row, send_advert_row_clicked, LV_EVENT_CLICKED,
-                        (void*)(intptr_t)(flood ? 1 : 0));
-    lv_obj_add_event_cb(row, back_long_press_event, LV_EVENT_LONG_PRESSED, NULL);
-    lv_obj_t* lbl = lv_label_create(row);
-    lv_label_set_text(lbl, text);
-    if (s_discovered_group) lv_group_add_obj(s_discovered_group, row);
-  };
-  add_action_row("+ Send advert (direct)", false);
-  add_action_row("+ Send advert (flood)",  true);
+  // (Send-advert moved to its own "Advert" carousel tile — item 2.)
 
   // Header (same widths as Contacts — column constants are shared).
   {
@@ -1468,6 +1753,7 @@ static void discovered_list_populate() {
     lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);  // single-click (item 6)
     lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
@@ -1806,6 +2092,122 @@ static void back_long_press_event(lv_event_t* /*e*/) {
   }
 }
 
+// ---------- Settings tile (item 8) ------------------------------------------
+//
+// A list of action rows. Home save/clear is the core feature (distance
+// reference); the rest are shortcuts / a software screen-sleep saver.
+// Backlight dimming + haptics need new AW9364/DRV2605 drivers not present
+// in this firmware, so they are intentionally omitted for now.
+enum {
+  SET_SAVE_HOME = 0,
+  SET_HOME_INFO,      // click = clear home
+  SET_SCREEN_OFF,     // click = cycle timeout
+  SET_RADIO,          // jump to Radio settings
+  SET_TIME,           // display (UTC) — click refreshes
+  SET_ABOUT,          // jump to About
+};
+
+static void settings_row_clicked(lv_event_t* e) {
+  int act = (int)(intptr_t)lv_event_get_user_data(e);
+  switch (act) {
+    case SET_SAVE_HOME: {
+      double lat = 0, lon = 0;
+      if (ui_get_self_loc) ui_get_self_loc(&lat, &lon);
+      if ((lat || lon) && ui_set_home_loc) {
+        ui_set_home_loc(lat, lon);
+        ui_toast("Home opgeslagen");
+      } else {
+        ui_toast("Geen GPS-fix\nGeen home opgeslagen");
+      }
+      break;
+    }
+    case SET_HOME_INFO:
+      if (ui_set_home_loc) { ui_set_home_loc(0, 0); ui_toast("Home gewist"); }
+      break;
+    case SET_SCREEN_OFF:
+      if      (s_screen_off_ms <  60000UL)  s_screen_off_ms =  60000UL;
+      else if (s_screen_off_ms < 120000UL)  s_screen_off_ms = 120000UL;
+      else if (s_screen_off_ms < 300000UL)  s_screen_off_ms = 300000UL;
+      else                                   s_screen_off_ms =  30000UL;
+      break;
+    case SET_RADIO:
+      enter_subscreen(TILE_RADIO);   // swaps groups itself
+      return;
+    case SET_ABOUT:
+      enter_subscreen(TILE_ABOUT);
+      return;
+    default:
+      break;
+  }
+  settings_list_populate();   // refresh dynamic labels
+}
+
+static void settings_list_populate() {
+  if (!s_settings_list) return;
+  lv_obj_clean(s_settings_list);
+  if (s_settings_group) lv_group_remove_all_objs(s_settings_group);
+
+  auto build_row = [&](const char* text, int act) -> lv_obj_t* {
+    lv_obj_t* row = lv_obj_create(s_settings_list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), 26);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
+    lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
+    lv_obj_set_style_pad_hor(row, 8, 0);
+    lv_obj_set_style_pad_ver(row, 2, 0);
+    lv_obj_set_style_radius(row, 4, 0);
+    lv_obj_set_style_margin_bottom(row, 2, 0);
+    lv_obj_set_style_border_color(row, lv_color_hex(0x303a47), 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);  // single-click (item 6)
+    lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    lv_obj_t* lbl = lv_label_create(row);
+    lv_label_set_text(lbl, text);
+    lv_obj_add_event_cb(row, settings_row_clicked, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)act);
+    lv_obj_add_event_cb(row, back_long_press_event, LV_EVENT_LONG_PRESSED, NULL);
+    if (s_settings_group) lv_group_add_obj(s_settings_group, row);
+    return row;
+  };
+
+  char buf[48];
+
+  lv_obj_t* first = build_row("Save home = current GPS", SET_SAVE_HOME);
+
+  double hlat = 0, hlon = 0;
+  bool have_home = ui_get_home_loc && ui_get_home_loc(&hlat, &hlon);
+  if (have_home) {
+    snprintf(buf, sizeof(buf), "Home: %.4f, %.4f  (clear)", hlat, hlon);
+  } else {
+    snprintf(buf, sizeof(buf), "Home: (not set)");
+  }
+  build_row(buf, SET_HOME_INFO);
+
+  snprintf(buf, sizeof(buf), "Screen off: %lus", s_screen_off_ms / 1000UL);
+  build_row(buf, SET_SCREEN_OFF);
+
+  build_row("Radio settings " LV_SYMBOL_RIGHT, SET_RADIO);
+
+  uint32_t ep = ui_get_now_epoch ? ui_get_now_epoch() : 0;
+  if (ep > 0) {
+    snprintf(buf, sizeof(buf), "Time UTC: %02u:%02u:%02u",
+             (unsigned)((ep / 3600) % 24), (unsigned)((ep / 60) % 60),
+             (unsigned)(ep % 60));
+  } else {
+    snprintf(buf, sizeof(buf), "Time UTC: (no clock)");
+  }
+  build_row(buf, SET_TIME);
+
+  build_row("About " LV_SYMBOL_RIGHT, SET_ABOUT);
+
+  lv_group_focus_obj(first);
+}
+
 // ---------- UI construction --------------------------------------------------
 
 static void build_ui() {
@@ -1860,6 +2262,24 @@ static void build_ui() {
                         (void*)(intptr_t)i);
 
     s_tile_buttons[i] = btn;
+
+    // Unread badge (item 7) — only on the Channels + DM tiles. Small red
+    // pill pinned to the top-right corner of the tile, hidden until there
+    // is unread traffic.
+    if (i == TILE_CHANNELS || i == TILE_DM) {
+      lv_obj_t* badge = lv_label_create(btn);
+      lv_obj_add_flag(badge, LV_OBJ_FLAG_IGNORE_LAYOUT);  // absolute, not flex
+      lv_label_set_text(badge, "");
+      lv_obj_set_style_bg_color(badge, lv_color_hex(0xe05050), 0);
+      lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+      lv_obj_set_style_text_color(badge, lv_color_hex(0xffffff), 0);
+      lv_obj_set_style_radius(badge, 8, 0);
+      lv_obj_set_style_pad_hor(badge, 5, 0);
+      lv_obj_set_style_pad_ver(badge, 1, 0);
+      lv_obj_align(badge, LV_ALIGN_TOP_RIGHT, -4, 4);
+      lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
+      s_tile_badges[i] = badge;
+    }
   }
 
   // < > arrow hints below the row
@@ -1873,16 +2293,9 @@ static void build_ui() {
   lv_obj_set_style_text_color(arrow_r, lv_color_hex(0x80868f), 0);
   lv_obj_align_to(arrow_r, s_tile_row, LV_ALIGN_OUT_RIGHT_MID, 2, 0);
 
-  s_title_label = lv_label_create(s_root);
-  lv_label_set_text(s_title_label, TILES[0].title);
-  lv_obj_set_style_text_color(s_title_label, lv_color_hex(0xffffff), 0);
-  lv_obj_align_to(s_title_label, s_tile_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
-
-  // Footer hint
-  lv_obj_t* hint = lv_label_create(s_root);
-  lv_label_set_text(hint, "rotate: scroll   click: open   long: back   3s: power off");
-  lv_obj_set_style_text_color(hint, lv_color_hex(0x707880), 0);
-  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -4);
+  // (Removed: the duplicated tile title + the static hint line that used to
+  //  sit under the carousel — item 1. The orange focus border + < > arrows
+  //  are the remaining affordances.)
 
   // ---- Sub-screen container (hidden by default) ----
   s_subscreen_root = lv_obj_create(scr);
@@ -1898,6 +2311,19 @@ static void build_ui() {
   lv_label_set_text(s_subscreen_title, "...");
   lv_obj_set_style_text_color(s_subscreen_title, lv_color_hex(0xFAA61A), 0);
   lv_obj_align(s_subscreen_title, LV_ALIGN_TOP_LEFT, 6, 24);
+
+  // Thin horizontal rules above and below the title (item 3) — improves
+  // readability of "line 1 = node name / line 2 = tile title". Anchored to
+  // the subscreen root so they render on every subscreen that shows a title.
+  for (int yk = 0; yk < 2; yk++) {
+    lv_obj_t* rule = lv_obj_create(s_subscreen_root);
+    lv_obj_remove_style_all(rule);
+    lv_obj_set_size(rule, lv_pct(96), 2);
+    lv_obj_align(rule, LV_ALIGN_TOP_LEFT, 6, yk == 0 ? 20 : 42);
+    lv_obj_set_style_bg_color(rule, lv_color_hex(0x404a55), 0);
+    lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
+    s_title_rule[yk] = rule;
+  }
 
   s_subscreen_body = lv_label_create(s_subscreen_root);
   lv_label_set_text(s_subscreen_body, "");
@@ -1982,21 +2408,77 @@ static void build_ui() {
 
   s_discovered_group = lv_group_create();
 
+  // Advert subscreen (item 2) — two big buttons: Direct / Flood. Built once,
+  // hidden by default; shown by enter_subscreen(TILE_ADVERT).
+  s_advert_root = lv_obj_create(s_subscreen_root);
+  lv_obj_remove_style_all(s_advert_root);
+  lv_obj_set_size(s_advert_root, lv_pct(96), lv_pct(70));
+  lv_obj_align(s_advert_root, LV_ALIGN_TOP_LEFT, 6, 44);
+  lv_obj_set_flex_flow(s_advert_root, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(s_advert_root, LV_FLEX_ALIGN_CENTER,
+                                       LV_FLEX_ALIGN_CENTER,
+                                       LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(s_advert_root, 16, 0);
+  lv_obj_set_style_bg_color(s_advert_root, lv_color_hex(0x0e141b), 0);
+  lv_obj_add_flag(s_advert_root, LV_OBJ_FLAG_HIDDEN);
+  s_advert_group = lv_group_create();
+  {
+    static const struct { const char* text; bool flood; } advert_btns[] = {
+      { "Direct advert", false },
+      { "Flood advert",  true  },
+    };
+    for (auto& ab : advert_btns) {
+      lv_obj_t* btn = lv_button_create(s_advert_root);
+      lv_obj_set_size(btn, lv_pct(80), 48);
+      style_popup_button(btn);
+      lv_obj_t* lbl = lv_label_create(btn);
+      lv_label_set_text(lbl, ab.text);
+      lv_obj_center(lbl);
+      lv_obj_add_event_cb(btn, advert_btn_clicked, LV_EVENT_CLICKED,
+                          (void*)(intptr_t)(ab.flood ? 1 : 0));
+      lv_obj_add_event_cb(btn, back_long_press_event, LV_EVENT_LONG_PRESSED, NULL);
+      lv_group_add_obj(s_advert_group, btn);
+    }
+  }
+
+  // Settings list (item 8) — action rows, same shape as the radio list.
+  s_settings_list = lv_obj_create(s_subscreen_root);
+  lv_obj_remove_style_all(s_settings_list);
+  lv_obj_set_size(s_settings_list, lv_pct(96), lv_pct(70));
+  lv_obj_align(s_settings_list, LV_ALIGN_TOP_LEFT, 6, 44);
+  lv_obj_set_flex_flow(s_settings_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_bg_color(s_settings_list, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_pad_all(s_settings_list, 2, 0);
+  lv_obj_set_scroll_dir(s_settings_list, LV_DIR_VER);
+  lv_obj_add_flag(s_settings_list, LV_OBJ_FLAG_HIDDEN);
+  s_settings_group = lv_group_create();
+
   // Chat-view widgets — history label (top, scrollable) + compose
   // label (bottom). Both hidden until chat_view_open() shows them.
   // Chat history is a spangroup so individual messages can mix colors
   // (green sender prefix + grey body). Spans are rebuilt by
   // chat_history_render on every change.
-  s_chat_history = lv_spangroup_create(s_subscreen_root);
+  // A spangroup itself is not scrollable (its spans aren't child objects,
+  // so lv_obj sees no scrollable extent). Wrap it in a scrollable lv_obj
+  // and scroll that with the encoder; the spangroup grows to its content.
+  s_chat_scroll = lv_obj_create(s_subscreen_root);
+  lv_obj_remove_style_all(s_chat_scroll);
+  lv_obj_set_size(s_chat_scroll, lv_pct(96), lv_pct(60));
+  lv_obj_align(s_chat_scroll, LV_ALIGN_TOP_LEFT, 6, 44);
+  lv_obj_set_style_bg_color(s_chat_scroll, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_bg_opa(s_chat_scroll, LV_OPA_COVER, 0);
+  lv_obj_set_style_pad_all(s_chat_scroll, 0, 0);
+  lv_obj_add_flag(s_chat_scroll, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(s_chat_scroll, LV_DIR_VER);
+  lv_obj_add_flag(s_chat_scroll, LV_OBJ_FLAG_HIDDEN);
+
+  s_chat_history = lv_spangroup_create(s_chat_scroll);
   lv_obj_remove_style_all(s_chat_history);
-  lv_obj_set_size(s_chat_history, lv_pct(96), lv_pct(60));
-  lv_obj_align(s_chat_history, LV_ALIGN_TOP_LEFT, 6, 44);
+  lv_obj_set_width(s_chat_history, lv_pct(100));
+  lv_obj_set_height(s_chat_history, LV_SIZE_CONTENT);
+  lv_obj_set_pos(s_chat_history, 0, 0);
   lv_spangroup_set_mode(s_chat_history, LV_SPAN_MODE_BREAK);
   lv_obj_set_style_text_color(s_chat_history, lv_color_hex(0xc0c8d0), 0);
-  lv_obj_set_style_bg_color(s_chat_history, lv_color_hex(0x0e141b), 0);
-  lv_obj_add_flag(s_chat_history, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scroll_dir(s_chat_history, LV_DIR_VER);
-  lv_obj_add_flag(s_chat_history, LV_OBJ_FLAG_HIDDEN);
 
   s_chat_compose = lv_label_create(s_subscreen_root);
   lv_obj_set_size(s_chat_compose, lv_pct(96), 24);
@@ -2039,6 +2521,23 @@ static void build_ui() {
   lv_label_set_text(s_battery_label, "");
   lv_obj_set_style_text_color(s_battery_label, lv_color_hex(0xc0c8d0), 0);
   lv_obj_align(s_battery_label, LV_ALIGN_TOP_RIGHT, -6, 4);
+
+  // Toast popup (item 2) — small centered label, hidden until ui_toast().
+  s_toast_popup = lv_obj_create(scr);
+  lv_obj_set_size(s_toast_popup, lv_pct(70), LV_SIZE_CONTENT);
+  lv_obj_center(s_toast_popup);
+  lv_obj_set_style_bg_color(s_toast_popup, lv_color_hex(0x1c2530), 0);
+  lv_obj_set_style_border_width(s_toast_popup, 2, 0);
+  lv_obj_set_style_border_color(s_toast_popup, lv_color_hex(0xFAA61A), 0);
+  lv_obj_set_style_radius(s_toast_popup, 8, 0);
+  lv_obj_set_style_pad_all(s_toast_popup, 14, 0);
+  lv_obj_clear_flag(s_toast_popup, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(s_toast_popup, LV_OBJ_FLAG_HIDDEN);
+  s_toast_label = lv_label_create(s_toast_popup);
+  lv_label_set_text(s_toast_label, "");
+  lv_obj_set_style_text_color(s_toast_label, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_align(s_toast_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_center(s_toast_label);
 
   // Edit popup (overlay) — hidden by default, shown by radio_item_clicked.
   s_edit_popup = lv_obj_create(scr);
@@ -2227,7 +2726,7 @@ static void build_ui() {
   }
 
   s_back_hint = lv_label_create(s_subscreen_root);
-  lv_label_set_text(s_back_hint, "click or dbl-click: edit   long-press: back");
+  lv_label_set_text(s_back_hint, "click: open   long-press: back");
   lv_obj_set_style_text_color(s_back_hint, lv_color_hex(0x707880), 0);
   lv_obj_align(s_back_hint, LV_ALIGN_BOTTOM_MID, 0, -4);
 
@@ -2245,7 +2744,6 @@ static void focused_changed_cb(lv_event_t* e) {
   lv_obj_t* obj = (lv_obj_t*)lv_event_get_target(e);
   for (int i = 0; i < NUM_TILES; i++) {
     if (s_tile_buttons[i] == obj) {
-      lv_label_set_text(s_title_label, TILES[i].title);
       lv_obj_scroll_to_view(obj, LV_ANIM_OFF);   // snap — no animation queue
       break;
     }
@@ -2258,7 +2756,7 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* pr
   _display = display;
   _sensors = sensors;
   _prefs = prefs;
-  _auto_off = millis() + AUTO_OFF_MILLIS;
+  _auto_off = millis() + s_screen_off_ms;
   s_self = this;
 
   if (_display) _display->turnOn();
@@ -2306,25 +2804,25 @@ void UITask::loop() {
     // invert the encoder delta while we're not on the horizontal carousel.
     int sign = s_in_subscreen ? -1 : 1;
     while (s_quad_accum >= 4)  {
-      if (s_chat_open && s_chat_history) {
-        // In chat view encoder = scroll the history label (LVGL otherwise
-        // moves focus, but there's no useful group here).
-        lv_obj_scroll_by(s_chat_history, 0, -20, LV_ANIM_OFF);
+      if (s_chat_open && s_chat_scroll) {
+        // In chat view the encoder scrolls the history wrapper (the
+        // spangroup grows inside it). Rotate up = scroll up.
+        lv_obj_scroll_by(s_chat_scroll, 0, 28, LV_ANIM_OFF);
       } else {
         tpager_lvgl_encoder_delta(+1 * sign);
       }
       s_quad_accum -= 4;
     }
     while (s_quad_accum <= -4) {
-      if (s_chat_open && s_chat_history) {
-        lv_obj_scroll_by(s_chat_history, 0, +20, LV_ANIM_OFF);
+      if (s_chat_open && s_chat_scroll) {
+        lv_obj_scroll_by(s_chat_scroll, 0, -28, LV_ANIM_OFF);   // rotate down = scroll down
       } else {
         tpager_lvgl_encoder_delta(-1 * sign);
       }
       s_quad_accum += 4;
     }
 
-    _auto_off = millis() + AUTO_OFF_MILLIS;
+    _auto_off = millis() + s_screen_off_ms;
     if (_display && !_display->isOn()) _display->turnOn();
   }
 #endif
@@ -2383,7 +2881,7 @@ void UITask::loop() {
         }
       }
     }
-    _auto_off = millis() + AUTO_OFF_MILLIS;
+    _auto_off = millis() + s_screen_off_ms;
     if (_display && !_display->isOn()) _display->turnOn();
     s_prev_btn = btn;
   }
@@ -2415,6 +2913,21 @@ void UITask::loop() {
       (long)(millis() - s_discovered_next_refresh) >= 0) {
     s_discovered_next_refresh = millis() + 5000;
     discovered_list_populate();
+  }
+  // Map (item 5): after opening on Home, hand off to live GPS once the
+  // dwell timer elapses and a fix is available.
+  if (s_active_tile == TILE_MAP && s_map_gps_switch_at &&
+      (long)(millis() - s_map_gps_switch_at) >= 0) {
+    s_map_gps_switch_at = 0;   // one-shot
+    double glat = 0, glon = 0;
+    if (ui_get_self_loc) ui_get_self_loc(&glat, &glon);
+    if (glat || glon) map_screen_set_center(glat, glon);
+  }
+  // Live sat-count refresh on the Map status strip (no tile reload).
+  if (s_active_tile == TILE_MAP &&
+      (long)(millis() - s_map_status_next) >= 0) {
+    s_map_status_next = millis() + 2000;
+    map_screen_refresh_status();
   }
 
   // Periodically refresh battery + header data on the carousel + sub-screen.
@@ -2451,6 +2964,7 @@ void UITask::loop() {
     if (s_header_label && _prefs && _prefs->node_name[0]) {
       lv_label_set_text(s_header_label, _prefs->node_name);
     }
+    update_tile_badges();   // keep unread badges in sync (item 7)
     // If sub-screen is showing Radio details (idx 0), refresh body
     if (s_in_subscreen && s_subscreen_body && _prefs) {
       // Quick-and-dirty: re-render the body if title matches "Radio".
