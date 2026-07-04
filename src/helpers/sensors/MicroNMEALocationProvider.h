@@ -223,7 +223,11 @@ public :
             if (!_time_sync_needed && _clock != NULL && (millis() - _last_time_sync) > TIME_SYNC_INTERVAL) {
                 _time_sync_needed = true;
             }
-            if (_time_sync_needed && time_valid > 2) {
+            // Only sync once the GPS has a plausible full date (year >= 2024).
+            // A position fix (isValid) can go true from GGA — which carries
+            // time but no date — a moment before RMC delivers the date, so
+            // syncing too eagerly can write a garbage/stale date to the RTC.
+            if (_time_sync_needed && time_valid > 2 && nmea.getYear() >= 2024) {
                 if (_clock != NULL) {
                     _clock->setCurrentTime(getTimestamp());
                     _time_sync_needed = false;
