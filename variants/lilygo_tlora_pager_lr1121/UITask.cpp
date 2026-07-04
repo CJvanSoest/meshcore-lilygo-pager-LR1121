@@ -374,6 +374,9 @@ extern "C" bool ui_toggle_favorite(const uint8_t* pub_key) __attribute__((weak))
 extern "C" int  ui_get_discovered_count() __attribute__((weak));
 extern "C" bool ui_get_discovered_info(int idx, UiContact* out) __attribute__((weak));
 extern "C" bool ui_add_discovered_to_contacts(int idx, bool favorite) __attribute__((weak));
+extern "C" bool ui_add_contact_by_key(const uint8_t* pub_key, const char* name,
+                                      uint8_t type, int32_t lat, int32_t lon,
+                                      bool favorite) __attribute__((weak));
 // DM bridges (S3.6d).
 struct UiDmMsg {
   char     text[120];
@@ -1795,8 +1798,26 @@ static void advert_btn_clicked(lv_event_t* e) {
   }
 }
 
+// Pack the first 4 pub_key bytes into a row's user_data so focus can be
+// restored to the same node across a rebuild (the list re-sorts by recency,
+// so a plain index/scroll snapshot would jump to a different node).
+static inline uint32_t disc_row_id(const uint8_t* pk) {
+  return (uint32_t)pk[0] | ((uint32_t)pk[1] << 8) |
+         ((uint32_t)pk[2] << 16) | ((uint32_t)pk[3] << 24);
+}
+
 static void discovered_list_populate() {
   if (!s_discovered_list || !ui_get_discovered_count) return;
+
+  // Remember which node was focused so the periodic refresh doesn't yank the
+  // user back to the top of the list mid-scroll.
+  uint32_t keep_id = 0;
+  bool have_keep = false;
+  if (s_discovered_group) {
+    lv_obj_t* foc = lv_group_get_focused(s_discovered_group);
+    if (foc) { keep_id = (uint32_t)(uintptr_t)lv_obj_get_user_data(foc); have_keep = (keep_id != 0); }
+  }
+
   lv_obj_clean(s_discovered_list);
   if (s_discovered_group) lv_group_remove_all_objs(s_discovered_group);
 
@@ -1869,6 +1890,7 @@ static void discovered_list_populate() {
     lv_obj_add_event_cb(row, back_long_press_event, LV_EVENT_LONG_PRESSED, NULL);
     lv_obj_add_event_cb(row, disc_row_clicked, LV_EVENT_CLICKED,
                         (void*)(intptr_t)i);
+    lv_obj_set_user_data(row, (void*)(uintptr_t)disc_row_id(ci.pub_key));
 
     lv_obj_t* lbl_role = lv_label_create(row);
     lv_obj_set_width(lbl_role, CON_COL_ROLE);
@@ -1915,6 +1937,19 @@ static void discovered_list_populate() {
 
     if (s_discovered_group) lv_group_add_obj(s_discovered_group, row);
   }
+
+  // Restore focus (and scroll) to the node the user was on before the rebuild.
+  if (have_keep && s_discovered_group) {
+    uint32_t cnt = lv_obj_get_child_count(s_discovered_list);
+    for (uint32_t c = 0; c < cnt; c++) {
+      lv_obj_t* row = lv_obj_get_child(s_discovered_list, c);
+      if ((uint32_t)(uintptr_t)lv_obj_get_user_data(row) == keep_id) {
+        lv_group_focus_obj(row);
+        lv_obj_scroll_to_view(row, LV_ANIM_OFF);
+        break;
+      }
+    }
+  }
 }
 
 // 3-option popup for clicked Discovered row. Maintained as a single
@@ -1931,9 +1966,17 @@ static void disc_menu_close() {
   }
 }
 
+// Target captured when the popup opens, by identity (not list index), so a
+// background re-sort of the discovered list can't make "Add" land on the
+// wrong node. Also carries the advertised coords into the new contact.
+static UiContact s_disc_menu_contact;
+static bool      s_disc_menu_valid = false;
+
 static void disc_menu_show(int disc_idx) {
   if (!s_disc_menu_popup) return;
   s_disc_menu_pubidx = disc_idx;
+  s_disc_menu_valid = (ui_get_discovered_info &&
+                       ui_get_discovered_info(disc_idx, &s_disc_menu_contact));
   lv_obj_remove_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(s_disc_menu_popup);
   lv_indev_t* enc = tpager_lvgl_get_encoder();
@@ -2720,10 +2763,20 @@ static void build_ui() {
       for (int i = 0; i < 3; i++) if (s_disc_menu_buttons[i] == tgt) which = i;
       if (which < 0 || s_disc_menu_pubidx < 0) { disc_menu_close(); return; }
       bool ok = false;
-      if (which == 0 && ui_add_discovered_to_contacts) {
-        ok = ui_add_discovered_to_contacts(s_disc_menu_pubidx, false);
-      } else if (which == 1 && ui_add_discovered_to_contacts) {
-        ok = ui_add_discovered_to_contacts(s_disc_menu_pubidx, true);
+      // Add (0) / Add-favorite (1): use the identity captured at popup-open so
+      // a background re-sort can't retarget the add. Fall back to the legacy
+      // index path only if the by-key bridge isn't linked.
+      if ((which == 0 || which == 1)) {
+        bool fav = (which == 1);
+        if (s_disc_menu_valid && ui_add_contact_by_key) {
+          ok = ui_add_contact_by_key(s_disc_menu_contact.pub_key,
+                                     s_disc_menu_contact.name,
+                                     s_disc_menu_contact.type,
+                                     s_disc_menu_contact.gps_lat,
+                                     s_disc_menu_contact.gps_lon, fav);
+        } else if (ui_add_discovered_to_contacts) {
+          ok = ui_add_discovered_to_contacts(s_disc_menu_pubidx, fav);
+        }
       } else {
         ok = true;  // Cancel
       }
@@ -3040,7 +3093,11 @@ void UITask::loop() {
   if (s_active_tile == 4 && s_discovered_list &&
       (long)(millis() - s_discovered_next_refresh) >= 0) {
     s_discovered_next_refresh = millis() + 5000;
-    discovered_list_populate();
+    // Don't rebuild the list out from under an open Add/Cancel popup — the
+    // re-sort would retarget the captured node and disrupt focus.
+    bool popup_open = s_disc_menu_popup &&
+                      !lv_obj_has_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
+    if (!popup_open) discovered_list_populate();
   }
   // Map (item 5 / issue 3): follow the live fix. After the initial dwell on
   // Home (s_map_gps_switch_at), re-centre on GPS every ~2 s so the crosshair

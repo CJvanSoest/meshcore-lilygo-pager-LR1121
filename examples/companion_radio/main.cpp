@@ -384,6 +384,8 @@ struct UiDiscovered {
   int8_t   snr_q;           // SNR * 4
   int16_t  rssi;            // dBm
   uint8_t  path_len;        // 0 = direct, N = N hops
+  int32_t  gps_lat;         // x10^6 from advert (0 if node broadcasts no location)
+  int32_t  gps_lon;
   uint32_t first_ms;        // millis() at first sighting (this boot)
   uint32_t last_ms;         // millis() at last update (0 = empty slot)
 };
@@ -435,7 +437,7 @@ static UiDiscovered* disc_allocate(const uint8_t* pub_key) {
 
 extern "C" void ui_on_advert_seen(const uint8_t* pub_key, const char* name,
                                   uint8_t type, float snr, float rssi,
-                                  uint8_t path_len) {
+                                  uint8_t path_len, int32_t lat, int32_t lon) {
   UiDiscovered* e = disc_allocate(pub_key);
   if (!e) return;     // PSRAM alloc failed; silently drop
   StrHelper::strncpy(e->name, name ? name : "", sizeof(e->name));
@@ -443,6 +445,9 @@ extern "C" void ui_on_advert_seen(const uint8_t* pub_key, const char* name,
   e->snr_q    = (int8_t)(snr * 4.0f);
   e->rssi     = (int16_t)rssi;
   e->path_len = path_len;
+  // Only overwrite a stored location with a non-zero one, so a later
+  // advert that happens to omit lat/lon doesn't wipe a good fix.
+  if (lat != 0 || lon != 0) { e->gps_lat = lat; e->gps_lon = lon; }
   e->last_ms  = millis() ? millis() : 1;
 
   // Throttled persist of the whole cache to SD (item: save discovered nodes).
@@ -459,7 +464,7 @@ void disc_persist_save() {
   if (!s_disc_cache || !sd_init()) return;
   FILE* f = fopen("/sd/disc.dat", "wb");
   if (!f) return;
-  uint32_t magic = 0x43534944;   // 'DISC'
+  uint32_t magic = 0x32534944;   // 'DIS2' — bumped when UiDiscovered layout changed (added gps_lat/lon)
   fwrite(&magic, 4, 1, f);
   for (int i = 0; i < UI_DISC_CACHE; i++) {
     if (s_disc_cache[i].last_ms == 0) continue;
@@ -473,7 +478,7 @@ void disc_persist_load() {
   FILE* f = fopen("/sd/disc.dat", "rb");
   if (!f) return;
   uint32_t magic = 0;
-  if (fread(&magic, 4, 1, f) != 1 || magic != 0x43534944) { fclose(f); return; }
+  if (fread(&magic, 4, 1, f) != 1 || magic != 0x32534944) { fclose(f); return; }
   int idx = 0;
   UiDiscovered e;
   while (idx < UI_DISC_CACHE && fread(&e, sizeof(e), 1, f) == 1) {
@@ -518,6 +523,8 @@ extern "C" bool ui_get_discovered_info(int idx, UiContact* out) {
   memset(out, 0, sizeof(*out));
   StrHelper::strncpy(out->name, d.name, sizeof(out->name));
   out->type        = d.type;
+  out->gps_lat     = d.gps_lat;
+  out->gps_lon     = d.gps_lon;
   out->snr_q       = d.snr_q;
   out->rssi        = d.rssi;
   out->last_advert = d.last_ms / 1000;  // ms since boot → "secs since boot"
@@ -534,7 +541,21 @@ extern "C" bool ui_get_discovered_info(int idx, UiContact* out) {
 extern "C" bool ui_add_discovered_to_contacts(int idx, bool favorite) {
   UiContact uc;
   if (!ui_get_discovered_info(idx, &uc)) return false;
-  if (!the_mesh.uiAddContact(uc.pub_key, uc.name, uc.type, favorite)) return false;
+  if (!the_mesh.uiAddContact(uc.pub_key, uc.name, uc.type, favorite,
+                             uc.gps_lat, uc.gps_lon)) return false;
+  the_mesh.uiSaveContacts();
+  return true;
+}
+
+// Identity-stable add: the UI captures the target's pub_key/name/type/coords
+// when the popup opens, so a background re-sort of the discovered list can't
+// make the add land on a different node. Preferred over the index-based path.
+extern "C" bool ui_add_contact_by_key(const uint8_t* pub_key, const char* name,
+                                      uint8_t type, int32_t lat, int32_t lon,
+                                      bool favorite) {
+  if (!pub_key) return false;
+  if (!the_mesh.uiAddContact(pub_key, name ? name : "", type, favorite, lat, lon))
+    return false;
   the_mesh.uiSaveContacts();
   return true;
 }

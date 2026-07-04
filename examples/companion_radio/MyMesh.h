@@ -225,11 +225,12 @@ public:
   // onAdvertRecv from that pub_key will fill in the rest naturally.
   // Returns false on table-full.
   bool uiAddContact(const uint8_t* pub_key, const char* name, uint8_t type,
-                    bool favorite) {
-    // De-dup: if already present, just update flags + (re-)save.
+                    bool favorite, int32_t lat = 0, int32_t lon = 0) {
+    // De-dup: if already present, just update flags + coords + (re-)save.
     for (int i = 0; i < num_contacts; i++) {
       if (memcmp(contacts[i].id.pub_key, pub_key, PUB_KEY_SIZE) == 0) {
         if (favorite) contacts[i].flags |= 0x01;
+        if (lat != 0 || lon != 0) { contacts[i].gps_lat = lat; contacts[i].gps_lon = lon; }
         return true;
       }
     }
@@ -240,6 +241,8 @@ public:
     ci.out_path_len = OUT_PATH_UNKNOWN;
     StrHelper::strncpy(ci.name, name, sizeof(ci.name));
     ci.type = type;
+    ci.gps_lat = lat;                         // 0 if the advert carried no location
+    ci.gps_lon = lon;
     if (favorite) ci.flags |= 0x01;
     ci.last_advert_timestamp = 0;             // fills on next advert
     ci.lastmod = getRTCClock()->getCurrentTime();

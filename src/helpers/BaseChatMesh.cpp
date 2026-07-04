@@ -119,7 +119,7 @@ extern "C" void ui_on_advert_received(const uint8_t* pub_key, float snr, float r
     __attribute__((weak));
 extern "C" void ui_on_advert_seen(const uint8_t* pub_key, const char* name,
                                   uint8_t type, float snr, float rssi,
-                                  uint8_t path_len)
+                                  uint8_t path_len, int32_t lat, int32_t lon)
     __attribute__((weak));
 
 void BaseChatMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len) {
@@ -134,9 +134,11 @@ void BaseChatMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, 
   // policy. Pass the parsed advert name directly rather than looking it up
   // from contacts[] (the contact may not even exist yet).
   if (ui_on_advert_seen) {
+    int32_t adv_lat = 0, adv_lon = 0;
+    if (parser.hasLatLon()) { adv_lat = parser.getIntLat(); adv_lon = parser.getIntLon(); }
     ui_on_advert_seen(id.pub_key, parser.getName(), parser.getType(),
                       packet->getSNR(), _radio->getLastRSSI(),
-                      packet->path_len);
+                      packet->path_len, adv_lat, adv_lon);
   }
 
   ContactInfo* from = NULL;
