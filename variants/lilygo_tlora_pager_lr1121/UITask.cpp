@@ -97,6 +97,11 @@ static unsigned long s_discovered_next_refresh = 0;
 #define MAP_GPS_SWITCH_MS 4000
 static unsigned long s_map_gps_switch_at = 0;   // 0 = no handoff pending
 static unsigned long s_map_status_next = 0;     // live sat-count refresh tick
+// Continuous GPS follow (issue 3): once true the map re-centres on the live
+// fix every ~2 s so the crosshair + tiles track movement. Cleared when the
+// user manually pans/zooms; re-armed each time the Map tile is opened.
+static bool          s_map_follow = false;
+static unsigned long s_map_follow_next = 0;
 
 // ---- Settings tile (item 8) ----
 static lv_obj_t*   s_settings_list = nullptr;
@@ -390,6 +395,40 @@ static void ui_ref_loc(double* lat, double* lon) {
   if (ui_get_home_loc && ui_get_home_loc(&hlat, &hlon)) { *lat = hlat; *lon = hlon; return; }
   *lat = 0; *lon = 0;
 }
+// Feed the Map view (map_screen.cpp) with node positions: every contact and
+// discovered node that carries a fix. Contacts render as orange dots,
+// repeaters (ADV type 2) as green squares. Layout matches MapMarker there.
+struct UiMapMarker { double lat; double lon; uint8_t is_repeater; char name[24]; };
+extern "C" int ui_get_map_markers(UiMapMarker* out, int max) {
+  int n = 0;
+  UiContact ci;
+  if (ui_get_contact_count && ui_get_contact_info) {
+    int cnt = ui_get_contact_count();
+    for (int i = 0; i < cnt && n < max; i++) {
+      if (!ui_get_contact_info(i, &ci)) continue;
+      if (ci.gps_lat == 0 && ci.gps_lon == 0) continue;
+      out[n].lat = ci.gps_lat / 1.0e6;
+      out[n].lon = ci.gps_lon / 1.0e6;
+      out[n].is_repeater = (ci.type == 2) ? 1 : 0;
+      snprintf(out[n].name, sizeof(out[n].name), "%s", ci.name);
+      n++;
+    }
+  }
+  if (ui_get_discovered_count && ui_get_discovered_info) {
+    int cnt = ui_get_discovered_count();
+    for (int i = 0; i < cnt && n < max; i++) {
+      if (!ui_get_discovered_info(i, &ci)) continue;
+      if (ci.gps_lat == 0 && ci.gps_lon == 0) continue;
+      out[n].lat = ci.gps_lat / 1.0e6;
+      out[n].lon = ci.gps_lon / 1.0e6;
+      out[n].is_repeater = (ci.type == 2) ? 1 : 0;
+      snprintf(out[n].name, sizeof(out[n].name), "%s", ci.name);
+      n++;
+    }
+  }
+  return n;
+}
+
 // Tenths-of-percent (0..1000) of the duty-cycle quota that has been
 // consumed in the current hour-window. 0 = idle, 1000 = throttled.
 extern "C" int  ui_get_duty_cycle_used_tenths() __attribute__((weak));
@@ -428,7 +467,7 @@ extern "C" void ui_input_char(char c) {
       case 'x': map_screen_zoom(-1); break;
       default:  handled = false; break;
     }
-    if (handled) { s_map_gps_switch_at = 0; return; }
+    if (handled) { s_map_gps_switch_at = 0; s_map_follow = false; return; }
   }
 
   // Chat compose: when a chat view is open, the keyboard feeds the
@@ -665,6 +704,8 @@ static void enter_subscreen(int idx) {
       if (have_center) map_screen_set_center(clat, clon);
       map_screen_show();
       s_map_gps_switch_at = millis() + MAP_GPS_SWITCH_MS;
+      s_map_follow = true;          // issue 3: track the live fix continuously
+      s_map_follow_next = 0;
       return;
     }
     case 7: {  // Settings (item 8) — action-row list
@@ -2102,9 +2143,7 @@ enum {
   SET_SAVE_HOME = 0,
   SET_HOME_INFO,      // click = clear home
   SET_SCREEN_OFF,     // click = cycle timeout
-  SET_RADIO,          // jump to Radio settings
   SET_TIME,           // display (UTC) — click refreshes
-  SET_ABOUT,          // jump to About
 };
 
 static void settings_row_clicked(lv_event_t* e) {
@@ -2130,12 +2169,6 @@ static void settings_row_clicked(lv_event_t* e) {
       else if (s_screen_off_ms < 300000UL)  s_screen_off_ms = 300000UL;
       else                                   s_screen_off_ms =  30000UL;
       break;
-    case SET_RADIO:
-      enter_subscreen(TILE_RADIO);   // swaps groups itself
-      return;
-    case SET_ABOUT:
-      enter_subscreen(TILE_ABOUT);
-      return;
     default:
       break;
   }
@@ -2191,8 +2224,6 @@ static void settings_list_populate() {
   snprintf(buf, sizeof(buf), "Screen off: %lus", s_screen_off_ms / 1000UL);
   build_row(buf, SET_SCREEN_OFF);
 
-  build_row("Radio settings " LV_SYMBOL_RIGHT, SET_RADIO);
-
   uint32_t ep = ui_get_now_epoch ? ui_get_now_epoch() : 0;
   if (ep > 0) {
     snprintf(buf, sizeof(buf), "Time UTC: %02u:%02u:%02u",
@@ -2202,8 +2233,6 @@ static void settings_list_populate() {
     snprintf(buf, sizeof(buf), "Time UTC: (no clock)");
   }
   build_row(buf, SET_TIME);
-
-  build_row("About " LV_SYMBOL_RIGHT, SET_ABOUT);
 
   lv_group_focus_obj(first);
 }
@@ -2293,9 +2322,12 @@ static void build_ui() {
   lv_obj_set_style_text_color(arrow_r, lv_color_hex(0x80868f), 0);
   lv_obj_align_to(arrow_r, s_tile_row, LV_ALIGN_OUT_RIGHT_MID, 2, 0);
 
-  // (Removed: the duplicated tile title + the static hint line that used to
-  //  sit under the carousel — item 1. The orange focus border + < > arrows
-  //  are the remaining affordances.)
+  // Footer hint (the duplicated tile title stays removed; only this control
+  // hint sits under the carousel).
+  lv_obj_t* hint = lv_label_create(s_root);
+  lv_label_set_text(hint, "rotate: scroll   click: open   long: back   3s: power off");
+  lv_obj_set_style_text_color(hint, lv_color_hex(0x707880), 0);
+  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -4);
 
   // ---- Sub-screen container (hidden by default) ----
   s_subscreen_root = lv_obj_create(scr);
@@ -2914,11 +2946,15 @@ void UITask::loop() {
     s_discovered_next_refresh = millis() + 5000;
     discovered_list_populate();
   }
-  // Map (item 5): after opening on Home, hand off to live GPS once the
-  // dwell timer elapses and a fix is available.
-  if (s_active_tile == TILE_MAP && s_map_gps_switch_at &&
-      (long)(millis() - s_map_gps_switch_at) >= 0) {
-    s_map_gps_switch_at = 0;   // one-shot
+  // Map (item 5 / issue 3): follow the live fix. After the initial dwell on
+  // Home (s_map_gps_switch_at), re-centre on GPS every ~2 s so the crosshair
+  // + tiles track movement. Manual pan/zoom clears s_map_follow so the view
+  // stays put until the Map tile is re-opened.
+  if (s_active_tile == TILE_MAP && s_map_follow &&
+      (s_map_gps_switch_at == 0 || (long)(millis() - s_map_gps_switch_at) >= 0) &&
+      (long)(millis() - s_map_follow_next) >= 0) {
+    s_map_follow_next = millis() + 2000;
+    s_map_gps_switch_at = 0;
     double glat = 0, glon = 0;
     if (ui_get_self_loc) ui_get_self_loc(&glat, &glon);
     if (glat || glon) map_screen_set_center(glat, glon);

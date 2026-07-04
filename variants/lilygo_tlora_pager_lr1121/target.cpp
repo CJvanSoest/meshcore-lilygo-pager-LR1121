@@ -185,6 +185,22 @@ void TLoraPagerBoard::begin() {
   delay(5);
   xl9555_set_output(2, true);    // KB_RST HIGH — out of reset
   delay(20);
+
+  // GPS (L76K): power the rail via XL9555 EXPANDS_GPS_EN (pin 4) and lift
+  // the module out of reset via EXPANDS_GPS_RST (pin 7). Without GPS_EN the
+  // module has no Vcc, sends no NMEA, and EnvironmentSensorManager's boot
+  // probe (Serial1.available() within 1 s) sees nothing -> it marks GPS
+  // "not detected" and disables it permanently, so no fix is ever acquired.
+  // Must run before sensors.begin()/initBasicGPS() in main.cpp setup().
+#if ENV_INCLUDE_GPS
+  #define EXPANDS_GPS_EN  4
+  #define EXPANDS_GPS_RST 7
+  xl9555_set_output(EXPANDS_GPS_RST, false);  // hold in reset
+  xl9555_set_output(EXPANDS_GPS_EN,  true);   // power the GPS rail
+  delay(50);                                  // let the regulator settle
+  xl9555_set_output(EXPANDS_GPS_RST, true);   // release reset -> module boots
+  delay(20);
+#endif
 }
 
 // --- TCA8418 keyboard ---------------------------------------------------------
