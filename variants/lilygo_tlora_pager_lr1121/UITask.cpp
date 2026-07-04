@@ -9,6 +9,7 @@
 #include <lvgl.h>
 #include <cstring>
 #include <cstdio>              // fopen/fread/fwrite for SD chat-history store
+#include <ctime>               // gmtime_r for NL local-time / DST conversion
 #include <esp_heap_caps.h>     // heap_caps_calloc / MALLOC_CAP_SPIRAM (S3.6d)
 
 bool sd_init();                // from target.cpp — mounts /sd (idempotent)
@@ -2202,7 +2203,7 @@ enum {
   SET_SAVE_HOME = 0,
   SET_HOME_INFO,      // click = clear home
   SET_SCREEN_OFF,     // click = cycle timeout
-  SET_TIME,           // display (UTC) — click refreshes
+  SET_TIME,           // display (NL local, DST-aware) — click refreshes
 };
 
 static void settings_row_clicked(lv_event_t* e) {
@@ -2232,6 +2233,36 @@ static void settings_row_clicked(lv_event_t* e) {
       break;
   }
   settings_list_populate();   // refresh dynamic labels
+}
+
+// Convert a UTC epoch to Netherlands local wall-clock (Europe/Amsterdam),
+// applying EU daylight-saving: CET = UTC+1 in winter, CEST = UTC+2 from the
+// last Sunday of March 01:00 UTC to the last Sunday of October 01:00 UTC.
+// 24-hour output via the caller's %02d:%02d formatting.
+static void epoch_to_nl_local(uint32_t ep, int* hh, int* mm, int* ss) {
+  time_t t = (time_t)ep;
+  struct tm g;
+  gmtime_r(&t, &g);                       // broken-down UTC
+  const int mon = g.tm_mon + 1;           // 1-12
+  bool dst;
+  if (mon < 3 || mon > 10) {
+    dst = false;                          // Nov-Feb: winter
+  } else if (mon > 3 && mon < 10) {
+    dst = true;                           // Apr-Sep: summer
+  } else {
+    // March / October (both 31 days): switch on the last Sunday at 01:00 UTC.
+    const int dim = 31;
+    const int wday_last = (g.tm_wday + (dim - g.tm_mday)) % 7;  // 0 = Sunday
+    const int last_sun  = dim - wday_last;
+    if (mon == 3)
+      dst = (g.tm_mday > last_sun) || (g.tm_mday == last_sun && g.tm_hour >= 1);
+    else
+      dst = (g.tm_mday < last_sun) || (g.tm_mday == last_sun && g.tm_hour <  1);
+  }
+  time_t local = t + (dst ? 2 * 3600 : 1 * 3600);
+  struct tm l;
+  gmtime_r(&local, &l);
+  *hh = l.tm_hour; *mm = l.tm_min; *ss = l.tm_sec;
 }
 
 static void settings_list_populate() {
@@ -2285,11 +2316,11 @@ static void settings_list_populate() {
 
   uint32_t ep = ui_get_now_epoch ? ui_get_now_epoch() : 0;
   if (ep > 0) {
-    snprintf(buf, sizeof(buf), "Time UTC: %02u:%02u:%02u",
-             (unsigned)((ep / 3600) % 24), (unsigned)((ep / 60) % 60),
-             (unsigned)(ep % 60));
+    int hh, mm, ss;
+    epoch_to_nl_local(ep, &hh, &mm, &ss);
+    snprintf(buf, sizeof(buf), "Tijd (NL): %02d:%02d:%02d", hh, mm, ss);
   } else {
-    snprintf(buf, sizeof(buf), "Time UTC: (no clock)");
+    snprintf(buf, sizeof(buf), "Tijd (NL): (geen klok)");
   }
   build_row(buf, SET_TIME);
 
@@ -3082,7 +3113,7 @@ void UITask::loop() {
       if (strcmp(title_now, "Radio") == 0) {
         char body[160];
         snprintf(body, sizeof(body),
-                 "FREQ: %.3f MHz\nSF: %d   BW: %.2f\nCR: %d   TX: %d dBm\nTime UTC: %lu",
+                 "FREQ: %.3f MHz\nSF: %d   BW: %.2f\nCR: %d   TX: %d dBm\nUptime: %lus",
                  _prefs->freq, _prefs->sf, _prefs->bw, _prefs->cr,
                  _prefs->tx_power_dbm, (unsigned long)millis() / 1000);
         lv_label_set_text(s_subscreen_body, body);
