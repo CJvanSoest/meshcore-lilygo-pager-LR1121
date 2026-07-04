@@ -196,10 +196,14 @@ static void update_tile_badges() {
 // Chat view (S3.4 step 2/3) — opened when the user clicks an existing
 // channel row in the Messages tile. Single shared ring buffer keyed by
 // channel_idx, plus a compose buffer that the keyboard fills.
+// Max stored message length. MeshCore's MAX_TEXT_LEN is 160; earlier this
+// was 96 which visibly truncated longer channel messages mid-sentence. 176
+// leaves headroom for the full body plus the "sender: " prefix and a NUL.
+#define CHAT_TEXT_MAX 176
 struct ChatMsg {
   uint8_t channel_idx;
   uint32_t timestamp;   // unix seconds (0 if unknown)
-  char text[96];        // includes "sender: " prefix from the wire
+  char text[CHAT_TEXT_MAX];  // includes "sender: " prefix from the wire
 };
 #define CHAT_RING_SIZE 32
 // Heap-allocated in PSRAM (S3.6d). 32 × ~104 bytes = ~3.3 KB; pushing
@@ -567,6 +571,31 @@ extern "C" void ui_input_char(char c) {
 static int s_last_enc_a = HIGH;
 static int s_prev_btn = HIGH;
 static bool s_skip_next_click = false;
+// One-back-per-press debounce: LVGL's LV_EVENT_LONG_PRESSED (fires ~400 ms on
+// a focused list row) and the manual encoder-hold handler (fires on release)
+// would otherwise both act on a single long press and pop two levels. Set when
+// either handler navigates back; cleared on the next button press-down.
+static bool s_back_handled = false;
+
+// Single source of truth for "go back one level": chat -> its list, otherwise
+// sub-screen -> carousel. Used by both the LVGL long-press cb and the manual
+// encoder-hold handler so the Map (no list rows -> no LVGL event) and the chat
+// (list-row event would wrongly pop to the carousel) both behave correctly.
+static void leave_subscreen();
+static bool s_in_subscreen = false;
+static void nav_back_one_level() {
+  if (s_back_handled) return;
+  if (s_chat_open) {
+    chat_view_close();               // chat -> channel/DM list (stay in tile)
+  } else if (s_in_subscreen) {
+    leave_subscreen();               // list / map / etc -> carousel
+    s_in_subscreen = false;
+  } else {
+    return;                          // already at the carousel — nothing to do
+  }
+  s_back_handled = true;
+  s_skip_next_click = true;
+}
 static unsigned long s_btn_press_at = 0;
 static bool s_lvgl_ready = false;
 static unsigned long s_next_tick = 0;
@@ -1087,7 +1116,7 @@ static void chat_history_append_line(const char* line) {
            (c >= '0' && c <= '9') || c == '-' || c == '_';
   };
 
-  char buf[160];
+  char buf[CHAT_TEXT_MAX];
   int bi = 0;
   auto flush_grey = [&]() {
     if (bi == 0) return;
@@ -1351,7 +1380,7 @@ static void chan_persist_append(uint8_t idx, const char* text) {
   FILE* f = fopen(path, "ab");
   if (!f) return;
   size_t L = strlen(text);
-  if (L > 95) L = 95;                 // matches ChatMsg.text[96]
+  if (L > CHAT_TEXT_MAX - 1) L = CHAT_TEXT_MAX - 1;   // matches ChatMsg.text
   uint8_t len = (uint8_t)L;
   fwrite(&len, 1, 1, f);
   fwrite(text, 1, L, f);
@@ -1381,12 +1410,12 @@ static void chan_persist_load(uint8_t idx) {
   snprintf(path, sizeof(path), "/sd/ch_%u.dat", (unsigned)idx);
   FILE* f = fopen(path, "rb");
   if (!f) return;
-  static char ring[CHAT_RING_SIZE][96];
+  static char ring[CHAT_RING_SIZE][CHAT_TEXT_MAX];
   int n = 0;
   uint8_t len;
   while (fread(&len, 1, 1, f) == 1) {
-    if (len > 95) break;
-    char buf[96];
+    if (len > CHAT_TEXT_MAX - 1) break;
+    char buf[CHAT_TEXT_MAX];
     if (fread(buf, 1, len, f) != len) break;
     buf[len] = 0;
     memcpy(ring[n % CHAT_RING_SIZE], buf, len + 1);
@@ -2144,8 +2173,6 @@ static void radio_item_clicked(lv_event_t* e) {
   }
 }
 
-static bool s_in_subscreen = false;
-
 static void tile_clicked_event(lv_event_t* e) {
   int idx = (int)(intptr_t)lv_event_get_user_data(e);
   Serial.printf("CLICK tile %d (skip=%d, in_sub=%d)\n", idx, s_skip_next_click, s_in_subscreen);
@@ -2158,14 +2185,11 @@ static void tile_clicked_event(lv_event_t* e) {
 // s_skip_next_click flag (declared near the top of the file) so the
 // carousel tile under the focus doesn't immediately re-open.
 //
-// Long-press on anything inside the sub-screen returns to the carousel.
+// Long-press on a list row goes back one level. Routed through
+// nav_back_one_level() so an open chat pops to its list (not the carousel)
+// and the manual encoder-hold handler doesn't double-pop the same press.
 static void back_long_press_event(lv_event_t* /*e*/) {
-  Serial.printf("LONG_PRESS (in_sub=%d)\n", s_in_subscreen);
-  if (s_in_subscreen) {
-    leave_subscreen();
-    s_in_subscreen = false;
-    s_skip_next_click = true;
-  }
+  nav_back_one_level();
 }
 
 // ---------- Settings tile (item 8) ------------------------------------------
@@ -2903,6 +2927,7 @@ void UITask::loop() {
   if (btn != s_prev_btn) {
     if (btn == LOW) {
       s_btn_press_at = millis();
+      s_back_handled = false;   // arm a fresh one-back-per-press window
       tpager_lvgl_encoder_pressed(true);
     } else {
       unsigned long held = millis() - s_btn_press_at;
@@ -2937,20 +2962,25 @@ void UITask::loop() {
           if (enc2 && back_group) lv_indev_set_group(enc2, back_group);
           s_editing_idx = -1;
           s_skip_next_click = true;
-        } else if (s_chat_open) {
-          // One level back: chat → channels list (stays inside Messages).
-          chat_view_close();
-          s_skip_next_click = true;
-        } else if (s_in_subscreen) {
-          leave_subscreen();
-          s_in_subscreen = false;
-          s_skip_next_click = true;
+        } else {
+          // Chat → its list, else sub-screen (incl. Map) → carousel. No-op if
+          // the LVGL long-press already handled this press (debounced inside).
+          nav_back_one_level();
         }
       }
     }
     _auto_off = millis() + s_screen_off_ms;
     if (_display && !_display->isOn()) _display->turnOn();
     s_prev_btn = btn;
+  }
+  // Back-while-held (~500 ms) for screens without list-row LVGL long-press —
+  // notably the Map. Without this the only back is the release-time handler,
+  // and with no ~400 ms feedback the user tends to keep holding and cross the
+  // 3 s power-off threshold. Debounced (one back per press) and skipped while
+  // an edit popup is open (that cancels on release instead).
+  if (btn == LOW && !s_back_handled && s_editing_idx < 0 &&
+      (millis() - s_btn_press_at) >= 500) {
+    nav_back_one_level();
   }
   // Drop the skip flag after 1 s to avoid blocking a future legitimate
   // click if LVGL didn't fire one to consume it.
