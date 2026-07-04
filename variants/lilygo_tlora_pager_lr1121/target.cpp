@@ -31,7 +31,69 @@ RADIO_CLASS radio = new Module(P_LORA_NSS, P_LORA_DIO_1, P_LORA_RESET, P_LORA_BU
 
 WRAPPER_CLASS radio_driver(radio, board);
 
-ESP32RTCClock fallback_clock;
+// Battery-backed PCF85063A real-time clock (I2C 0x51 on the shared bus). The
+// pager's RTC keeps time across reboots / power-off on its backup supply, so
+// the clock survives a reboot instead of resetting to a stale volatile value.
+// MeshCore's AutoDiscoverRTCClock only knows PCF8563 (different register map,
+// same address) so we drive the PCF85063 directly and keep an ESP32 volatile
+// clock as a within-session fallback when the chip has no valid time yet.
+#include <RTClib.h>            // DateTime epoch<->calendar (already a build dep)
+#ifndef PCF85063_I2C_ADDR
+  #define PCF85063_I2C_ADDR 0x51
+#endif
+class PCF85063Clock : public mesh::RTCClock {
+  ESP32RTCClock _sys;
+  static uint8_t bcd2dec(uint8_t b) { return (uint8_t)((b >> 4) * 10 + (b & 0x0F)); }
+  static uint8_t dec2bcd(uint8_t d) { return (uint8_t)(((d / 10) << 4) | (d % 10)); }
+  bool readRegs(uint8_t start, uint8_t* buf, uint8_t n) {
+    Wire.beginTransmission(PCF85063_I2C_ADDR);
+    Wire.write(start);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((int)PCF85063_I2C_ADDR, (int)n) != n) return false;
+    for (uint8_t i = 0; i < n; i++) buf[i] = Wire.read();
+    return true;
+  }
+public:
+  void begin() {
+    _sys.begin();
+    // Control_1 (0x00): STOP=0 (run), 12_24=0 (24-hour), CAP_SEL default.
+    Wire.beginTransmission(PCF85063_I2C_ADDR);
+    Wire.write(0x00); Wire.write(0x00);
+    Wire.endTransmission();
+  }
+  uint32_t getCurrentTime() override {
+    uint8_t b[7];
+    if (readRegs(0x04, b, 7)) {
+      const bool os = (b[0] & 0x80) != 0;   // oscillator stopped => time lost
+      const int  sec = bcd2dec(b[0] & 0x7F);
+      const int  mi  = bcd2dec(b[1] & 0x7F);
+      const int  hr  = bcd2dec(b[2] & 0x3F);
+      const int  day = bcd2dec(b[3] & 0x3F);
+      const int  mon = bcd2dec(b[5] & 0x1F);
+      const int  yr  = 2000 + bcd2dec(b[6]);
+      if (!os && yr >= 2024 && mon >= 1 && mon <= 12 && day >= 1 && day <= 31)
+        return DateTime(yr, mon, day, hr, mi, sec).unixtime();
+    }
+    return _sys.getCurrentTime();           // chip absent / not yet set
+  }
+  void setCurrentTime(uint32_t t) override {
+    _sys.setCurrentTime(t);
+    DateTime dt(t);
+    Wire.beginTransmission(PCF85063_I2C_ADDR);
+    Wire.write(0x04);
+    Wire.write(dec2bcd(dt.second()));       // bit7 (OS) cleared by this write
+    Wire.write(dec2bcd(dt.minute()));
+    Wire.write(dec2bcd(dt.hour()));
+    Wire.write(dec2bcd(dt.day()));
+    Wire.write((uint8_t)(dt.dayOfTheWeek() & 0x07));
+    Wire.write(dec2bcd(dt.month()));
+    Wire.write(dec2bcd((uint8_t)(dt.year() - 2000)));
+    Wire.endTransmission();
+  }
+  void tick() override { _sys.tick(); }
+};
+
+PCF85063Clock fallback_clock;
 AutoDiscoverRTCClock rtc_clock(fallback_clock);
 
 #if ENV_INCLUDE_GPS
