@@ -40,6 +40,7 @@ static const TileDef TILES[] = {
   { LV_SYMBOL_GPS,       "Map"        },   // 6 — SD raster tiles
   { LV_SYMBOL_SETTINGS,  "Settings"   },   // 7 — device settings list
   { LV_SYMBOL_HOME,      "About"      },   // 8 — build info
+  { LV_SYMBOL_GPS,       "Sat test"   },   // 9 — live GPS reception diagnostic
 };
 static const int NUM_TILES = sizeof(TILES) / sizeof(TILES[0]);
 
@@ -47,7 +48,7 @@ static const int NUM_TILES = sizeof(TILES) / sizeof(TILES[0]);
 // and the map refresh. Keep in sync with TILES[] above if you reorder.
 enum {
   TILE_RADIO = 0, TILE_CHANNELS, TILE_DM, TILE_CONTACTS, TILE_DISCOVERED,
-  TILE_ADVERT, TILE_MAP, TILE_SETTINGS, TILE_ABOUT,
+  TILE_ADVERT, TILE_MAP, TILE_SETTINGS, TILE_ABOUT, TILE_SATTEST,
 };
 
 // ---------- UI state ---------------------------------------------------------
@@ -102,6 +103,8 @@ static unsigned long s_map_status_next = 0;     // live sat-count refresh tick
 // user manually pans/zooms; re-armed each time the Map tile is opened.
 static bool          s_map_follow = false;
 static unsigned long s_map_follow_next = 0;
+// Sat-test tile live-refresh tick.
+static unsigned long s_sattest_next = 0;
 
 // ---- Settings tile (item 8) ----
 static lv_obj_t*   s_settings_list = nullptr;
@@ -378,6 +381,11 @@ extern "C" bool ui_send_dm(const uint8_t* pub_key, const char* text) __attribute
 extern "C" int  ui_get_dm_msg_count(const uint8_t* pub_key) __attribute__((weak));
 extern "C" bool ui_get_dm_msg(const uint8_t* pub_key, int idx, UiDmMsg* out) __attribute__((weak));
 extern "C" void ui_get_self_loc(double* lat, double* lon) __attribute__((weak));
+// GPS reception diagnostics for the Sat-test tile (target.cpp).
+extern "C" int  ui_get_sat_count() __attribute__((weak));     // sats used in fix
+extern "C" bool ui_get_gps_valid() __attribute__((weak));     // has a position fix
+extern "C" int  ui_get_sat_in_view() __attribute__((weak));   // sats in view (GSV)
+extern "C" int  ui_get_gps_best_snr() __attribute__((weak));  // best C/N0 dBHz
 // Saved "home" location (item 8). Returns true if a home has been stored.
 extern "C" bool ui_get_home_loc(double* lat, double* lon) __attribute__((weak));
 // Restore a peer's DM history from SD into the ring (no-op if already loaded).
@@ -591,6 +599,30 @@ static void init_styles() {
 
 // ---------- Sub-screen for a clicked tile -----------------------------------
 
+// Format the live GPS reception readout for the Sat-test tile. "In view"
+// (GSV) + best SNR go non-zero as soon as the antenna hears satellites, well
+// before a position fix — so they tell you whether the RF path works and how
+// good the sky is during a cold start.
+static void sattest_format(char* buf, int cap) {
+  bool fix    = ui_get_gps_valid    && ui_get_gps_valid();
+  int  inview = ui_get_sat_in_view  ? ui_get_sat_in_view()  : -1;
+  int  snr    = ui_get_gps_best_snr ? ui_get_gps_best_snr() : -1;
+  int  infix  = ui_get_sat_count    ? ui_get_sat_count()    : -1;
+  double lat = 0, lon = 0;
+  if (ui_get_self_loc) ui_get_self_loc(&lat, &lon);
+  char loc[48];
+  if (fix && (lat || lon)) snprintf(loc, sizeof(loc), "%.5f, %.5f", lat, lon);
+  else                     snprintf(loc, sizeof(loc), "(nog geen fix)");
+  snprintf(buf, cap,
+    "Fix: %s\n"
+    "In view: %d sat   SNR: %d dBHz\n"
+    "In fix:  %d sat\n"
+    "Pos: %s\n\n"
+    "Buiten, vrij zicht, stilstaan.\n"
+    "in view > 0 = antenne ontvangt.",
+    fix ? "JA" : "nee", inview, snr, infix, loc);
+}
+
 static void enter_subscreen(int idx) {
   s_active_tile = idx;
   // Hide carousel, show subscreen container with content for the tile.
@@ -627,7 +659,7 @@ static void enter_subscreen(int idx) {
   // Default: encoder drives carousel group (will switch for Radio below).
   lv_indev_t* enc = tpager_lvgl_get_encoder();
 
-  char body[160];
+  char body[220];
   body[0] = 0;
   switch (idx) {
     case 0: {  // Radio
@@ -718,6 +750,9 @@ static void enter_subscreen(int idx) {
     case 8:
       snprintf(body, sizeof(body), "MeshCore T-Pager\n%s\n\nLVGL %d.%d.%d",
                FIRMWARE_VERSION, LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
+      break;
+    case TILE_SATTEST:  // 9 — live GPS reception diagnostic, refreshed ~1 Hz
+      sattest_format(body, sizeof(body));
       break;
   }
   lv_label_set_text(s_subscreen_body, body);
@@ -2964,6 +2999,14 @@ void UITask::loop() {
       (long)(millis() - s_map_status_next) >= 0) {
     s_map_status_next = millis() + 2000;
     map_screen_refresh_status();
+  }
+  // Live refresh of the Sat-test tile readout (~1 Hz).
+  if (s_active_tile == TILE_SATTEST && s_subscreen_body &&
+      (long)(millis() - s_sattest_next) >= 0) {
+    s_sattest_next = millis() + 1000;
+    char b[220];
+    sattest_format(b, sizeof(b));
+    lv_label_set_text(s_subscreen_body, b);
   }
 
   // Periodically refresh battery + header data on the carousel + sub-screen.

@@ -44,6 +44,13 @@ class MicroNMEALocationProvider : public LocationProvider {
     int _pin_en;
     long next_check = 0;
     long time_valid = 0;
+    // GSV (satellites-in-view / best C/N0) tracking, refreshed ~1 Hz.
+    int  _sats_in_view = 0;
+    int  _best_snr = 0;
+    int  _iv_accum = 0;      // summed sats-in-view this 1 s window
+    int  _snr_accum = 0;     // best SNR this 1 s window
+    char _gsv_line[110];     // current sentence accumulator for GSV parsing
+    int  _gsv_len = 0;
     unsigned long _last_time_sync = 0;
     static const unsigned long TIME_SYNC_INTERVAL = 1800000; // Re-sync every 30 minutes
 
@@ -122,6 +129,13 @@ public :
     long satellitesCount() override { return nmea.getNumSatellites(); }
     bool isValid() override { return nmea.isValid(); }
 
+    // Satellites in VIEW (from GSV) + best C/N0 seen, refreshed ~1 Hz. Unlike
+    // satellitesCount() (satellites used in the fix, 0 until locked) these are
+    // non-zero as soon as the antenna hears anything — a useful "is the RF
+    // path alive / how good is the sky" indicator during acquisition.
+    int getSatsInView() const { return _sats_in_view; }
+    int getBestSNR()    const { return _best_snr; }
+
     long getTimestamp() override { 
         DateTime dt(nmea.getYear(), nmea.getMonth(),nmea.getDay(),nmea.getHour(),nmea.getMinute(),nmea.getSecond());
         return dt.unixtime();
@@ -129,6 +143,35 @@ public :
 
     void sendSentence(const char *sentence) override {
         nmea.sendSentence(*_gps_serial, sentence);
+    }
+
+    // Accumulate satellites-in-view + best C/N0 from GSV sentences, fed one
+    // char at a time alongside nmea.process(). Sums field-4 (numInView) of
+    // each talker's first message and tracks the peak SNR across the window.
+    void gsvAccumulate(char c) {
+        if (c == '\n' || c == '\r') {
+            if (_gsv_len > 6 && _gsv_line[0] == '$' &&
+                _gsv_line[3] == 'G' && _gsv_line[4] == 'S' && _gsv_line[5] == 'V') {
+                _gsv_line[_gsv_len] = 0;
+                int field = 0, msgNum = 0;
+                const char* p = _gsv_line;
+                for (const char* q = _gsv_line; ; q++) {
+                    if (*q == ',' || *q == '*' || *q == 0) {
+                        field++;
+                        if (field == 3) msgNum = atoi(p);
+                        else if (field == 4 && msgNum == 1) _iv_accum += atoi(p);
+                        else if (field >= 8 && (field - 8) % 4 == 0) {
+                            int s = atoi(p); if (s > _snr_accum) _snr_accum = s;
+                        }
+                        p = q + 1;
+                        if (*q == 0 || *q == '*') break;
+                    }
+                }
+            }
+            _gsv_len = 0;
+        } else if (_gsv_len < (int)sizeof(_gsv_line) - 1) {
+            _gsv_line[_gsv_len++] = c;
+        }
     }
 
     void loop() override {
@@ -139,12 +182,18 @@ public :
             Serial.print(c);
             #endif
             nmea.process(c);
+            gsvAccumulate(c);
         }
 
         if (!isValid()) time_valid = 0;
 
         if (millis() > next_check) {
             next_check = millis() + 1000;
+            // Snapshot the last second of GSV data, then start a fresh window.
+            _sats_in_view = _iv_accum;
+            _best_snr     = _snr_accum;
+            _iv_accum = 0;
+            _snr_accum = 0;
             // Re-enable time sync periodically when GPS has valid fix
             if (!_time_sync_needed && _clock != NULL && (millis() - _last_time_sync) > TIME_SYNC_INTERVAL) {
                 _time_sync_needed = true;

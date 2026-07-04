@@ -57,6 +57,24 @@ extern "C" bool ui_get_gps_valid() {
   return false;
 #endif
 }
+// Satellites in VIEW (from GSV) — non-zero as soon as the antenna hears
+// anything, unlike ui_get_sat_count() (sats used in the fix). -1 = no GPS.
+extern "C" int ui_get_sat_in_view() {
+#if ENV_INCLUDE_GPS
+  return nmea.getSatsInView();
+#else
+  return -1;
+#endif
+}
+// Best carrier-to-noise (C/N0, dBHz) seen across the constellations this
+// second. A healthy sky gives 30-45; 0 means no usable signal. -1 = no GPS.
+extern "C" int ui_get_gps_best_snr() {
+#if ENV_INCLUDE_GPS
+  return nmea.getBestSNR();
+#else
+  return -1;
+#endif
+}
 
 #ifndef LORA_CR
   #define LORA_CR 5
