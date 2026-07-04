@@ -44,11 +44,12 @@ class MicroNMEALocationProvider : public LocationProvider {
     int _pin_en;
     long next_check = 0;
     long time_valid = 0;
-    // GSV (satellites-in-view / best C/N0) tracking, refreshed ~1 Hz.
-    int  _sats_in_view = 0;
-    int  _best_snr = 0;
-    int  _iv_accum = 0;      // summed sats-in-view this 1 s window
-    int  _snr_accum = 0;     // best SNR this 1 s window
+    // GSV (satellites-in-view / best C/N0) tracking, per constellation with a
+    // staleness hold so a flickering satellite doesn't drop the readout to 0.
+    static const unsigned long GSV_HOLD_MS = 6000;
+    struct GsvTalker { uint16_t id; int inView; int snr; unsigned long ts; };
+    GsvTalker _gsv[6] = {};
+    int  _gsv_n = 0;
     char _gsv_line[110];     // current sentence accumulator for GSV parsing
     int  _gsv_len = 0;
     unsigned long _last_time_sync = 0;
@@ -129,12 +130,24 @@ public :
     long satellitesCount() override { return nmea.getNumSatellites(); }
     bool isValid() override { return nmea.isValid(); }
 
-    // Satellites in VIEW (from GSV) + best C/N0 seen, refreshed ~1 Hz. Unlike
-    // satellitesCount() (satellites used in the fix, 0 until locked) these are
-    // non-zero as soon as the antenna hears anything — a useful "is the RF
-    // path alive / how good is the sky" indicator during acquisition.
-    int getSatsInView() const { return _sats_in_view; }
-    int getBestSNR()    const { return _best_snr; }
+    // Satellites in VIEW (from GSV) + best C/N0. Unlike satellitesCount()
+    // (satellites used in the fix, 0 until locked) these go non-zero as soon
+    // as the antenna hears anything — the "is the RF path alive / how good is
+    // the sky" indicator during acquisition. Values are held per constellation
+    // with a short staleness window so a satellite that flickers in and out of
+    // one GSV cycle doesn't make the readout drop to 0.
+    int getSatsInView() const {
+        int total = 0;
+        for (int i = 0; i < _gsv_n; i++)
+            if ((millis() - _gsv[i].ts) < GSV_HOLD_MS) total += _gsv[i].inView;
+        return total;
+    }
+    int getBestSNR() const {
+        int best = 0;
+        for (int i = 0; i < _gsv_n; i++)
+            if ((millis() - _gsv[i].ts) < GSV_HOLD_MS && _gsv[i].snr > best) best = _gsv[i].snr;
+        return best;
+    }
 
     long getTimestamp() override { 
         DateTime dt(nmea.getYear(), nmea.getMonth(),nmea.getDay(),nmea.getHour(),nmea.getMinute(),nmea.getSecond());
@@ -145,27 +158,44 @@ public :
         nmea.sendSentence(*_gps_serial, sentence);
     }
 
-    // Accumulate satellites-in-view + best C/N0 from GSV sentences, fed one
-    // char at a time alongside nmea.process(). Sums field-4 (numInView) of
-    // each talker's first message and tracks the peak SNR across the window.
+    // Parse one complete GSV sentence: talker (chars 1-2 = constellation),
+    // field 4 = satellites in view for that talker (identical across its
+    // messages), SNR = every 4th field from field 8. Per-constellation state
+    // is time-stamped so getSatsInView()/getBestSNR() can hold it briefly.
+    // Fed one char at a time alongside nmea.process().
     void gsvAccumulate(char c) {
         if (c == '\n' || c == '\r') {
             if (_gsv_len > 6 && _gsv_line[0] == '$' &&
                 _gsv_line[3] == 'G' && _gsv_line[4] == 'S' && _gsv_line[5] == 'V') {
                 _gsv_line[_gsv_len] = 0;
-                int field = 0, msgNum = 0;
+                uint16_t talker = ((uint8_t)_gsv_line[1] << 8) | (uint8_t)_gsv_line[2];
+                int field = 0, msgNum = 0, inView = 0, lineSnr = 0;
                 const char* p = _gsv_line;
                 for (const char* q = _gsv_line; ; q++) {
                     if (*q == ',' || *q == '*' || *q == 0) {
                         field++;
                         if (field == 3) msgNum = atoi(p);
-                        else if (field == 4 && msgNum == 1) _iv_accum += atoi(p);
+                        else if (field == 4) inView = atoi(p);
                         else if (field >= 8 && (field - 8) % 4 == 0) {
-                            int s = atoi(p); if (s > _snr_accum) _snr_accum = s;
+                            int s = atoi(p); if (s > lineSnr) lineSnr = s;
                         }
                         p = q + 1;
                         if (*q == 0 || *q == '*') break;
                     }
+                }
+                // Locate (or add) this constellation's slot.
+                int idx = -1;
+                for (int i = 0; i < _gsv_n; i++) if (_gsv[i].id == talker) { idx = i; break; }
+                if (idx < 0 && _gsv_n < (int)(sizeof(_gsv) / sizeof(_gsv[0]))) {
+                    idx = _gsv_n++; _gsv[idx].id = talker; _gsv[idx].snr = 0;
+                }
+                if (idx >= 0) {
+                    _gsv[idx].inView = inView;
+                    // msgNum 1 starts a fresh burst for this talker; later
+                    // messages contribute more satellites' SNR to the same burst.
+                    if (msgNum <= 1) _gsv[idx].snr = lineSnr;
+                    else if (lineSnr > _gsv[idx].snr) _gsv[idx].snr = lineSnr;
+                    _gsv[idx].ts = millis();
                 }
             }
             _gsv_len = 0;
@@ -189,11 +219,6 @@ public :
 
         if (millis() > next_check) {
             next_check = millis() + 1000;
-            // Snapshot the last second of GSV data, then start a fresh window.
-            _sats_in_view = _iv_accum;
-            _best_snr     = _snr_accum;
-            _iv_accum = 0;
-            _snr_accum = 0;
             // Re-enable time sync periodically when GPS has valid fix
             if (!_time_sync_needed && _clock != NULL && (millis() - _last_time_sync) > TIME_SYNC_INTERVAL) {
                 _time_sync_needed = true;

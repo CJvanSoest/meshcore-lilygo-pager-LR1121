@@ -936,6 +936,15 @@ void setup() {
 
 #if ENV_INCLUDE_GPS == 1
   the_mesh.applyGpsPrefs();
+  #if defined(T_LORA_PAGER_LR1121)
+  // The companion default is gps_enabled=0 (the phone toggles it on). The
+  // pager is a standalone GPS device with no such toggle, and applyGpsPrefs()
+  // above just turned the receiver off — force it on so it actually acquires
+  // and MicroNMEA parses the stream. (ENV_SKIP_GPS_DETECT makes gps_detected
+  // true so this setting is accepted.)
+  sensors.setSettingValue("gps", "1");
+  sensors.setSettingValue("gps_interval", "1");
+  #endif
 #endif
 
 #ifdef DISPLAY_CLASS
