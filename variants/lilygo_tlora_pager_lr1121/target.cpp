@@ -358,13 +358,37 @@ extern "C" uint8_t tpager_kb_last_raw() {
   return v;
 }
 
+#ifdef TPAGER_CHARGE_DEBUG
+extern "C" void tpager_charge_debug();   // defined below, near the BQ25896 code
+#endif
+
 extern "C" void variant_loop() {
   if (!_kb_ok) { kb_begin(); return; }   // try late init if I2C wasn't ready
+
+  uint32_t now_ms = millis();
+
+#ifdef TPAGER_CHARGE_DEBUG
+  // Periodic charge-state diagnostic — tells us whether "stops at N%" is the
+  // charger terminating early or the BQ27220 gauge under-reading. Once/3 s so
+  // it never adds meaningful bus load. Sniff over USB with pyserial dtr=True.
+  // Off by default: the Serial spam interleaves with companion-protocol frames.
+  static uint32_t s_last_chg_dbg = 0;
+  if (now_ms - s_last_chg_dbg >= 3000) { s_last_chg_dbg = now_ms; tpager_charge_debug(); }
+#endif
 
   // Static so the modifier state survives across loop ticks — FN can be
   // pressed for hundreds of millis before the user reaches the next key.
   static bool s_fn_held = false;
   static bool s_caps_lock = false;     // sticky; toggled by the key right of M
+
+  // Throttle the TCA8418 FIFO poll. _kb.available() is an I2C read on the
+  // shared Wire bus (RTC / XL9555 / BQ25896 also live there); running it every
+  // loop iteration floods the bus and starves the other devices, which surfaces
+  // as general UI lag. The key FIFO buffers events, so draining it every ~15 ms
+  // batches the I2C traffic with no perceptible typing latency.
+  static uint32_t s_last_kb_poll = 0;
+  if (now_ms - s_last_kb_poll < 15) return;
+  s_last_kb_poll = now_ms;
 
   while (_kb.available()) {
     uint8_t ev = _kb.getEvent();
@@ -527,12 +551,87 @@ static int read_battery_percent() {
   return (int)((hi << 8) | lo);
 }
 
+// Battery % from resting LiPo voltage. The BQ27220 gauge's coulomb-counted SoC
+// tops out around ~74% because its full-charge-capacity is programmed for a
+// larger cell than is installed — but the *voltage* it reports is accurate, so
+// we derive % from a standard single-cell LiPo discharge curve instead. Top of
+// the curve is 4.15 V = 100 % (a fully-charged cell rests there once off the
+// charger; ~4.2 V only occurs while actively charging).
+static int lipo_percent_from_mv(int mv) {
+  static const int kV[] = {3270,3610,3690,3710,3730,3750,3770,3790,3800,3820,
+                           3840,3850,3870,3910,3950,3980,4020,4080,4110,4150};
+  static const int kP[] = {   0,   5,  10,  15,  20,  25,  30,  35,  40,  45,
+                             50,  55,  60,  65,  70,  75,  80,  85,  90, 100};
+  const int n = (int)(sizeof(kV) / sizeof(kV[0]));
+  if (mv <= kV[0])   return 0;
+  if (mv >= kV[n-1]) return 100;
+  for (int i = 1; i < n; i++) {
+    if (mv < kV[i]) {
+      int span = kV[i] - kV[i - 1];
+      return kP[i - 1] + (kP[i] - kP[i - 1]) * (mv - kV[i - 1]) / span;
+    }
+  }
+  return 100;
+}
+
+static int read_battery_percent_voltage() {
+  int mv = read_bq27220_word(BQ27220_REG_VOLTAGE);
+  if (mv < 0) return -1;
+  int pct = lipo_percent_from_mv(mv);
+  // Light EMA so transmit-time voltage sag doesn't make the reading jitter.
+  static float ema = -1.0f;
+  if (ema < 0.0f) ema = (float)pct;
+  else            ema = ema * 0.8f + (float)pct * 0.2f;
+  return (int)(ema + 0.5f);
+}
+
 extern "C" int tpager_battery_percent() {
-  int p = read_battery_percent();
+  int p = read_battery_percent_voltage();
   if (p < 0) return -1;
   if (p > 100) return 100;
   return p;
 }
+
+#ifdef TPAGER_CHARGE_DEBUG
+static int read_bq25896_reg(uint8_t reg) {
+  Wire.beginTransmission(BQ25896_I2C_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(true) != 0) return -1;
+  if (Wire.requestFrom(BQ25896_I2C_ADDR, (uint8_t)1) != 1) return -1;
+  return (int)Wire.read();
+}
+
+// Dump charge state so we can tell whether the battery "stops at ~74%" because
+// the BQ25896 terminates charge early (low VREG target / not-charging) or the
+// BQ27220 fuel gauge is under-reading a cell that is actually full:
+//   - state=done + vbat ~4.15-4.2 V  → cell full, gauge under-reads (calib)
+//   - state=fast-charging, soc stuck → gauge issue while still charging
+//   - state=not-charging + low vbat + low vreg → charger terminating early
+// REG0B = system status (VBUS_STAT[7:5] / CHRG_STAT[4:3] / PG_STAT[2]).
+// REG06 = charge-voltage limit: VREG = 3.840 V + VREG_field*16 mV (POR = 4.208 V).
+extern "C" void tpager_charge_debug() {
+  int reg0b = read_bq25896_reg(0x0B);
+  int reg06 = read_bq25896_reg(0x06);
+  int mv    = read_bq27220_word(BQ27220_REG_VOLTAGE);
+  int soc   = read_battery_percent();
+  if (reg0b < 0 || reg06 < 0) { Serial.println("CHG: BQ25896 read err"); return; }
+
+  static const char* kChg[4] = { "not-charging", "pre-charge", "fast-charging", "done" };
+  int chrg_stat = (reg0b >> 3) & 0x3;
+  int pg        = (reg0b >> 2) & 0x1;
+  int vreg_mv   = 3840 + (((reg06 >> 2) & 0x3F) * 16);
+
+  // BQ27220 capacity standard-commands: RemainingCapacity 0x10,
+  // FullChargeCapacity 0x12, DesignCapacity 0x3C (all mAh). If the cell is
+  // full but soc<100, FCC/design set for a bigger cell is the smoking gun.
+  int rem  = read_bq27220_word(0x10);
+  int fcc  = read_bq27220_word(0x12);
+  int dcap = read_bq27220_word(0x3C);
+
+  Serial.printf("CHG: soc=%d%% vbat=%dmV state=%s pg=%d vreg=%dmV | rem=%dmAh fcc=%dmAh design=%dmAh (REG0B=0x%02X REG06=0x%02X)\n",
+                soc, mv, kChg[chrg_stat], pg, vreg_mv, rem, fcc, dcap, reg0b, reg06);
+}
+#endif  // TPAGER_CHARGE_DEBUG
 
 // --- Variant status hook (called from UITask::renderCurrScreen home-screen) ---
 #include <helpers/ui/DisplayDriver.h>
@@ -566,8 +665,8 @@ void render_extra_status_lines(DisplayDriver* d, int start_y) {
   d->print(tmp);
   y += 10;
 
-  // Battery percentage (BQ27220 fuel gauge)
-  int bat = read_battery_percent();
+  // Battery percentage (derived from BQ27220 voltage — see tpager_battery_percent)
+  int bat = tpager_battery_percent();
   d->setCursor(0, y);
   if (bat >= 0 && bat <= 100) {
     sprintf(tmp, "BAT: %d %%", bat);
