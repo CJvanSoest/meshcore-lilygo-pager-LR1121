@@ -1239,7 +1239,11 @@ void MyMesh::handleCmdFrame(size_t len) {
     uint32_t secs;
     memcpy(&secs, &cmd_frame[1], 4);
     uint32_t curr = getRTCClock()->getCurrentTime();
-    if (secs >= curr) {
+    // Accept a normal forward set, OR any plausible real wall-clock time
+    // (>= 2024-01-01). The latter lets a clock that is wrongly running ahead
+    // (e.g. a bogus RTC value broadcast in adverts) be corrected backwards;
+    // the old `secs >= curr`-only rule made a fast clock impossible to fix.
+    if (secs >= curr || secs >= 1704067200UL /* 2024-01-01 UTC */) {
       getRTCClock()->setCurrentTime(secs);
       writeOKFrame();
     } else {
