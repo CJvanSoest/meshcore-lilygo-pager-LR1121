@@ -193,6 +193,9 @@ static void update_tile_badges() {
 // "add new channel". Out-of-range w.r.t. radio rows so existing
 // per-row dispatch ignores it.
 #define EDIT_IDX_NEW_CHANNEL  100
+// Text-input popup for the Settings "Set time" row (manual RTC set). Same
+// out-of-range trick as EDIT_IDX_NEW_CHANNEL so radio row dispatch ignores it.
+#define EDIT_IDX_SET_TIME     101
 
 // Chat view (S3.4 step 2/3) — opened when the user clicks an existing
 // channel row in the Messages tile. Single shared ring buffer keyed by
@@ -315,6 +318,8 @@ static bool chan_ring_has(uint8_t idx);
 static void contacts_list_populate();
 static void discovered_list_populate();
 static void settings_list_populate();
+static void open_set_time_popup();
+static uint32_t nl_local_to_epoch(int y, int mo, int d, int h, int mi);
 static void disc_menu_show(int disc_idx);
 static void disc_menu_close();
 static void con_menu_show(const uint8_t* pub_key);
@@ -400,6 +405,9 @@ extern "C" bool ui_get_home_loc(double* lat, double* lon) __attribute__((weak));
 extern "C" void ui_load_dm_history(const uint8_t* pub_key) __attribute__((weak));
 extern "C" void ui_set_home_loc(double lat, double lon) __attribute__((weak));
 extern "C" uint32_t ui_get_now_epoch() __attribute__((weak));
+// Manually set the RTC (UTC epoch). Backup for no-GPS / no-app. Returns false
+// if the epoch is implausible (rejected firmware-side).
+extern "C" bool ui_set_device_time(uint32_t epoch) __attribute__((weak));
 
 // Reference location for distance-to-contact: live GPS if we have a fix,
 // otherwise the saved Home (item 8). (0,0) if neither is available.
@@ -531,7 +539,8 @@ extern "C" void ui_input_char(char c) {
   // letters + digits + '-', node name accepts mixed-case letters +
   // digits + '-' + '_'. All accept '\b' (pop) and '\n' (commit).
   if ((s_editing_idx == 0 || s_editing_idx == 7 || s_editing_idx == 8 ||
-       s_editing_idx == EDIT_IDX_NEW_CHANNEL) && s_text_value_label) {
+       s_editing_idx == EDIT_IDX_NEW_CHANNEL ||
+       s_editing_idx == EDIT_IDX_SET_TIME) && s_text_value_label) {
     if (c == '\n') {
       close_edit_popup_apply();
       return;
@@ -544,6 +553,8 @@ extern "C" void ui_input_char(char c) {
       } else if (s_editing_idx == 8) {  // node name — wider set
         allow = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                 (c >= '0' && c <= '9') || c == '-' || c == '_';
+      } else if (s_editing_idx == EDIT_IDX_SET_TIME) {  // "YYYY-MM-DD HH:MM"
+        allow = (c >= '0' && c <= '9') || c == '-' || c == ':' || c == ' ';
       } else {  // scope or new-channel
         allow = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
       }
@@ -2040,6 +2051,33 @@ static void close_edit_popup_apply() {
     return;
   }
 
+  // Special case: manual clock set from the Settings list. Parses the typed
+  // "YYYY-MM-DD HH:MM" (NL local), converts to a UTC epoch and writes the RTC,
+  // then returns the user to the Settings list.
+  if (s_editing_idx == EDIT_IDX_SET_TIME) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0;
+    bool ok = false;
+    if (sscanf(s_text_buf, "%d-%d-%d %d:%d", &y, &mo, &d, &h, &mi) == 5 &&
+        mo >= 1 && mo <= 12 && d >= 1 && d <= 31 &&
+        h >= 0 && h <= 23 && mi >= 0 && mi <= 59) {
+      uint32_t ep = nl_local_to_epoch(y, mo, d, h, mi);
+      if (ui_set_device_time && ui_set_device_time(ep)) ok = true;
+    }
+    lv_obj_add_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
+    if (s_edit_group)     lv_group_set_editing(s_edit_group, false);
+    if (s_settings_group) lv_group_set_editing(s_settings_group, false);
+    s_editing_idx = -1;
+    settings_list_populate();
+    lv_indev_t* enc = tpager_lvgl_get_encoder();
+    if (enc && s_settings_group) {
+      lv_indev_set_group(enc, s_settings_group);
+      lv_group_set_editing(s_settings_group, false);
+    }
+    s_skip_next_click = true;
+    ui_toast(ok ? "Tijd ingesteld" : "Ongeldige tijd");
+    return;
+  }
+
   NodePrefs* p = s_self ? s_self->getPrefs() : nullptr;
   if (!p) return;
 
@@ -2272,6 +2310,9 @@ static void settings_row_clicked(lv_event_t* e) {
       else if (s_screen_off_ms < 300000UL)  s_screen_off_ms = 300000UL;
       else                                   s_screen_off_ms =  30000UL;
       break;
+    case SET_TIME:
+      open_set_time_popup();   // opens the text-input popup; switches groups
+      return;                  // don't rebuild the list under the popup
     default:
       break;
   }
@@ -2282,30 +2323,103 @@ static void settings_row_clicked(lv_event_t* e) {
 // applying EU daylight-saving: CET = UTC+1 in winter, CEST = UTC+2 from the
 // last Sunday of March 01:00 UTC to the last Sunday of October 01:00 UTC.
 // 24-hour output via the caller's %02d:%02d formatting.
-static void epoch_to_nl_local(uint32_t ep, int* hh, int* mm, int* ss) {
+// Is Europe/Amsterdam on summer time (CEST, UTC+2) at this UTC instant?
+static bool nl_is_dst(uint32_t ep) {
   time_t t = (time_t)ep;
   struct tm g;
   gmtime_r(&t, &g);                       // broken-down UTC
   const int mon = g.tm_mon + 1;           // 1-12
-  bool dst;
-  if (mon < 3 || mon > 10) {
-    dst = false;                          // Nov-Feb: winter
-  } else if (mon > 3 && mon < 10) {
-    dst = true;                           // Apr-Sep: summer
-  } else {
-    // March / October (both 31 days): switch on the last Sunday at 01:00 UTC.
-    const int dim = 31;
-    const int wday_last = (g.tm_wday + (dim - g.tm_mday)) % 7;  // 0 = Sunday
-    const int last_sun  = dim - wday_last;
-    if (mon == 3)
-      dst = (g.tm_mday > last_sun) || (g.tm_mday == last_sun && g.tm_hour >= 1);
-    else
-      dst = (g.tm_mday < last_sun) || (g.tm_mday == last_sun && g.tm_hour <  1);
-  }
-  time_t local = t + (dst ? 2 * 3600 : 1 * 3600);
+  if (mon < 3 || mon > 10) return false;  // Nov-Feb: winter
+  if (mon > 3 && mon < 10)  return true;  // Apr-Sep: summer
+  // March / October (both 31 days): switch on the last Sunday at 01:00 UTC.
+  const int dim = 31;
+  const int wday_last = (g.tm_wday + (dim - g.tm_mday)) % 7;  // 0 = Sunday
+  const int last_sun  = dim - wday_last;
+  if (mon == 3)
+    return (g.tm_mday > last_sun) || (g.tm_mday == last_sun && g.tm_hour >= 1);
+  else
+    return (g.tm_mday < last_sun) || (g.tm_mday == last_sun && g.tm_hour <  1);
+}
+
+// Fill a broken-down NL-local time (all fields) from a UTC epoch.
+static void epoch_to_nl_tm(uint32_t ep, struct tm* out) {
+  time_t local = (time_t)ep + (nl_is_dst(ep) ? 2 * 3600 : 1 * 3600);
+  gmtime_r(&local, out);
+}
+
+static void epoch_to_nl_local(uint32_t ep, int* hh, int* mm, int* ss) {
   struct tm l;
-  gmtime_r(&local, &l);
+  epoch_to_nl_tm(ep, &l);
   *hh = l.tm_hour; *mm = l.tm_min; *ss = l.tm_sec;
+}
+
+// Convert broken-down civil UTC fields to a Unix epoch (days-from-civil,
+// Howard Hinnant). Avoids the non-portable timegm().
+static uint32_t civil_to_epoch(int y, int mo, int d, int h, int mi, int s) {
+  y -= mo <= 2;
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153u * (unsigned)(mo + (mo > 2 ? -3 : 9)) + 2) / 5 + (unsigned)d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  const long days = (long)era * 146097 + (long)doe - 719468;
+  return (uint32_t)(days * 86400L + h * 3600 + mi * 60 + s);
+}
+
+// Convert NL-local wall-clock fields (as shown on screen) to a UTC epoch.
+// DST for the entered instant is decided from a provisional UTC estimate;
+// the only ambiguity is the 1-hour DST-switch window, harmless for a manual
+// clock set.
+static uint32_t nl_local_to_epoch(int y, int mo, int d, int h, int mi) {
+  uint32_t prov = civil_to_epoch(y, mo, d, h, mi, 0);   // fields treated as UTC
+  int off = nl_is_dst(prov) ? 2 * 3600 : 1 * 3600;
+  return prov - (uint32_t)off;
+}
+
+// Manual clock set. Opens the shared text-input popup pre-filled with the
+// current NL-local date/time as "YYYY-MM-DD HH:MM"; commit path is the
+// EDIT_IDX_SET_TIME branch in close_edit_popup_apply().
+static void open_set_time_popup() {
+  s_editing_idx = EDIT_IDX_SET_TIME;
+  lv_obj_remove_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
+  if (s_edit_widget) { lv_obj_del(s_edit_widget); s_edit_widget = nullptr; }
+  if (s_text_value_label) { lv_obj_del(s_text_value_label); s_text_value_label = nullptr; }
+  lv_group_remove_all_objs(s_edit_group);
+
+  uint32_t ep = ui_get_now_epoch ? ui_get_now_epoch() : 0;
+  if (ep > 0) {
+    struct tm l;
+    epoch_to_nl_tm(ep, &l);
+    snprintf(s_text_buf, sizeof(s_text_buf), "%04d-%02d-%02d %02d:%02d",
+             l.tm_year + 1900, l.tm_mon + 1, l.tm_mday, l.tm_hour, l.tm_min);
+  } else {
+    snprintf(s_text_buf, sizeof(s_text_buf), "2026-01-01 00:00");
+  }
+  s_text_len = strlen(s_text_buf);
+  lv_label_set_text(s_edit_title, "Set time (NL)  YYYY-MM-DD HH:MM");
+
+  s_text_value_label = lv_label_create(s_edit_popup);
+  lv_obj_set_style_text_color(s_text_value_label, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_font(s_text_value_label, &lv_font_montserrat_24, 0);
+  lv_label_set_text(s_text_value_label, s_text_buf);
+  lv_obj_align(s_text_value_label, LV_ALIGN_CENTER, 0, -12);
+
+  s_edit_widget = lv_button_create(s_edit_popup);
+  lv_obj_set_size(s_edit_widget, 60, 24);
+  lv_obj_align(s_edit_widget, LV_ALIGN_BOTTOM_MID, 0, -20);
+  lv_obj_t* okl = lv_label_create(s_edit_widget);
+  lv_label_set_text(okl, "OK");
+  lv_obj_center(okl);
+  lv_obj_add_event_cb(s_edit_widget, [](lv_event_t*) {
+    close_edit_popup_apply();
+  }, LV_EVENT_CLICKED, nullptr);
+
+  lv_group_add_obj(s_edit_group, s_edit_widget);
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (enc) {
+    lv_indev_set_group(enc, s_edit_group);
+    lv_group_focus_obj(s_edit_widget);
+    lv_group_set_editing(s_edit_group, true);
+  }
 }
 
 static void settings_list_populate() {
@@ -2359,11 +2473,12 @@ static void settings_list_populate() {
 
   uint32_t ep = ui_get_now_epoch ? ui_get_now_epoch() : 0;
   if (ep > 0) {
-    int hh, mm, ss;
-    epoch_to_nl_local(ep, &hh, &mm, &ss);
-    snprintf(buf, sizeof(buf), "Tijd (NL): %02d:%02d:%02d", hh, mm, ss);
+    struct tm l;
+    epoch_to_nl_tm(ep, &l);
+    snprintf(buf, sizeof(buf), "Tijd: %02d-%02d %02d:%02d  (zet)",
+             l.tm_mday, l.tm_mon + 1, l.tm_hour, l.tm_min);
   } else {
-    snprintf(buf, sizeof(buf), "Tijd (NL): (geen klok)");
+    snprintf(buf, sizeof(buf), "Tijd: (geen klok)  (zet)");
   }
   build_row(buf, SET_TIME);
 

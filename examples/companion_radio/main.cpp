@@ -791,6 +791,17 @@ extern "C" uint32_t ui_get_now_epoch() {
   return the_mesh.getRTCClock()->getCurrentTime();
 }
 
+// Manually set the device clock from the on-device UI (backup for when there
+// is no GPS fix and no phone app). epoch is a UTC Unix timestamp. Unlike the
+// serial CMD_SET_DEVICE_TIME path there is no monotonic guard here: a user
+// correcting a wrong (e.g. fast) clock must be able to move it in either
+// direction. Writes through to the battery-backed RTC.
+extern "C" bool ui_set_device_time(uint32_t epoch) {
+  if (epoch < 1704067200UL) return false;   // reject implausible (< 2024-01-01)
+  the_mesh.getRTCClock()->setCurrentTime(epoch);
+  return true;
+}
+
 // Send a chat message to a channel by index. Returns false if the
 // channel is empty or sendGroupMessage rejects the payload. The
 // caller is responsible for the channel index — variant UIs find it
