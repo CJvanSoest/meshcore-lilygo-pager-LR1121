@@ -26,6 +26,15 @@ static lv_indev_t*   s_encoder = NULL;
 static volatile int  s_enc_diff = 0;
 static volatile bool s_enc_pressed = false;
 
+// Raw encoder mode: when on, wheel ticks + a click edge are captured for a
+// custom widget (the Set-time field editor) instead of being fed to LVGL's
+// group/edit machinery. Lets 'a'/'d' pick a field while the wheel scrolls its
+// value, exactly as the field editor wants.
+static volatile bool s_enc_raw       = false;
+static volatile int  s_raw_accum     = 0;
+static volatile bool s_raw_click     = false;
+static volatile bool s_raw_prev_down = false;
+
 static uint8_t s_buf1[DRAW_BUF_ROWS * 480 * 2];   // 16-bit colour
 static uint8_t s_buf2[DRAW_BUF_ROWS * 480 * 2];
 
@@ -64,6 +73,18 @@ static void tpager_lvgl_encoder_read(lv_indev_t* /*indev*/, lv_indev_data_t* dat
   int16_t step = 0;
   if (s_enc_diff > 0) { step = 1; s_enc_diff--; }
   else if (s_enc_diff < 0) { step = -1; s_enc_diff++; }
+
+  if (s_enc_raw) {
+    // Capture ticks + a press edge for the custom field editor; report
+    // nothing to LVGL so the underlying group stays put.
+    if (step) s_raw_accum += step;
+    if (s_enc_pressed && !s_raw_prev_down) s_raw_click = true;
+    s_raw_prev_down = s_enc_pressed;
+    data->enc_diff = 0;
+    data->state = LV_INDEV_STATE_RELEASED;
+    return;
+  }
+
   data->enc_diff = step;
   data->state = s_enc_pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
   // NOTE: continue_reading deliberately left false. With it set true LVGL
@@ -74,6 +95,20 @@ static void tpager_lvgl_encoder_read(lv_indev_t* /*indev*/, lv_indev_data_t* dat
 // Public input feeders — called from variant_loop or UITask poll routines.
 void tpager_lvgl_encoder_delta(int delta)      { s_enc_diff += delta; }
 void tpager_lvgl_encoder_pressed(bool pressed) { s_enc_pressed = pressed; }
+
+// Raw encoder accessors — used by the Set-time field editor.
+void tpager_lvgl_encoder_set_raw(bool on) {
+  s_enc_raw = on;
+  s_raw_accum = 0;
+  s_raw_click = false;
+  s_raw_prev_down = s_enc_pressed;   // don't fire a click from an already-held button
+}
+int tpager_lvgl_encoder_take_delta() {
+  int d = s_raw_accum; s_raw_accum = 0; return d;
+}
+bool tpager_lvgl_encoder_take_click() {
+  bool c = s_raw_click; s_raw_click = false; return c;
+}
 
 static uint32_t tpager_lvgl_tick(void) { return (uint32_t)millis(); }
 

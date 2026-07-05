@@ -110,6 +110,11 @@ static unsigned long s_sattest_next = 0;
 // ---- Settings tile (item 8) ----
 static lv_obj_t*   s_settings_list = nullptr;
 static lv_group_t* s_settings_group = nullptr;
+// Set-time field editor: NL-local {year, month, day, hour, minute} and the
+// currently-selected field (0..4). 'a'/'d' move the selection, the wheel
+// scrolls the selected field's value (raw encoder mode).
+static int s_time_val[5] = {2026, 1, 1, 0, 0};
+static int s_time_sel    = 2;
 // Runtime-adjustable display sleep timeout (battery saver). Cycled from the
 // Settings list; not persisted (resets to the compile-time default on boot).
 static unsigned long s_screen_off_ms = AUTO_OFF_MILLIS;
@@ -320,6 +325,8 @@ static void discovered_list_populate();
 static void settings_list_populate();
 static void open_set_time_popup();
 static uint32_t nl_local_to_epoch(int y, int mo, int d, int h, int mi);
+static void time_editor_render();
+static void time_field_adjust(int dir);
 static void disc_menu_show(int disc_idx);
 static void disc_menu_close();
 static void con_menu_show(const uint8_t* pub_key);
@@ -538,9 +545,16 @@ extern "C" void ui_input_char(char c) {
   // freq accepts digits + '.', scope + new-channel accept lowercase
   // letters + digits + '-', node name accepts mixed-case letters +
   // digits + '-' + '_'. All accept '\b' (pop) and '\n' (commit).
+  // Set-time field editor: 'a'/'d' move the selected field, wheel scrolls
+  // value (handled in UITask::loop), Enter commits. No text buffer.
+  if (s_editing_idx == EDIT_IDX_SET_TIME) {
+    if (c == '\n') { close_edit_popup_apply(); return; }
+    if (c == 'a' || c == 'A') { if (s_time_sel > 0) s_time_sel--; time_editor_render(); }
+    else if (c == 'd' || c == 'D') { if (s_time_sel < 4) s_time_sel++; time_editor_render(); }
+    return;
+  }
   if ((s_editing_idx == 0 || s_editing_idx == 7 || s_editing_idx == 8 ||
-       s_editing_idx == EDIT_IDX_NEW_CHANNEL ||
-       s_editing_idx == EDIT_IDX_SET_TIME) && s_text_value_label) {
+       s_editing_idx == EDIT_IDX_NEW_CHANNEL) && s_text_value_label) {
     if (c == '\n') {
       close_edit_popup_apply();
       return;
@@ -553,8 +567,6 @@ extern "C" void ui_input_char(char c) {
       } else if (s_editing_idx == 8) {  // node name — wider set
         allow = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                 (c >= '0' && c <= '9') || c == '-' || c == '_';
-      } else if (s_editing_idx == EDIT_IDX_SET_TIME) {  // "YYYY-MM-DD HH:MM"
-        allow = (c >= '0' && c <= '9') || c == '-' || c == ':' || c == ' ';
       } else {  // scope or new-channel
         allow = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
       }
@@ -688,6 +700,7 @@ static void enter_subscreen(int idx) {
   if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
   if (s_advert_root)     lv_obj_add_flag(s_advert_root,     LV_OBJ_FLAG_HIDDEN);
   if (s_settings_list)   lv_obj_add_flag(s_settings_list,   LV_OBJ_FLAG_HIDDEN);
+  tpager_lvgl_encoder_set_raw(false);   // defensively release the wheel
   if (s_disc_menu_popup) lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
   if (s_con_menu_popup)  lv_obj_add_flag(s_con_menu_popup,  LV_OBJ_FLAG_HIDDEN);
   if (s_ch_menu_popup)   lv_obj_add_flag(s_ch_menu_popup,   LV_OBJ_FLAG_HIDDEN);
@@ -819,6 +832,7 @@ static void leave_subscreen() {
   if (s_discovered_list) lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
   if (s_advert_root)     lv_obj_add_flag(s_advert_root,     LV_OBJ_FLAG_HIDDEN);
   if (s_settings_list)   lv_obj_add_flag(s_settings_list,   LV_OBJ_FLAG_HIDDEN);
+  tpager_lvgl_encoder_set_raw(false);   // defensively release the wheel
   if (s_disc_menu_popup) lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
   if (s_con_menu_popup)  lv_obj_add_flag(s_con_menu_popup,  LV_OBJ_FLAG_HIDDEN);
   if (s_ch_menu_popup)   lv_obj_add_flag(s_ch_menu_popup,   LV_OBJ_FLAG_HIDDEN);
@@ -1803,9 +1817,9 @@ static void advert_btn_clicked(lv_event_t* e) {
   bool flood = (bool)(intptr_t)lv_event_get_user_data(e);
   bool ok = ui_send_self_advert ? ui_send_self_advert(flood) : false;
   if (ok) {
-    ui_toast(flood ? "Advert verstuurd\n(flood)" : "Advert verstuurd\n(direct)");
+    ui_toast(flood ? "Advert sent\n(flood)" : "Advert sent\n(direct)");
   } else {
-    ui_toast("Advert mislukt");
+    ui_toast("Advert failed");
   }
 }
 
@@ -2051,18 +2065,14 @@ static void close_edit_popup_apply() {
     return;
   }
 
-  // Special case: manual clock set from the Settings list. Parses the typed
-  // "YYYY-MM-DD HH:MM" (NL local), converts to a UTC epoch and writes the RTC,
+  // Special case: manual clock set from the Settings list. Reads the field
+  // editor's NL-local values, converts to a UTC epoch and writes the RTC,
   // then returns the user to the Settings list.
   if (s_editing_idx == EDIT_IDX_SET_TIME) {
-    int y = 0, mo = 0, d = 0, h = 0, mi = 0;
-    bool ok = false;
-    if (sscanf(s_text_buf, "%d-%d-%d %d:%d", &y, &mo, &d, &h, &mi) == 5 &&
-        mo >= 1 && mo <= 12 && d >= 1 && d <= 31 &&
-        h >= 0 && h <= 23 && mi >= 0 && mi <= 59) {
-      uint32_t ep = nl_local_to_epoch(y, mo, d, h, mi);
-      if (ui_set_device_time && ui_set_device_time(ep)) ok = true;
-    }
+    tpager_lvgl_encoder_set_raw(false);   // hand the wheel back to LVGL
+    uint32_t ep = nl_local_to_epoch(s_time_val[0], s_time_val[1], s_time_val[2],
+                                    s_time_val[3], s_time_val[4]);
+    bool ok = ui_set_device_time && ui_set_device_time(ep);
     lv_obj_add_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
     if (s_edit_group)     lv_group_set_editing(s_edit_group, false);
     if (s_settings_group) lv_group_set_editing(s_settings_group, false);
@@ -2074,7 +2084,7 @@ static void close_edit_popup_apply() {
       lv_group_set_editing(s_settings_group, false);
     }
     s_skip_next_click = true;
-    ui_toast(ok ? "Tijd ingesteld" : "Ongeldige tijd");
+    ui_toast(ok ? "Time set" : "Invalid time");
     return;
   }
 
@@ -2295,14 +2305,14 @@ static void settings_row_clicked(lv_event_t* e) {
       if (ui_get_self_loc) ui_get_self_loc(&lat, &lon);
       if ((lat || lon) && ui_set_home_loc) {
         ui_set_home_loc(lat, lon);
-        ui_toast("Home opgeslagen");
+        ui_toast("Home saved");
       } else {
-        ui_toast("Geen GPS-fix\nGeen home opgeslagen");
+        ui_toast("No GPS fix\nHome not saved");
       }
       break;
     }
     case SET_HOME_INFO:
-      if (ui_set_home_loc) { ui_set_home_loc(0, 0); ui_toast("Home gewist"); }
+      if (ui_set_home_loc) { ui_set_home_loc(0, 0); ui_toast("Home cleared"); }
       break;
     case SET_SCREEN_OFF:
       if      (s_screen_off_ms <  60000UL)  s_screen_off_ms =  60000UL;
@@ -2375,9 +2385,54 @@ static uint32_t nl_local_to_epoch(int y, int mo, int d, int h, int mi) {
   return prov - (uint32_t)off;
 }
 
-// Manual clock set. Opens the shared text-input popup pre-filled with the
-// current NL-local date/time as "YYYY-MM-DD HH:MM"; commit path is the
-// EDIT_IDX_SET_TIME branch in close_edit_popup_apply().
+static int time_days_in_month(int y, int mo) {
+  static const int dm[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (mo == 2) {
+    bool leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    return leap ? 29 : 28;
+  }
+  return dm[(mo - 1) % 12];
+}
+
+// Render the field editor into s_text_value_label; the selected field is
+// wrapped in [brackets]. Format: "[YYYY]-MM-DD  HH:MM".
+static void time_editor_render() {
+  if (!s_text_value_label) return;
+  char raw[5][8];
+  snprintf(raw[0], sizeof(raw[0]), "%04d", s_time_val[0]);
+  snprintf(raw[1], sizeof(raw[1]), "%02d", s_time_val[1]);
+  snprintf(raw[2], sizeof(raw[2]), "%02d", s_time_val[2]);
+  snprintf(raw[3], sizeof(raw[3]), "%02d", s_time_val[3]);
+  snprintf(raw[4], sizeof(raw[4]), "%02d", s_time_val[4]);
+  char f[5][12];
+  for (int i = 0; i < 5; i++) {
+    if (i == s_time_sel) snprintf(f[i], sizeof(f[i]), "[%s]", raw[i]);
+    else                 snprintf(f[i], sizeof(f[i]), "%s", raw[i]);
+  }
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%s-%s-%s  %s:%s", f[0], f[1], f[2], f[3], f[4]);
+  lv_label_set_text(s_text_value_label, buf);
+}
+
+// Step the selected field by dir (+1/-1), wrapping within its range, then
+// clamp the day to the (possibly shortened) month length.
+static void time_field_adjust(int dir) {
+  int* v = &s_time_val[s_time_sel];
+  switch (s_time_sel) {
+    case 0: *v += dir; if (*v < 2024) *v = 2099; else if (*v > 2099) *v = 2024; break;
+    case 1: *v += dir; if (*v < 1) *v = 12; else if (*v > 12) *v = 1; break;
+    case 2: { int dim = time_days_in_month(s_time_val[0], s_time_val[1]);
+              *v += dir; if (*v < 1) *v = dim; else if (*v > dim) *v = 1; break; }
+    case 3: *v += dir; if (*v < 0) *v = 23; else if (*v > 23) *v = 0; break;
+    case 4: *v += dir; if (*v < 0) *v = 59; else if (*v > 59) *v = 0; break;
+  }
+  int dim = time_days_in_month(s_time_val[0], s_time_val[1]);
+  if (s_time_val[2] > dim) s_time_val[2] = dim;
+}
+
+// Manual clock set. Opens a field editor pre-filled with the current NL-local
+// date/time. 'a'/'d' pick a field, the wheel scrolls its value (raw encoder
+// mode, polled in UITask::loop), a click commits, a long-press cancels.
 static void open_set_time_popup() {
   s_editing_idx = EDIT_IDX_SET_TIME;
   lv_obj_remove_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
@@ -2386,40 +2441,38 @@ static void open_set_time_popup() {
   lv_group_remove_all_objs(s_edit_group);
 
   uint32_t ep = ui_get_now_epoch ? ui_get_now_epoch() : 0;
+  struct tm l;
   if (ep > 0) {
-    struct tm l;
     epoch_to_nl_tm(ep, &l);
-    snprintf(s_text_buf, sizeof(s_text_buf), "%04d-%02d-%02d %02d:%02d",
-             l.tm_year + 1900, l.tm_mon + 1, l.tm_mday, l.tm_hour, l.tm_min);
   } else {
-    snprintf(s_text_buf, sizeof(s_text_buf), "2026-01-01 00:00");
+    memset(&l, 0, sizeof(l));
+    l.tm_year = 2026 - 1900; l.tm_mon = 0; l.tm_mday = 1;
   }
-  s_text_len = strlen(s_text_buf);
-  lv_label_set_text(s_edit_title, "Set time (NL)  YYYY-MM-DD HH:MM");
+  s_time_val[0] = l.tm_year + 1900;
+  s_time_val[1] = l.tm_mon + 1;
+  s_time_val[2] = l.tm_mday;
+  s_time_val[3] = l.tm_hour;
+  s_time_val[4] = l.tm_min;
+  s_time_sel = 2;   // start on the day field
+
+  lv_label_set_text(s_edit_title, "Set time (NL)");
 
   s_text_value_label = lv_label_create(s_edit_popup);
   lv_obj_set_style_text_color(s_text_value_label, lv_color_hex(0xffffff), 0);
   lv_obj_set_style_text_font(s_text_value_label, &lv_font_montserrat_24, 0);
-  lv_label_set_text(s_text_value_label, s_text_buf);
-  lv_obj_align(s_text_value_label, LV_ALIGN_CENTER, 0, -12);
+  lv_obj_align(s_text_value_label, LV_ALIGN_CENTER, 0, -8);
+  time_editor_render();
 
-  s_edit_widget = lv_button_create(s_edit_popup);
-  lv_obj_set_size(s_edit_widget, 60, 24);
-  lv_obj_align(s_edit_widget, LV_ALIGN_BOTTOM_MID, 0, -20);
-  lv_obj_t* okl = lv_label_create(s_edit_widget);
-  lv_label_set_text(okl, "OK");
-  lv_obj_center(okl);
-  lv_obj_add_event_cb(s_edit_widget, [](lv_event_t*) {
-    close_edit_popup_apply();
-  }, LV_EVENT_CLICKED, nullptr);
+  // Hint line — parked in s_edit_widget so it is cleaned up on the next open.
+  s_edit_widget = lv_label_create(s_edit_popup);
+  lv_obj_set_style_text_color(s_edit_widget, lv_color_hex(0x8a94a0), 0);
+  lv_label_set_text(s_edit_widget,
+                    "a/d: field   wheel: value\nclick: OK   hold: cancel");
+  lv_obj_set_style_text_align(s_edit_widget, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(s_edit_widget, LV_ALIGN_BOTTOM_MID, 0, -14);
 
-  lv_group_add_obj(s_edit_group, s_edit_widget);
-  lv_indev_t* enc = tpager_lvgl_get_encoder();
-  if (enc) {
-    lv_indev_set_group(enc, s_edit_group);
-    lv_group_focus_obj(s_edit_widget);
-    lv_group_set_editing(s_edit_group, true);
-  }
+  // Take the wheel raw so a/d + rotation drive the fields directly.
+  tpager_lvgl_encoder_set_raw(true);
 }
 
 static void settings_list_populate() {
@@ -2475,10 +2528,10 @@ static void settings_list_populate() {
   if (ep > 0) {
     struct tm l;
     epoch_to_nl_tm(ep, &l);
-    snprintf(buf, sizeof(buf), "Tijd: %02d-%02d %02d:%02d  (zet)",
+    snprintf(buf, sizeof(buf), "Time: %02d-%02d %02d:%02d  (set)",
              l.tm_mday, l.tm_mon + 1, l.tm_hour, l.tm_min);
   } else {
-    snprintf(buf, sizeof(buf), "Tijd: (geen klok)  (zet)");
+    snprintf(buf, sizeof(buf), "Time: (no clock)  (set)");
   }
   build_row(buf, SET_TIME);
 
@@ -3149,11 +3202,15 @@ void UITask::loop() {
           if (s_edit_widget && (s_editing_idx == 2 || s_editing_idx == 6)) {
             lv_dropdown_close(s_edit_widget);
           }
-          // Route the encoder back to whichever list-group the popup
-          // was opened from: channels group for NEW_CHANNEL, otherwise
-          // the radio settings group.
-          lv_group_t* back_group = (s_editing_idx == EDIT_IDX_NEW_CHANNEL)
-                                   ? s_channel_group : s_radio_group;
+          // The Set-time editor holds the wheel raw — release it on cancel.
+          if (s_editing_idx == EDIT_IDX_SET_TIME) tpager_lvgl_encoder_set_raw(false);
+          // Route the encoder back to whichever list-group the popup was
+          // opened from: channels for NEW_CHANNEL, settings for SET_TIME,
+          // otherwise the radio settings group.
+          lv_group_t* back_group =
+              (s_editing_idx == EDIT_IDX_NEW_CHANNEL) ? s_channel_group :
+              (s_editing_idx == EDIT_IDX_SET_TIME)    ? s_settings_group :
+                                                        s_radio_group;
           lv_obj_add_flag(s_edit_popup, LV_OBJ_FLAG_HIDDEN);
           if (s_edit_group) lv_group_set_editing(s_edit_group, false);
           if (back_group)   lv_group_set_editing(back_group, false);
@@ -3166,6 +3223,10 @@ void UITask::loop() {
           // the LVGL long-press already handled this press (debounced inside).
           nav_back_one_level();
         }
+      } else if (s_editing_idx == EDIT_IDX_SET_TIME) {
+        // Short click in the Set-time editor commits (the wheel is raw, so
+        // LVGL never sees this press as a widget click).
+        close_edit_popup_apply();
       }
     }
     _auto_off = millis() + s_screen_off_ms;
@@ -3195,6 +3256,21 @@ void UITask::loop() {
   if (s_lvgl_ready && (long)(millis() - s_next_tick) >= 0) {
     s_next_tick = millis() + 5;
     lv_timer_handler();
+  }
+
+  // Set-time field editor: drain raw wheel ticks into the selected field.
+  // The list-focus sign is inverted in sub-screens, so a negative delta is
+  // "rotate up" — map that to +1 (increment) for an intuitive feel.
+  if (s_editing_idx == EDIT_IDX_SET_TIME) {
+    int d = tpager_lvgl_encoder_take_delta();
+    if (d) {
+      int dir = (d < 0) ? +1 : -1;
+      int n = (d < 0) ? -d : d;
+      for (int i = 0; i < n; i++) time_field_adjust(dir);
+      time_editor_render();
+      _auto_off = millis() + s_screen_off_ms;
+      if (_display && !_display->isOn()) _display->turnOn();
+    }
   }
 
   // Periodic refresh of the contacts list so the "last seen" column
