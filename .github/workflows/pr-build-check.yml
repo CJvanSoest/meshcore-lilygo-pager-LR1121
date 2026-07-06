@@ -42,6 +42,7 @@ jobs:
           - LilyGo_Tlora_C6_repeater_
           # ESP32-S3 — LilyGo T-Lora Pager LR1121 (this fork's primary target)
           - T_LoRa_Pager_LR1121_companion_radio_usb
+          - T_LoRa_Pager_LR1121_repeater
 
     steps:
       - name: Clone Repo
