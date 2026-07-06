@@ -121,10 +121,16 @@ MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store
 // re-runs setFrequency/SF/BW/CR), so without the explicit
 // setRxBoostedGainMode() call below a UI-side toggle would only take
 // effect on the next reboot.
+// radio_set_params/radio_set_tx_power are provided per-variant (target.cpp).
+// Weak-declare them so shared companion targets that don't define them (Heltec,
+// RAK, ...) still build/link; the T-Pager variant provides strong definitions.
+// (v1.16 dropped Heltec's definition, so the plain calls no longer compiled.)
+void radio_set_params(float freq, float bw, uint8_t sf, uint8_t cr) __attribute__((weak));
+void radio_set_tx_power(int8_t dbm) __attribute__((weak));
 extern "C" void ui_apply_radio_changes() {
   auto* p = the_mesh.getNodePrefs();
-  radio_set_params(p->freq, p->bw, p->sf, p->cr);
-  radio_set_tx_power(p->tx_power_dbm);
+  if (radio_set_params) radio_set_params(p->freq, p->bw, p->sf, p->cr);
+  if (radio_set_tx_power) radio_set_tx_power(p->tx_power_dbm);
   radio_driver.setRxBoostedGainMode(p->rx_boosted_gain);
   the_mesh.savePrefs();
 }
