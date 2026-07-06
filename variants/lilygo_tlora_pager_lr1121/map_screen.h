@@ -11,7 +11,7 @@
 // Create the Map screen as a child of `parent` (UITask.cpp's
 // s_subscreen_root). Hidden by default. Idempotent: a second call returns
 // the existing root without rebuilding.
-lv_obj_t* map_screen_create(lv_obj_t* parent);
+lv_obj_t *map_screen_create(lv_obj_t *parent);
 
 // Visibility — called by UITask.cpp on tile enter/leave.
 void map_screen_show();

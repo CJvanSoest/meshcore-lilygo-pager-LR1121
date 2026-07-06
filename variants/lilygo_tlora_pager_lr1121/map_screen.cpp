@@ -1,39 +1,46 @@
-#include <lvgl.h>
-#include <Arduino.h>
-#include <stdio.h>
-#include <math.h>
 #include "map_screen.h"
+
 #include "map_tiles.h"
 #include "target.h"
 
-static lv_obj_t* s_root          = nullptr;
-static lv_obj_t* s_body          = nullptr;   // text shown when no tile is up
-static lv_obj_t* s_status_strip  = nullptr;  // top status bar
+#include <Arduino.h>
+#include <lvgl.h>
+#include <math.h>
+#include <stdio.h>
+
+static lv_obj_t *s_root = nullptr;
+static lv_obj_t *s_body = nullptr;         // text shown when no tile is up
+static lv_obj_t *s_status_strip = nullptr; // top status bar
 
 // 3x3 tile raster centred on the current lat/lon with sub-tile pixel offset,
 // so the exact centre lands at the viewport centre (needed for an accurate
 // position crosshair + node markers). Index = row*3 + col, centre = index 4.
-static lv_obj_t* s_tiles[9]      = { nullptr };
-static char      s_tile_path[9][map_tiles::PATH_BUF_MIN];
+static lv_obj_t *s_tiles[9] = { nullptr };
+static char s_tile_path[9][map_tiles::PATH_BUF_MIN];
 // Remember which (z, x, y) each slot currently shows so auto-follow can skip
 // the expensive PNG re-decode when only the sub-tile offset changed.
-static int       s_tile_z[9]     = { 0 };
-static int       s_tile_x[9]     = { -1 };
-static int       s_tile_y[9]     = { -1 };
+static int s_tile_z[9] = { 0 };
+static int s_tile_x[9] = { -1 };
+static int s_tile_y[9] = { -1 };
 
 // Position crosshair (own GPS location) — drawn at the viewport centre.
-static lv_obj_t* s_cross_h       = nullptr;
-static lv_obj_t* s_cross_v       = nullptr;
-static lv_obj_t* s_cross_dot     = nullptr;
+static lv_obj_t *s_cross_h = nullptr;
+static lv_obj_t *s_cross_v = nullptr;
+static lv_obj_t *s_cross_dot = nullptr;
 
 // Node markers projected onto the map. Contacts + discovered nodes that carry
 // a valid lat/lon, fetched via the weak ui_get_map_markers() bridge. Each
 // carries its name so the map can label the nearby nodes.
-struct MapMarker { double lat; double lon; uint8_t is_repeater; char name[24]; };
-extern "C" int ui_get_map_markers(MapMarker* out, int max) __attribute__((weak));
+struct MapMarker {
+  double lat;
+  double lon;
+  uint8_t is_repeater;
+  char name[24];
+};
+extern "C" int ui_get_map_markers(MapMarker *out, int max) __attribute__((weak));
 static constexpr int MAX_MARKERS = 24;
-static lv_obj_t* s_marker[MAX_MARKERS]       = { nullptr };
-static lv_obj_t* s_marker_label[MAX_MARKERS] = { nullptr };
+static lv_obj_t *s_marker[MAX_MARKERS] = { nullptr };
+static lv_obj_t *s_marker_label[MAX_MARKERS] = { nullptr };
 
 // Centre fallback: Den Haag, NL. UITask overrides this with saved Home on
 // open, then with live GPS a few seconds later (map_screen_set_center).
@@ -42,49 +49,44 @@ static constexpr double DEFAULT_LON_DEG = 4.310;
 // The SD holds carto z16+z17 (legacy `tiles/<z>/<x>/<y>.png` layout). z16 is
 // a good neighbourhood-scale default; resolve_tile_path falls back to the
 // legacy schema so the "carto" source label is cosmetic.
-static constexpr int    DEFAULT_ZOOM    = 16;
-static constexpr const char* DEFAULT_SOURCE = "carto";
+static constexpr int DEFAULT_ZOOM = 16;
+static constexpr const char *DEFAULT_SOURCE = "carto";
 
 // Live centre — mutated by map_screen_set_center(). Starts at the fallback.
 static double s_center_lat = DEFAULT_LAT_DEG;
 static double s_center_lon = DEFAULT_LON_DEG;
-static int    s_zoom       = DEFAULT_ZOOM;
+static int s_zoom = DEFAULT_ZOOM;
 
 // Clamp panning-zoom to the band present on the SD card (z14..z17).
 static constexpr int MAP_ZOOM_MIN = 14;
 static constexpr int MAP_ZOOM_MAX = 17;
 
 // GPS status for the strip — provided by the firmware (target.cpp).
-extern "C" int  ui_get_sat_count() __attribute__((weak));
+extern "C" int ui_get_sat_count() __attribute__((weak));
 extern "C" bool ui_get_gps_valid() __attribute__((weak));
 
 // Try the MAPS.md primary path first, then fall back to the Ripple
 // legacy schema; returns true if either exists on /sd and fills both
 // the POSIX path (for fopen) and the LVGL drive-A path (for image src).
-static bool resolve_tile_path(const char* source, int zoom, int tx, int ty,
-                              char* lvgl_out, int lvgl_cap) {
+static bool resolve_tile_path(const char *source, int zoom, int tx, int ty, char *lvgl_out, int lvgl_cap) {
   char posix_path[map_tiles::PATH_BUF_MIN];
 
-  map_tiles::format_tile_path(posix_path, sizeof(posix_path),
-                              "/sd", source, zoom, tx, ty);
-  if (FILE* f = fopen(posix_path, "r")) {
+  map_tiles::format_tile_path(posix_path, sizeof(posix_path), "/sd", source, zoom, tx, ty);
+  if (FILE *f = fopen(posix_path, "r")) {
     fclose(f);
-    map_tiles::format_tile_path(lvgl_out, lvgl_cap,
-                                "A:", source, zoom, tx, ty);
+    map_tiles::format_tile_path(lvgl_out, lvgl_cap, "A:", source, zoom, tx, ty);
     return true;
   }
-  map_tiles::format_tile_path_legacy(posix_path, sizeof(posix_path),
-                                     "/sd", zoom, tx, ty);
-  if (FILE* f = fopen(posix_path, "r")) {
+  map_tiles::format_tile_path_legacy(posix_path, sizeof(posix_path), "/sd", zoom, tx, ty);
+  if (FILE *f = fopen(posix_path, "r")) {
     fclose(f);
-    map_tiles::format_tile_path_legacy(lvgl_out, lvgl_cap,
-                                       "A:", zoom, tx, ty);
+    map_tiles::format_tile_path_legacy(lvgl_out, lvgl_cap, "A:", zoom, tx, ty);
     return true;
   }
   return false;
 }
 
-lv_obj_t* map_screen_create(lv_obj_t* parent) {
+lv_obj_t *map_screen_create(lv_obj_t *parent) {
   if (s_root) return s_root;
 
   s_root = lv_obj_create(parent);
@@ -185,7 +187,7 @@ lv_obj_t* map_screen_create(lv_obj_t* parent) {
 
   // Controls hint — bottom strip, solid black + white so it stays readable
   // outdoors too.
-  lv_obj_t* hint = lv_label_create(s_root);
+  lv_obj_t *hint = lv_label_create(s_root);
   lv_label_set_text(hint, "WASD pan  Z/X zoom  long-press back");
   lv_obj_set_style_bg_color(hint, lv_color_hex(0x000000), 0);
   lv_obj_set_style_bg_opa(hint, LV_OPA_COVER, 0);
@@ -197,8 +199,7 @@ lv_obj_t* map_screen_create(lv_obj_t* parent) {
 
 // Project the node markers onto the current view and place the crosshair.
 // Cheap (no PNG decode) so it can run on every auto-follow re-centre.
-static void map_place_overlays(int cx, int cy, int W, int H,
-                               double c_world_x, double c_world_y) {
+static void map_place_overlays(int cx, int cy, int W, int H, double c_world_x, double c_world_y) {
   // Crosshair at the exact viewport centre = own position once following GPS.
   if (s_cross_h) {
     lv_obj_set_pos(s_cross_h, cx - 11, cy - 1);
@@ -224,16 +225,16 @@ static void map_place_overlays(int cx, int cy, int W, int H,
   const double world_px = (double)(1 << s_zoom) * map_tiles::TILE_PX;
   for (int i = 0; i < MAX_MARKERS; i++) {
     if (i >= n) {
-      if (s_marker[i])       lv_obj_add_flag(s_marker[i],       LV_OBJ_FLAG_HIDDEN);
+      if (s_marker[i]) lv_obj_add_flag(s_marker[i], LV_OBJ_FLAG_HIDDEN);
       if (s_marker_label[i]) lv_obj_add_flag(s_marker_label[i], LV_OBJ_FLAG_HIDDEN);
       continue;
     }
     const auto mc = map_tiles::latlon_to_tile(mk[i].lat, mk[i].lon, s_zoom);
     double mwx = (double)mc.tile_x * map_tiles::TILE_PX + mc.px_in_tile;
     double mwy = (double)mc.tile_y * map_tiles::TILE_PX + mc.py_in_tile;
-    double dx  = mwx - c_world_x;
+    double dx = mwx - c_world_x;
     // Fold across the antimeridian (harmless for NL, correct globally).
-    if (dx >  world_px * 0.5) dx -= world_px;
+    if (dx > world_px * 0.5) dx -= world_px;
     if (dx < -world_px * 0.5) dx += world_px;
     int sx = cx + (int)lround(dx);
     int sy = cy + (int)lround(mwy - c_world_y);
@@ -244,10 +245,10 @@ static void map_place_overlays(int cx, int cy, int W, int H,
       continue;
     }
     if (mk[i].is_repeater) {
-      lv_obj_set_style_radius(s_marker[i], 0, 0);                       // square
+      lv_obj_set_style_radius(s_marker[i], 0, 0);                        // square
       lv_obj_set_style_bg_color(s_marker[i], lv_color_hex(0x36C24A), 0); // green
     } else {
-      lv_obj_set_style_radius(s_marker[i], 4, 0);                       // dot
+      lv_obj_set_style_radius(s_marker[i], 4, 0);                        // dot
       lv_obj_set_style_bg_color(s_marker[i], lv_color_hex(0xFAA61A), 0); // orange
     }
     lv_obj_set_pos(s_marker[i], sx - 4, sy - 4);
@@ -279,15 +280,14 @@ static void map_render() {
   if (!sd_ok) {
     for (int i = 0; i < 9; i++)
       if (s_tiles[i]) lv_obj_add_flag(s_tiles[i], LV_OBJ_FLAG_HIDDEN);
-    if (s_cross_h)   lv_obj_add_flag(s_cross_h,   LV_OBJ_FLAG_HIDDEN);
-    if (s_cross_v)   lv_obj_add_flag(s_cross_v,   LV_OBJ_FLAG_HIDDEN);
+    if (s_cross_h) lv_obj_add_flag(s_cross_h, LV_OBJ_FLAG_HIDDEN);
+    if (s_cross_v) lv_obj_add_flag(s_cross_v, LV_OBJ_FLAG_HIDDEN);
     if (s_cross_dot) lv_obj_add_flag(s_cross_dot, LV_OBJ_FLAG_HIDDEN);
     if (s_body) {
       lv_obj_remove_flag(s_body, LV_OBJ_FLAG_HIDDEN);
-      lv_label_set_text(s_body,
-        "Map view\n\n"
-        "SD: mount FAILED.\n"
-        "Insert card, then re-open the Map tile.");
+      lv_label_set_text(s_body, "Map view\n\n"
+                                "SD: mount FAILED.\n"
+                                "Insert card, then re-open the Map tile.");
     }
     return;
   }
@@ -303,7 +303,7 @@ static void map_render() {
   const auto tc = map_tiles::latlon_to_tile(s_center_lat, s_center_lon, s_zoom);
   const int TX = tc.tile_x;
   const int TY = tc.tile_y;
-  const int origin_x = cx - tc.px_in_tile;   // screen pos of centre-tile TL
+  const int origin_x = cx - tc.px_in_tile; // screen pos of centre-tile TL
   const int origin_y = cy - tc.py_in_tile;
   const double c_world_x = (double)TX * map_tiles::TILE_PX + tc.px_in_tile;
   const double c_world_y = (double)TY * map_tiles::TILE_PX + tc.py_in_tile;
@@ -313,39 +313,44 @@ static void map_render() {
   for (int r = -1; r <= 1; r++) {
     for (int c = -1; c <= 1; c++) {
       const int idx = (r + 1) * 3 + (c + 1);
-      lv_obj_t* img = s_tiles[idx];
+      lv_obj_t *img = s_tiles[idx];
       if (!img) continue;
       const int tx = map_tiles::wrap_tile_x(TX + c, s_zoom);
       const int ty = TY + r;
-      if (ty < 0 || ty > maxt) { lv_obj_add_flag(img, LV_OBJ_FLAG_HIDDEN); continue; }
+      if (ty < 0 || ty > maxt) {
+        lv_obj_add_flag(img, LV_OBJ_FLAG_HIDDEN);
+        continue;
+      }
       // Reload the PNG only when this slot now shows a different tile;
       // otherwise just reposition (cheap — no decode) for smooth following.
       if (s_tile_z[idx] != s_zoom || s_tile_x[idx] != tx || s_tile_y[idx] != ty) {
-        if (resolve_tile_path(DEFAULT_SOURCE, s_zoom, tx, ty,
-                              s_tile_path[idx], sizeof(s_tile_path[idx]))) {
+        if (resolve_tile_path(DEFAULT_SOURCE, s_zoom, tx, ty, s_tile_path[idx], sizeof(s_tile_path[idx]))) {
           lv_image_set_src(img, s_tile_path[idx]);
-          s_tile_z[idx] = s_zoom; s_tile_x[idx] = tx; s_tile_y[idx] = ty;
+          s_tile_z[idx] = s_zoom;
+          s_tile_x[idx] = tx;
+          s_tile_y[idx] = ty;
         } else {
-          s_tile_z[idx] = 0; s_tile_x[idx] = -1; s_tile_y[idx] = -1;
+          s_tile_z[idx] = 0;
+          s_tile_x[idx] = -1;
+          s_tile_y[idx] = -1;
           lv_obj_add_flag(img, LV_OBJ_FLAG_HIDDEN);
           continue;
         }
       }
-      lv_obj_set_pos(img, origin_x + c * map_tiles::TILE_PX,
-                          origin_y + r * map_tiles::TILE_PX);
+      lv_obj_set_pos(img, origin_x + c * map_tiles::TILE_PX, origin_y + r * map_tiles::TILE_PX);
       lv_obj_remove_flag(img, LV_OBJ_FLAG_HIDDEN);
       shown++;
     }
   }
-  Serial.printf("MAP: centre (%.4f, %.4f) z=%d tile(%d,%d) shown=%d\n",
-                s_center_lat, s_center_lon, s_zoom, TX, TY, shown);
+  Serial.printf("MAP: centre (%.4f, %.4f) z=%d tile(%d,%d) shown=%d\n", s_center_lat, s_center_lon, s_zoom,
+                TX, TY, shown);
 
   if (shown == 0) {
-    if (s_cross_h)   lv_obj_add_flag(s_cross_h,   LV_OBJ_FLAG_HIDDEN);
-    if (s_cross_v)   lv_obj_add_flag(s_cross_v,   LV_OBJ_FLAG_HIDDEN);
+    if (s_cross_h) lv_obj_add_flag(s_cross_h, LV_OBJ_FLAG_HIDDEN);
+    if (s_cross_v) lv_obj_add_flag(s_cross_v, LV_OBJ_FLAG_HIDDEN);
     if (s_cross_dot) lv_obj_add_flag(s_cross_dot, LV_OBJ_FLAG_HIDDEN);
     for (int i = 0; i < MAX_MARKERS; i++) {
-      if (s_marker[i])       lv_obj_add_flag(s_marker[i],       LV_OBJ_FLAG_HIDDEN);
+      if (s_marker[i]) lv_obj_add_flag(s_marker[i], LV_OBJ_FLAG_HIDDEN);
       if (s_marker_label[i]) lv_obj_add_flag(s_marker_label[i], LV_OBJ_FLAG_HIDDEN);
     }
     if (s_body) {
@@ -374,10 +379,11 @@ void map_screen_refresh_status() {
   int sats = ui_get_sat_count ? ui_get_sat_count() : -1;
   bool fix = ui_get_gps_valid ? ui_get_gps_valid() : false;
   char sbuf[16];
-  if (sats >= 0) snprintf(sbuf, sizeof(sbuf), "%s%d sat", fix ? "" : "~", sats);
-  else           snprintf(sbuf, sizeof(sbuf), "-- sat");
-  snprintf(buf, sizeof(buf), "z%d  %s  %.4f,%.4f",
-           s_zoom, sbuf, s_center_lat, s_center_lon);
+  if (sats >= 0)
+    snprintf(sbuf, sizeof(sbuf), "%s%d sat", fix ? "" : "~", sats);
+  else
+    snprintf(sbuf, sizeof(sbuf), "-- sat");
+  snprintf(buf, sizeof(buf), "z%d  %s  %.4f,%.4f", s_zoom, sbuf, s_center_lat, s_center_lon);
   lv_label_set_text(s_status_strip, buf);
 }
 
@@ -418,7 +424,7 @@ void map_screen_show() {
 }
 
 void map_screen_set_center(double lat_deg, double lon_deg) {
-  if (lat_deg == 0.0 && lon_deg == 0.0) return;   // no fix / unset — ignore
+  if (lat_deg == 0.0 && lon_deg == 0.0) return; // no fix / unset — ignore
   s_center_lat = lat_deg;
   s_center_lon = lon_deg;
   // Re-render only while the map is on screen.

@@ -1,7 +1,19 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
 #include "MyMesh.h"
+#if defined(ESP_PLATFORM)
 #include <esp_heap_caps.h>  // heap_caps_calloc / MALLOC_CAP_SPIRAM
+#else
+// Non-ESP companion targets (nRF52/RP2040/STM32) have no PSRAM/heap_caps API —
+// fall back to plain calloc so the shared discovered/DM buffers still build.
+#include <stdlib.h>
+#define MALLOC_CAP_SPIRAM 0
+#define MALLOC_CAP_8BIT 0
+static inline void* heap_caps_calloc(size_t n, size_t sz, uint32_t caps) {
+  (void)caps;
+  return calloc(n, sz);
+}
+#endif
 
 // Believe it or not, this std C function is busted on some platforms!
 static uint32_t _atoi(const char* sp) {
@@ -459,6 +471,11 @@ extern "C" void ui_on_advert_seen(const uint8_t* pub_key, const char* name,
   }
 }
 
+// SD is only wired up on the T-Pager variant (strong sd_init() in its
+// target.cpp). This weak default lets non-pager companion targets build and
+// link — SD persistence just no-ops there. Declared before first use below.
+bool __attribute__((weak)) sd_init() { return false; }
+
 // ---- Discovered-nodes SD persistence (whole-cache binary dump) -------------
 void disc_persist_save() {
   if (!s_disc_cache || !sd_init()) return;
@@ -602,7 +619,7 @@ extern "C" void ui_refresh_open_dm(const uint8_t* pub_key) __attribute__((weak))
 // ---- DM history SD persistence --------------------------------------------
 // One append-log per peer at /sd/dm_<hex8>.dat. Each record is
 // [uint8 from_me][uint8 len][len bytes]. Loaded into the ring on chat open.
-bool sd_init();   // from target.cpp
+// sd_init() declared+weak-defaulted above (near disc_persist_save).
 static bool dm_has_active_history(const uint8_t* pub_key);   // fwd
 
 static void dm_hist_path(const uint8_t* pub_key, char* out, size_t cap) {
@@ -872,11 +889,14 @@ void setup() {
   // S3.6 follow-up — confirm PSRAM is alive. Without this, the chat /
   // discovered / DM ring buffers (heap_caps_calloc(MALLOC_CAP_SPIRAM))
   // silently return NULL and the UI shows empty lists. Banner is also
-  // useful in the next round of testing.
+  // useful in the next round of testing. ESP-only (psramFound()/ESP.* are
+  // Arduino-ESP32 globals); other companion targets skip it.
+#if defined(ESP_PLATFORM)
   Serial.printf("[BOOT] psramFound=%d psram_size=%u free_psram=%u\n",
                 psramFound() ? 1 : 0,
                 (unsigned)ESP.getPsramSize(),
                 (unsigned)ESP.getFreePsram());
+#endif
 
 #ifdef DISPLAY_CLASS
   DisplayDriver* disp = NULL;
