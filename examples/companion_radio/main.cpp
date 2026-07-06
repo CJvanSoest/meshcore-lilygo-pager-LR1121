@@ -1,7 +1,19 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
 #include "MyMesh.h"
+#if defined(ESP_PLATFORM)
 #include <esp_heap_caps.h>  // heap_caps_calloc / MALLOC_CAP_SPIRAM
+#else
+// Non-ESP companion targets (nRF52/RP2040/STM32) have no PSRAM/heap_caps API —
+// fall back to plain calloc so the shared discovered/DM buffers still build.
+#include <stdlib.h>
+#define MALLOC_CAP_SPIRAM 0
+#define MALLOC_CAP_8BIT 0
+static inline void* heap_caps_calloc(size_t n, size_t sz, uint32_t caps) {
+  (void)caps;
+  return calloc(n, sz);
+}
+#endif
 
 // Believe it or not, this std C function is busted on some platforms!
 static uint32_t _atoi(const char* sp) {
@@ -877,11 +889,14 @@ void setup() {
   // S3.6 follow-up — confirm PSRAM is alive. Without this, the chat /
   // discovered / DM ring buffers (heap_caps_calloc(MALLOC_CAP_SPIRAM))
   // silently return NULL and the UI shows empty lists. Banner is also
-  // useful in the next round of testing.
+  // useful in the next round of testing. ESP-only (psramFound()/ESP.* are
+  // Arduino-ESP32 globals); other companion targets skip it.
+#if defined(ESP_PLATFORM)
   Serial.printf("[BOOT] psramFound=%d psram_size=%u free_psram=%u\n",
                 psramFound() ? 1 : 0,
                 (unsigned)ESP.getPsramSize(),
                 (unsigned)ESP.getFreePsram());
+#endif
 
 #ifdef DISPLAY_CLASS
   DisplayDriver* disp = NULL;
