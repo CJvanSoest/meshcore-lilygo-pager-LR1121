@@ -352,6 +352,9 @@ static void style_popup_button(lv_obj_t* btn) {
 // handler refetches contact info on-demand via ui_get_dm_contact_info(idx).
 
 extern "C" void tpager_power_off() __attribute__((weak));
+// Turn the GPS receiver (UART parse + power rail) on/off — grace-window battery
+// saving, driven from the loop below based on which tile is open.
+extern "C" void ui_set_gps_active(bool on) __attribute__((weak));
 extern "C" void ui_apply_radio_changes() __attribute__((weak));
 // Companion writes the new default-scope name + derived HMAC key into
 // NodePrefs and persists. Empty name = wildcard / no scope.
@@ -624,6 +627,12 @@ static void nav_back_one_level() {
   s_skip_next_click = true;
 }
 static unsigned long s_btn_press_at = 0;
+// Captured at press-down: were we on the home carousel when this press began?
+// Power-off (3 s hold) is only allowed from the home carousel — inside any
+// subscreen/chat a long hold must only navigate back, never power off. We
+// latch it at press time because the back-while-held may leave the subscreen
+// (→ carousel) before the button is released.
+static bool s_press_on_home = false;
 static bool s_lvgl_ready = false;
 static unsigned long s_next_tick = 0;
 static unsigned long s_next_status = 0;
@@ -956,6 +965,11 @@ static void radio_list_populate(NodePrefs* p, int focus_row) {
 // either opens the add popup or (later, step 2) the chat view.
 
 static void channel_row_clicked(lv_event_t* e) {
+  // Swallow the stray click that LVGL emits on the now-focused list row when a
+  // long-press-back closed a chat with the button still held. Without this the
+  // channel action popup pops up right after leaving a chat. A genuine click
+  // from within the list leaves s_skip_next_click false and works normally.
+  if (s_skip_next_click) { s_skip_next_click = false; return; }
   int idx = (int)(intptr_t)lv_event_get_user_data(e);
   if (idx < 0) {
     open_add_channel_popup();
@@ -1581,6 +1595,7 @@ static void contacts_list_populate() {
   // handler only needs the pub_key, so we cache just that per row to
   // stay light on DRAM (UiContact is ~80 bytes; pub_key is 32).
   static auto contact_row_clicked = +[](lv_event_t* e) {
+    if (s_skip_next_click) { s_skip_next_click = false; return; }  // stray click after chat-close
     const uint8_t* pk = (const uint8_t*)lv_event_get_user_data(e);
     if (!pk) return;
     con_menu_show(pk);
@@ -1695,6 +1710,7 @@ static void contacts_list_populate() {
 // history pulled from the per-contact-tagged ring buffer in main.cpp.
 
 static void dm_row_clicked(lv_event_t* e) {
+  if (s_skip_next_click) { s_skip_next_click = false; return; }  // stray click after chat-close
   int idx = (int)(intptr_t)lv_event_get_user_data(e);
   UiContact ci;
   if (!ui_get_dm_contact_info || !ui_get_dm_contact_info(idx, &ci)) return;
@@ -1788,6 +1804,7 @@ extern "C" void ui_refresh_open_dm(const uint8_t* pub_key) {
 // [Cancel].
 
 static void disc_row_clicked(lv_event_t* e) {
+  if (s_skip_next_click) { s_skip_next_click = false; return; }  // stray click after chat-close
   int idx = (int)(intptr_t)lv_event_get_user_data(e);
   disc_menu_show(idx);
 }
@@ -2898,7 +2915,7 @@ static void build_ui() {
   // Discovered click-popup (S3.6b). Reused container; hidden by default,
   // shown by disc_menu_show() with the row index baked in s_disc_menu_pubidx.
   s_disc_menu_popup = lv_obj_create(scr);
-  lv_obj_set_size(s_disc_menu_popup, lv_pct(80), 130);
+  lv_obj_set_size(s_disc_menu_popup, lv_pct(80), 96);
   lv_obj_center(s_disc_menu_popup);
   lv_obj_set_style_bg_color(s_disc_menu_popup, lv_color_hex(0x1c2530), 0);
   lv_obj_set_style_border_width(s_disc_menu_popup, 2, 0);
@@ -2912,12 +2929,14 @@ static void build_ui() {
   lv_obj_add_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
 
   s_disc_menu_group = lv_group_create();
-  static const char* btn_labels[3] = {
+  // Two actions only — "Add to contacts" + "Cancel". The old "Add as favorite"
+  // row was dropped: adding + favouriting a discovered node in one step was
+  // confusing; favourite is a per-contact toggle you set later from Contacts.
+  static const char* btn_labels[2] = {
     "Add to contacts",
-    "Add as favorite",
     "Cancel",
   };
-  for (int b = 0; b < 3; b++) {
+  for (int b = 0; b < 2; b++) {
     s_disc_menu_buttons[b] = lv_button_create(s_disc_menu_popup);
     lv_obj_set_size(s_disc_menu_buttons[b], lv_pct(80), 26);
     style_popup_button(s_disc_menu_buttons[b]);
@@ -2928,22 +2947,21 @@ static void build_ui() {
     lv_obj_add_event_cb(s_disc_menu_buttons[b], [](lv_event_t* e) {
       lv_obj_t* tgt = (lv_obj_t*)lv_event_get_target(e);
       int which = -1;
-      for (int i = 0; i < 3; i++) if (s_disc_menu_buttons[i] == tgt) which = i;
+      for (int i = 0; i < 2; i++) if (s_disc_menu_buttons[i] == tgt) which = i;
       if (which < 0 || s_disc_menu_pubidx < 0) { disc_menu_close(); return; }
       bool ok = false;
-      // Add (0) / Add-favorite (1): use the identity captured at popup-open so
-      // a background re-sort can't retarget the add. Fall back to the legacy
-      // index path only if the by-key bridge isn't linked.
-      if ((which == 0 || which == 1)) {
-        bool fav = (which == 1);
+      // Add (0): use the identity captured at popup-open so a background
+      // re-sort can't retarget the add. Fall back to the legacy index path
+      // only if the by-key bridge isn't linked. (1) = Cancel.
+      if (which == 0) {
         if (s_disc_menu_valid && ui_add_contact_by_key) {
           ok = ui_add_contact_by_key(s_disc_menu_contact.pub_key,
                                      s_disc_menu_contact.name,
                                      s_disc_menu_contact.type,
                                      s_disc_menu_contact.gps_lat,
-                                     s_disc_menu_contact.gps_lon, fav);
+                                     s_disc_menu_contact.gps_lon, /*fav=*/false);
         } else if (ui_add_discovered_to_contacts) {
-          ok = ui_add_discovered_to_contacts(s_disc_menu_pubidx, fav);
+          ok = ui_add_discovered_to_contacts(s_disc_menu_pubidx, /*fav=*/false);
         }
       } else {
         ok = true;  // Cancel
@@ -3180,14 +3198,17 @@ void UITask::loop() {
     if (btn == LOW) {
       s_btn_press_at = millis();
       s_back_handled = false;   // arm a fresh one-back-per-press window
+      s_press_on_home = (!s_in_subscreen && !s_chat_open);  // latch for power-off gate
       tpager_lvgl_encoder_pressed(true);
     } else {
       unsigned long held = millis() - s_btn_press_at;
       tpager_lvgl_encoder_pressed(false);
-      // Very long press (≥3 s) from anywhere triggers a clean power-off
-      // via the BQ25896 BATFET_DIS bit — matches the LilyGo / Ripple
-      // factory behaviour when the dedicated power button is held.
-      if (held >= 3000 && tpager_power_off) {
+      // Very long press (≥3 s) triggers a clean power-off via the BQ25896
+      // BATFET_DIS bit — but ONLY when the press began on the home carousel
+      // (s_press_on_home). Inside a subscreen/chat a long hold just navigates
+      // back (handled below / by back-while-held), so you can't power off by
+      // accident while reading a channel.
+      if (held >= 3000 && s_press_on_home && tpager_power_off) {
         Serial.println("VERY_LONG_PRESS → tpager_power_off()");
         tpager_power_off();
       } else if (held >= 600) {
@@ -3316,6 +3337,27 @@ void UITask::loop() {
     char b[220];
     sattest_format(b, sizeof(b));
     lv_label_set_text(s_subscreen_body, b);
+  }
+
+  // GPS grace-window power management. The GPS is only worth powering while a
+  // screen that consumes a live fix is open — Map, Sat-test, or Settings
+  // (Save-home / time-sync). We keep it on for GPS_GRACE_MS after leaving so a
+  // quick hop back in doesn't force a cold start (no backup rail on this board).
+  // Boot starts the window open so the initial fix + RTC time-sync can happen.
+  if (ui_set_gps_active) {
+    static const uint32_t GPS_GRACE_MS = 3UL * 60UL * 1000UL;
+    static uint32_t s_gps_grace_until = GPS_GRACE_MS;   // on for the first 3 min
+    static bool     s_gps_on = true;                    // matches boot rail state
+    uint32_t now = millis();
+    bool wanted = (s_active_tile == TILE_MAP ||
+                   s_active_tile == TILE_SATTEST ||
+                   s_active_tile == TILE_SETTINGS);
+    if (wanted) s_gps_grace_until = now + GPS_GRACE_MS;
+    bool should_be_on = (int32_t)(s_gps_grace_until - now) > 0;
+    if (should_be_on != s_gps_on) {
+      s_gps_on = should_be_on;
+      ui_set_gps_active(s_gps_on);
+    }
   }
 
   // Periodically refresh battery + header data on the carousel + sub-screen.

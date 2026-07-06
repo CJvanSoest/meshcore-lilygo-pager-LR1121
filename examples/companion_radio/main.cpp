@@ -770,6 +770,25 @@ extern "C" void ui_get_self_loc(double* lat, double* lon) {
   if (lon) *lon = sensors.node_lon;
 }
 
+// GPS runtime power management (T-Pager grace-window, driven from UITask). Turns
+// the receiver's UART parsing on/off AND toggles the physical power rail so an
+// idle pager doesn't keep burning ~25 mA on a GPS nobody is reading. Weak:
+// tpager_gps_power is only linked in the T-Pager variant (no-op elsewhere).
+extern "C" void tpager_gps_power(bool on) __attribute__((weak));
+extern "C" void ui_set_gps_active(bool on) {
+#if ENV_INCLUDE_GPS == 1
+  if (on) {
+    if (tpager_gps_power) tpager_gps_power(true);   // rail up first — module boots
+    sensors.setSettingValue("gps", "1");            // resume UART drain/parse
+  } else {
+    sensors.setSettingValue("gps", "0");            // stop UART drain/parse
+    if (tpager_gps_power) tpager_gps_power(false);  // then cut the rail
+  }
+#else
+  (void)on;
+#endif
+}
+
 // Saved "home" location (T-Pager Settings tile). ui_get_home_loc returns
 // true only when a home has been stored (non-zero). ui_set_home_loc stores
 // + persists; (0,0) clears it.

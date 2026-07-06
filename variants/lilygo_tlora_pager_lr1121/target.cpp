@@ -186,6 +186,31 @@ static bool xl9555_set_output(uint8_t pin, bool high) {
   return Wire.endTransmission() == 0;
 }
 
+// --- GPS power rail (XL9555) ---------------------------------------------------
+// The u-blox MIA-M10Q hangs off XL9555 EXPANDS_GPS_EN (pin 4, Vcc) and
+// EXPANDS_GPS_RST (pin 7, active-low reset). Runtime power management: the UI
+// only powers the module while a GPS-consuming screen is open (+ a grace
+// window) to save battery. NB: no backup rail on this board, so a power-down
+// forces a cold start on the next power-up.
+#define EXPANDS_GPS_EN  4
+#define EXPANDS_GPS_RST 7
+extern "C" void tpager_gps_power(bool on) {
+#if ENV_INCLUDE_GPS
+  if (on) {
+    xl9555_set_output(EXPANDS_GPS_RST, false);  // hold in reset
+    xl9555_set_output(EXPANDS_GPS_EN,  true);   // power the GPS rail
+    delay(50);                                  // let the regulator settle
+    xl9555_set_output(EXPANDS_GPS_RST, true);   // release reset -> module boots
+    delay(20);
+  } else {
+    xl9555_set_output(EXPANDS_GPS_EN,  false);  // cut the rail
+    xl9555_set_output(EXPANDS_GPS_RST, false);  // hold reset low so nothing floats
+  }
+#else
+  (void)on;
+#endif
+}
+
 // --- SD card bringup ----------------------------------------------------------
 
 static bool s_sd_mounted = false;
@@ -266,20 +291,12 @@ void TLoraPagerBoard::begin() {
   xl9555_set_output(2, true);    // KB_RST HIGH — out of reset
   delay(20);
 
-  // GPS (L76K): power the rail via XL9555 EXPANDS_GPS_EN (pin 4) and lift
-  // the module out of reset via EXPANDS_GPS_RST (pin 7). Without GPS_EN the
-  // module has no Vcc, sends no NMEA, and EnvironmentSensorManager's boot
-  // probe (Serial1.available() within 1 s) sees nothing -> it marks GPS
-  // "not detected" and disables it permanently, so no fix is ever acquired.
-  // Must run before sensors.begin()/initBasicGPS() in main.cpp setup().
+  // GPS (u-blox MIA-M10Q): power the rail at boot so sensors.begin() /
+  // initBasicGPS() can probe the module and acquire an initial fix + time-sync.
+  // Runtime power management (grace-window power-down to save battery) is driven
+  // from the UI via tpager_gps_power(); see UITask.cpp.
 #if ENV_INCLUDE_GPS
-  #define EXPANDS_GPS_EN  4
-  #define EXPANDS_GPS_RST 7
-  xl9555_set_output(EXPANDS_GPS_RST, false);  // hold in reset
-  xl9555_set_output(EXPANDS_GPS_EN,  true);   // power the GPS rail
-  delay(50);                                  // let the regulator settle
-  xl9555_set_output(EXPANDS_GPS_RST, true);   // release reset -> module boots
-  delay(20);
+  tpager_gps_power(true);
 #endif
 }
 
