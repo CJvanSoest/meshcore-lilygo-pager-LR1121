@@ -40,13 +40,17 @@ jobs:
           # unrelated to this pager fork. Re-add once upstream resolves it.
           # ESP32-C6
           - LilyGo_Tlora_C6_repeater_
+          # LR1110 (nRF52)
+          - wio_wm1110_repeater
+          # SX1276 (ESP32)
+          - Tbeam_SX1276_repeater
           # ESP32-S3 — LilyGo T-Lora Pager LR1121 (this fork's primary target)
           - T_LoRa_Pager_LR1121_companion_radio_usb
           - T_LoRa_Pager_LR1121_repeater
 
     steps:
       - name: Clone Repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Build Environment
         uses: ./.github/actions/setup-build-environment
