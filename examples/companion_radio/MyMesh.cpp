@@ -983,15 +983,22 @@ void MyMesh::begin(bool has_display) {
 
   resetContacts();
   _store->loadContacts(this);
-  // Only seed the clock from stored contacts when the RTC has no plausible
-  // time of its own. This used to run every boot and overwrite a valid
-  // battery-backed / GPS / manually-set clock — and a single contact whose
-  // advert carried a future timestamp would then pin the clock into the
-  // future (e.g. +1 year) on every reboot. Keep a good clock; only fall back
-  // to contact timestamps when the RTC is genuinely unset (< 2024-01-01).
+#if defined(T_LORA_PAGER_LR1121)
+  // T-Pager: the clock is NEVER seeded from the network. bootstrapRTCfromContacts()
+  // derives time from stored contacts (whose timestamps ultimately come from other
+  // nodes' adverts), so a single peer with a wrong/future clock could — and did —
+  // pin our clock into the future on every reboot. The pager's clock comes only
+  // from GPS, the on-device set-time UI, or the phone app (CMD_SET_DEVICE_TIME).
+  // No other node can change it. (Live adverts only read the clock, never set it;
+  // the companion doesn't use CommonCLI's remote "clock sync"/"time" commands.)
+#else
+  // Other companions may seed the clock from contacts, but only when the RTC has
+  // no plausible time of its own — never overwrite a valid battery-backed / GPS /
+  // manually-set clock.
   if (getRTCClock()->getCurrentTime() < 1704067200UL) {
     bootstrapRTCfromContacts();
   }
+#endif
   addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure Andy's public channel
   _store->loadChannels(this);
 
