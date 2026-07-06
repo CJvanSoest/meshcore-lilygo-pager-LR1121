@@ -459,6 +459,11 @@ extern "C" void ui_on_advert_seen(const uint8_t* pub_key, const char* name,
   }
 }
 
+// SD is only wired up on the T-Pager variant (strong sd_init() in its
+// target.cpp). This weak default lets non-pager companion targets build and
+// link — SD persistence just no-ops there. Declared before first use below.
+bool __attribute__((weak)) sd_init() { return false; }
+
 // ---- Discovered-nodes SD persistence (whole-cache binary dump) -------------
 void disc_persist_save() {
   if (!s_disc_cache || !sd_init()) return;
@@ -602,7 +607,7 @@ extern "C" void ui_refresh_open_dm(const uint8_t* pub_key) __attribute__((weak))
 // ---- DM history SD persistence --------------------------------------------
 // One append-log per peer at /sd/dm_<hex8>.dat. Each record is
 // [uint8 from_me][uint8 len][len bytes]. Loaded into the ring on chat open.
-bool sd_init();   // from target.cpp
+// sd_init() declared+weak-defaulted above (near disc_persist_save).
 static bool dm_has_active_history(const uint8_t* pub_key);   // fwd
 
 static void dm_hist_path(const uint8_t* pub_key, char* out, size_t cap) {
