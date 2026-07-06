@@ -38,8 +38,7 @@ struct TileCoord {
 TileCoord latlon_to_tile(double lat_deg, double lon_deg, int zoom);
 
 // Inverse: north-west corner lat/lon of tile (x, y) at the given zoom.
-void tile_to_latlon(int tile_x, int tile_y, int zoom,
-                    double& lat_deg_out, double& lon_deg_out);
+void tile_to_latlon(int tile_x, int tile_y, int zoom, double &lat_deg_out, double &lon_deg_out);
 
 // Wrap tile_x modulo 2^zoom so panning across the antimeridian works.
 // Always returns a value in [0, 2^zoom).
@@ -51,12 +50,11 @@ int wrap_tile_x(int tile_x, int zoom);
 inline constexpr int PATH_BUF_MIN = 64;
 
 // Primary path per MAPS.md: <prefix>/tiles/<source>/<z>/<x>/<y>.png
-int format_tile_path(char* out, int cap, const char* prefix,
-                     const char* source, int zoom, int tile_x, int tile_y);
+int format_tile_path(char *out, int cap, const char *prefix, const char *source, int zoom, int tile_x,
+                     int tile_y);
 
 // Legacy fallback: <prefix>/tiles/<z>/<x>/<y>.png (Ripple Radio Europe
 // tileset has this layout — no <source> directory).
-int format_tile_path_legacy(char* out, int cap, const char* prefix,
-                            int zoom, int tile_x, int tile_y);
+int format_tile_path_legacy(char *out, int cap, const char *prefix, int zoom, int tile_x, int tile_y);
 
-}  // namespace map_tiles
+} // namespace map_tiles

@@ -2,23 +2,24 @@
 
 #define RADIOLIB_STATIC_ONLY 1
 #include <RadioLib.h>
-#include <helpers/ESP32Board.h>
 #include <helpers/AutoDiscoverRTCClock.h>
-#include <helpers/sensors/EnvironmentSensorManager.h>
-#include <helpers/radiolib/RadioLibWrappers.h>
+#include <helpers/ESP32Board.h>
 #include <helpers/radiolib/CustomLR1110.h>
 #include <helpers/radiolib/CustomLR1110Wrapper.h>
+#include <helpers/radiolib/RadioLibWrappers.h>
+#include <helpers/sensors/EnvironmentSensorManager.h>
 
 #ifdef DISPLAY_CLASS
-  #include "TPagerST7796Display.h"
-  #include <helpers/ui/MomentaryButton.h>
+#include "TPagerST7796Display.h"
+
+#include <helpers/ui/MomentaryButton.h>
 #endif
 
 class TLoraPagerBoard : public ESP32Board {
 public:
   void begin();
   uint16_t getBattMilliVolts() override;
-  const char* getManufacturerName() const override { return "LilyGo"; }
+  const char *getManufacturerName() const override { return "LilyGo"; }
 };
 
 extern TLoraPagerBoard board;
@@ -26,8 +27,8 @@ extern WRAPPER_CLASS radio_driver;
 extern AutoDiscoverRTCClock rtc_clock;
 extern EnvironmentSensorManager sensors;
 #ifdef DISPLAY_CLASS
-  extern DISPLAY_CLASS display;
-  extern MomentaryButton user_btn;
+extern DISPLAY_CLASS display;
+extern MomentaryButton user_btn;
 #endif
 
 bool radio_init();
