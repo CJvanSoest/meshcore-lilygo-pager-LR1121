@@ -568,48 +568,6 @@ static int read_battery_percent() {
   return (int)((hi << 8) | lo);
 }
 
-// Battery % from resting LiPo voltage. The BQ27220 gauge's coulomb-counted SoC
-// tops out around ~74% because its full-charge-capacity is programmed for a
-// larger cell than is installed — but the *voltage* it reports is accurate, so
-// we derive % from a standard single-cell LiPo discharge curve instead. Top of
-// the curve is 4.15 V = 100 % (a fully-charged cell rests there once off the
-// charger; ~4.2 V only occurs while actively charging).
-static int lipo_percent_from_mv(int mv) {
-  static const int kV[] = {3270,3610,3690,3710,3730,3750,3770,3790,3800,3820,
-                           3840,3850,3870,3910,3950,3980,4020,4080,4110,4150};
-  static const int kP[] = {   0,   5,  10,  15,  20,  25,  30,  35,  40,  45,
-                             50,  55,  60,  65,  70,  75,  80,  85,  90, 100};
-  const int n = (int)(sizeof(kV) / sizeof(kV[0]));
-  if (mv <= kV[0])   return 0;
-  if (mv >= kV[n-1]) return 100;
-  for (int i = 1; i < n; i++) {
-    if (mv < kV[i]) {
-      int span = kV[i] - kV[i - 1];
-      return kP[i - 1] + (kP[i] - kP[i - 1]) * (mv - kV[i - 1]) / span;
-    }
-  }
-  return 100;
-}
-
-static int read_battery_percent_voltage() {
-  int mv = read_bq27220_word(BQ27220_REG_VOLTAGE);
-  if (mv < 0) return -1;
-  int pct = lipo_percent_from_mv(mv);
-  // Light EMA so transmit-time voltage sag doesn't make the reading jitter.
-  static float ema = -1.0f;
-  if (ema < 0.0f) ema = (float)pct;
-  else            ema = ema * 0.8f + (float)pct * 0.2f;
-  return (int)(ema + 0.5f);
-}
-
-extern "C" int tpager_battery_percent() {
-  int p = read_battery_percent_voltage();
-  if (p < 0) return -1;
-  if (p > 100) return 100;
-  return p;
-}
-
-#ifdef TPAGER_CHARGE_DEBUG
 static int read_bq25896_reg(uint8_t reg) {
   Wire.beginTransmission(BQ25896_I2C_ADDR);
   Wire.write(reg);
@@ -618,6 +576,41 @@ static int read_bq25896_reg(uint8_t reg) {
   return (int)Wire.read();
 }
 
+// Battery % from coulomb-counted RemainingCapacity, NOT voltage.
+//
+// Two gotchas ruled out the obvious approaches:
+//  - The BQ27220's own StateOfCharge reads ~74% at full (its FullChargeCapacity
+//    is programmed for a bigger cell than is fitted), so it can't be used raw.
+//  - Voltage-based % looks right at rest but JUMPS to ~100% the instant USB is
+//    plugged in, because the charge current pushes the terminal voltage up to
+//    ~4.2 V regardless of the true state of charge.
+// RemainingCapacity (mAh) is integrated from current, so it neither over-reads
+// at full nor inflates on charge. We divide it by a full-charge reference that
+// self-calibrates: whenever the charger reports charge-complete we latch the
+// current RemainingCapacity as "100%". A sane default covers the first charge.
+static int s_batt_full_ref_mah = 1050;   // ~observed full (rem≈1010 at "done")
+
+extern "C" int tpager_battery_percent() {
+  int rem = read_bq27220_word(0x10);   // RemainingCapacity, mAh
+  if (rem < 0) return -1;
+
+  // Recalibrate the 100% reference on charge-complete: BQ25896 REG0B with
+  // PG_STAT set and CHRG_STAT==11 ("charge termination done"). Floor guard so a
+  // spurious read can't corrupt the reference.
+  int reg0b = read_bq25896_reg(0x0B);
+  if (reg0b >= 0) {
+    bool pg   = (reg0b >> 2) & 0x1;
+    int  chrg = (reg0b >> 3) & 0x3;
+    if (pg && chrg == 3 && rem > 500) s_batt_full_ref_mah = rem;
+  }
+
+  int pct = (int)((long)rem * 100 / s_batt_full_ref_mah);
+  if (pct < 0)   pct = 0;
+  if (pct > 100) pct = 100;
+  return pct;
+}
+
+#ifdef TPAGER_CHARGE_DEBUG
 // Dump charge state so we can tell whether the battery "stops at ~74%" because
 // the BQ25896 terminates charge early (low VREG target / not-charging) or the
 // BQ27220 fuel gauge is under-reading a cell that is actually full:

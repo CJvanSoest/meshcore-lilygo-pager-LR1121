@@ -90,6 +90,10 @@ static int       s_ch_menu_idx = -1;     // populated channel index
 static lv_group_t* s_group;          // carousel tiles
 static lv_group_t* s_radio_group;    // Radio settings list rows
 static lv_group_t* s_channel_group;  // Channels list rows
+static lv_group_t* s_chat_group;     // Deliberately EMPTY — bound while a chat
+                                     // (channel/DM) is open so a stray click
+                                     // lands on nothing (encoder scroll is
+                                     // handled manually in the loop, not here).
 static lv_group_t* s_contacts_group; // Contacts list rows
 static unsigned long s_contacts_next_refresh = 0;
 static lv_group_t* s_discovered_group; // Discovered list rows
@@ -106,6 +110,7 @@ static bool          s_map_follow = false;
 static unsigned long s_map_follow_next = 0;
 // Sat-test tile live-refresh tick.
 static unsigned long s_sattest_next = 0;
+static unsigned long s_settings_gps_next = 0;
 
 // ---- Settings tile (item 8) ----
 static lv_obj_t*   s_settings_list = nullptr;
@@ -1297,11 +1302,12 @@ static void dm_chat_view_open(const uint8_t* pub_key, const char* peer_name) {
   // chat compose is keyboard-driven so encoder rotation only scrolls
   // history (handled in UITask::loop).
   lv_indev_t* enc = tpager_lvgl_get_encoder();
-  if (enc && s_channel_group) {
-    // Reuse the channel chat's group (no widgets bound — empty group is
-    // fine; loop() takes over scroll handling for both modes).
-    lv_indev_set_group(enc, s_channel_group);
-    lv_group_set_editing(s_channel_group, false);
+  if (enc && s_chat_group) {
+    // Bind the deliberately-empty chat group so a short click in the DM view
+    // lands on nothing. (Previously this reused s_channel_group, whose focused
+    // "+ Add channel" row caught the click and popped the add-channel dialog.)
+    // Encoder rotation scrolls history via the loop, not this group.
+    lv_indev_set_group(enc, s_chat_group);
   }
 
   chat_history_render();
@@ -1373,6 +1379,12 @@ static void chat_view_open(int channel_idx) {
     snprintf(title, sizeof(title), "chat #%d", channel_idx);
   }
   lv_label_set_text(s_subscreen_title, title);
+
+  // Bind the empty chat group so a short click in the channel chat lands on
+  // nothing instead of re-firing channel_row_clicked on the focused row (which
+  // would re-open the ch_menu popup, or re-open Public). Scroll is loop-driven.
+  lv_indev_t* enc = tpager_lvgl_get_encoder();
+  if (enc && s_chat_group) lv_indev_set_group(enc, s_chat_group);
 
   chat_history_render();
   chat_compose_render();
@@ -2309,10 +2321,12 @@ static void back_long_press_event(lv_event_t* /*e*/) {
 // in this firmware, so they are intentionally omitted for now.
 enum {
   SET_SAVE_HOME = 0,
+  SET_GPS_INFO,       // live GPS fix/sat readout — informational, click no-ops
   SET_HOME_INFO,      // click = clear home
   SET_SCREEN_OFF,     // click = cycle timeout
   SET_TIME,           // display (NL local, DST-aware) — click refreshes
 };
+static lv_obj_t* s_settings_gps_lbl = nullptr;  // label of the GPS-status row
 
 static void settings_row_clicked(lv_event_t* e) {
   int act = (int)(intptr_t)lv_event_get_user_data(e);
@@ -2492,8 +2506,24 @@ static void open_set_time_popup() {
   tpager_lvgl_encoder_set_raw(true);
 }
 
+// Live GPS readout for the Settings tab so the user knows when a fix is
+// available to save as Home. Opening Settings powers the GPS (grace-window), so
+// this goes from "searching" to "fix" once the receiver locks.
+static void settings_gps_status(char* buf, int cap) {
+  bool fix    = ui_get_gps_valid   && ui_get_gps_valid();
+  int  infix  = ui_get_sat_count   ? ui_get_sat_count()   : -1;
+  int  inview = ui_get_sat_in_view ? ui_get_sat_in_view() : -1;
+  if (fix) {
+    snprintf(buf, cap, "GPS: fix - %d sat (Home ready)", infix < 0 ? 0 : infix);
+  } else {
+    snprintf(buf, cap, "GPS: searching... %d/%d sat",
+             infix < 0 ? 0 : infix, inview < 0 ? 0 : inview);
+  }
+}
+
 static void settings_list_populate() {
   if (!s_settings_list) return;
+  s_settings_gps_lbl = nullptr;   // stale after lv_obj_clean below
   lv_obj_clean(s_settings_list);
   if (s_settings_group) lv_group_remove_all_objs(s_settings_group);
 
@@ -2528,6 +2558,12 @@ static void settings_list_populate() {
   char buf[48];
 
   lv_obj_t* first = build_row("Save home = current GPS", SET_SAVE_HOME);
+
+  // Live GPS fix/sat status (refreshed ~1 Hz from the loop). Capture its label
+  // so we can update it in place without rebuilding the whole list.
+  settings_gps_status(buf, sizeof(buf));
+  lv_obj_t* gps_row = build_row(buf, SET_GPS_INFO);
+  s_settings_gps_lbl = lv_obj_get_child(gps_row, 0);
 
   double hlat = 0, hlon = 0;
   bool have_home = ui_get_home_loc && ui_get_home_loc(&hlat, &hlon);
@@ -2715,6 +2751,7 @@ static void build_ui() {
   lv_obj_add_flag(s_channel_list, LV_OBJ_FLAG_HIDDEN);
 
   s_channel_group = lv_group_create();
+  s_chat_group = lv_group_create();   // stays empty on purpose (see decl)
 
   // Contacts list (S3.5) — same row pattern as channels list. Built
   // once, hidden by default. Refilled on each enter from
@@ -3337,6 +3374,15 @@ void UITask::loop() {
     char b[220];
     sattest_format(b, sizeof(b));
     lv_label_set_text(s_subscreen_body, b);
+  }
+  // Live refresh of the Settings GPS-status row (~1 Hz), in place so focus and
+  // the rest of the list are undisturbed.
+  if (s_active_tile == TILE_SETTINGS && s_settings_gps_lbl &&
+      (long)(millis() - s_settings_gps_next) >= 0) {
+    s_settings_gps_next = millis() + 1000;
+    char g[48];
+    settings_gps_status(g, sizeof(g));
+    lv_label_set_text(s_settings_gps_lbl, g);
   }
 
   // GPS grace-window power management. The GPS is only worth powering while a
