@@ -822,7 +822,7 @@ static void enter_subscreen(int idx) {
       snprintf(body, sizeof(body),
                "MeshCore T-Pager\n%s\n\n"
                "Author: CJ van Soest\n"
-               "github.com/CJvanSoest/MeshCore\n"
+               "github.com/CJvanSoest/\n  meshcore-lilygo-pager-LR1121\n"
                "License: MIT\n\n"
                "LVGL %d.%d.%d",
                FIRMWARE_VERSION, LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
