@@ -983,7 +983,15 @@ void MyMesh::begin(bool has_display) {
 
   resetContacts();
   _store->loadContacts(this);
-  bootstrapRTCfromContacts();
+  // Only seed the clock from stored contacts when the RTC has no plausible
+  // time of its own. This used to run every boot and overwrite a valid
+  // battery-backed / GPS / manually-set clock — and a single contact whose
+  // advert carried a future timestamp would then pin the clock into the
+  // future (e.g. +1 year) on every reboot. Keep a good clock; only fall back
+  // to contact timestamps when the RTC is genuinely unset (< 2024-01-01).
+  if (getRTCClock()->getCurrentTime() < 1704067200UL) {
+    bootstrapRTCfromContacts();
+  }
   addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure Andy's public channel
   _store->loadChannels(this);
 
