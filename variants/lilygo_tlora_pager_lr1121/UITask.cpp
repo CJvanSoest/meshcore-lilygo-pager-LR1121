@@ -819,7 +819,12 @@ static void enter_subscreen(int idx) {
       return;
     }
     case 8:
-      snprintf(body, sizeof(body), "MeshCore T-Pager\n%s\n\nLVGL %d.%d.%d",
+      snprintf(body, sizeof(body),
+               "MeshCore T-Pager\n%s\n\n"
+               "Author: CJ van Soest\n"
+               "github.com/CJvanSoest/MeshCore\n"
+               "License: MIT\n\n"
+               "LVGL %d.%d.%d",
                FIRMWARE_VERSION, LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
       break;
     case TILE_SATTEST:  // 9 — live GPS reception diagnostic, refreshed ~1 Hz
