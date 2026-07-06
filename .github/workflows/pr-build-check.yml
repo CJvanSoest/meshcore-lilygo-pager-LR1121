@@ -39,6 +39,8 @@ jobs:
           - wio-e5-mini_repeater
           # ESP32-C6
           - LilyGo_Tlora_C6_repeater_
+          # ESP32-S3 — LilyGo T-Lora Pager LR1121 (this fork's primary target)
+          - T_LoRa_Pager_LR1121_companion_radio_usb
 
     steps:
       - name: Clone Repo
@@ -49,3 +51,28 @@ jobs:
 
       - name: Build ${{ matrix.environment }}
         run: pio run -e ${{ matrix.environment }}
+
+  format-check:
+    # Enforce clang-format on the LilyGo T-Lora Pager variant sources we own.
+    # Vendored lv_conf.h is excluded. Uses the repo .clang-format, which needs
+    # clang-format 19+ (AlignEscapedNewlines: LeftWithLastLine); we pin 20.1.0.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install clang-format
+        run: pip install 'clang-format==20.1.0'
+
+      - name: Check pager variant formatting
+        run: |
+          files=$(git ls-files 'variants/lilygo_tlora_pager_lr1121/*.cpp' \
+                               'variants/lilygo_tlora_pager_lr1121/*.h' \
+                    | grep -v 'lv_conf.h')
+          echo "Checking:"; echo "$files"
+          clang-format --style=file --dry-run -Werror $files
