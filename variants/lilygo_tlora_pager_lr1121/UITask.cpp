@@ -367,7 +367,7 @@ static void ch_menu_close();
 // focus style used by the list tiles.
 static void style_popup_button(lv_obj_t *btn) {
   lv_obj_set_style_bg_color(btn, lv_color_hex(0x1c2530), 0);
-  lv_obj_set_style_text_color(btn, lv_color_hex(0xc0c8d0), 0);
+  lv_obj_set_style_text_color(btn, lv_color_hex(0xe8ecf0), 0);
   lv_obj_set_style_bg_color(btn, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
   lv_obj_set_style_text_color(btn, lv_color_hex(0x101418), LV_STATE_FOCUSED);
   lv_obj_set_style_border_width(btn, 0, 0);
@@ -554,8 +554,11 @@ extern "C" void ui_input_char(char c) {
       break;
     }
     if (handled) {
+      // Manual pan/zoom pauses the auto-recenter for a bit so the user can
+      // look around, then GPS-follow resumes (was: disabled until re-open,
+      // which felt like "the map won't track me").
       s_map_gps_switch_at = 0;
-      s_map_follow = false;
+      s_map_follow_next = millis() + 12000;
       return;
     }
   }
@@ -722,7 +725,8 @@ static void init_styles() {
   lv_style_set_border_width(&style_tile, 1);
   lv_style_set_border_color(&style_tile, lv_color_hex(0x404a55));
   lv_style_set_bg_color(&style_tile, lv_color_hex(0x1c2530));
-  lv_style_set_text_color(&style_tile, lv_color_hex(0xc0c8d0));
+  lv_style_set_text_color(&style_tile, lv_color_hex(0xe8ecf0));
+  lv_style_set_text_font(&style_tile, &lv_font_montserrat_18); // bigger menu labels (issue 1)
 
   lv_style_init(&style_tile_focused);
   lv_style_set_border_width(&style_tile_focused, 3);
@@ -1005,10 +1009,11 @@ static void radio_list_populate(NodePrefs *p, int focus_row) {
 
     lv_obj_t *row = lv_obj_create(s_radio_list);
     lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, lv_pct(100), 24);
+    lv_obj_set_size(row, lv_pct(100), 28);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
-    lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
+    lv_obj_set_style_text_font(row, &lv_font_montserrat_16, 0); // bigger list rows (issue 1)
+    lv_obj_set_style_text_color(row, lv_color_hex(0xe8ecf0), 0);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 8, 0);
     lv_obj_set_style_pad_ver(row, 2, 0);
@@ -1110,10 +1115,11 @@ static void channels_list_populate(int focus_row) {
   auto build_row = [&](const char *text, int data, bool is_add) -> lv_obj_t * {
     lv_obj_t *row = lv_obj_create(s_channel_list);
     lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, lv_pct(100), 24);
+    lv_obj_set_size(row, lv_pct(100), 28);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
-    lv_obj_set_style_text_color(row, is_add ? lv_color_hex(0xFAA61A) : lv_color_hex(0xc0c8d0), 0);
+    lv_obj_set_style_text_font(row, &lv_font_montserrat_16, 0); // bigger list rows (issue 1)
+    lv_obj_set_style_text_color(row, is_add ? lv_color_hex(0xFAA61A) : lv_color_hex(0xe8ecf0), 0);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 8, 0);
     lv_obj_set_style_pad_ver(row, 2, 0);
@@ -1242,7 +1248,7 @@ static void chat_history_append_line(const char *line) {
     lv_span_t *sp_nl = lv_spangroup_new_span(s_chat_history);
     if (sp_nl) {
       lv_span_set_text(sp_nl, "\n");
-      lv_style_set_text_color(&sp_nl->style, lv_color_hex(0xc0c8d0));
+      lv_style_set_text_color(&sp_nl->style, lv_color_hex(0xe8ecf0));
     }
     return;
   }
@@ -1265,7 +1271,7 @@ static void chat_history_append_line(const char *line) {
     lv_span_t *sp = lv_spangroup_new_span(s_chat_history);
     if (sp) {
       lv_span_set_text(sp, buf);
-      lv_style_set_text_color(&sp->style, lv_color_hex(0xc0c8d0));
+      lv_style_set_text_color(&sp->style, lv_color_hex(0xe8ecf0));
     }
     bi = 0;
   };
@@ -1738,10 +1744,11 @@ static void contacts_list_populate() {
 
     lv_obj_t *row = lv_obj_create(s_contacts_list);
     lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, lv_pct(100), 22);
+    lv_obj_set_size(row, lv_pct(100), 30);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
-    lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
+    lv_obj_set_style_text_font(row, &lv_font_montserrat_16, 0); // bigger list rows (issue 1)
+    lv_obj_set_style_text_color(row, lv_color_hex(0xe8ecf0), 0);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);
@@ -1866,10 +1873,11 @@ static void dm_list_populate() {
 
     lv_obj_t *row = lv_obj_create(s_dm_list);
     lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, lv_pct(100), 26);
+    lv_obj_set_size(row, lv_pct(100), 30);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
-    lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
+    lv_obj_set_style_text_font(row, &lv_font_montserrat_16, 0); // bigger list rows (issue 1)
+    lv_obj_set_style_text_color(row, lv_color_hex(0xe8ecf0), 0);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);
@@ -2041,10 +2049,11 @@ static void discovered_list_populate() {
 
     lv_obj_t *row = lv_obj_create(s_discovered_list);
     lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, lv_pct(100), 22);
+    lv_obj_set_size(row, lv_pct(100), 30);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
-    lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
+    lv_obj_set_style_text_font(row, &lv_font_montserrat_16, 0); // bigger list rows (issue 1)
+    lv_obj_set_style_text_color(row, lv_color_hex(0xe8ecf0), 0);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);
@@ -2726,10 +2735,11 @@ static void settings_list_populate() {
   auto build_row = [&](const char *text, int act) -> lv_obj_t * {
     lv_obj_t *row = lv_obj_create(s_settings_list);
     lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, lv_pct(100), 26);
+    lv_obj_set_size(row, lv_pct(100), 30);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
-    lv_obj_set_style_text_color(row, lv_color_hex(0xc0c8d0), 0);
+    lv_obj_set_style_text_font(row, &lv_font_montserrat_16, 0); // bigger list rows (issue 1)
+    lv_obj_set_style_text_color(row, lv_color_hex(0xe8ecf0), 0);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 8, 0);
     lv_obj_set_style_pad_ver(row, 2, 0);
@@ -2902,7 +2912,7 @@ static void build_ui() {
 
   s_subscreen_body = lv_label_create(s_subscreen_root);
   lv_label_set_text(s_subscreen_body, "");
-  lv_obj_set_style_text_color(s_subscreen_body, lv_color_hex(0xc0c8d0), 0);
+  lv_obj_set_style_text_color(s_subscreen_body, lv_color_hex(0xe8ecf0), 0);
   lv_obj_set_width(s_subscreen_body, lv_pct(96));
   lv_label_set_long_mode(s_subscreen_body, LV_LABEL_LONG_WRAP);
   lv_obj_align(s_subscreen_body, LV_ALIGN_TOP_LEFT, 6, 48);
@@ -3054,25 +3064,31 @@ static void build_ui() {
   lv_obj_set_height(s_chat_history, LV_SIZE_CONTENT);
   lv_obj_set_pos(s_chat_history, 0, 0);
   lv_spangroup_set_mode(s_chat_history, LV_SPAN_MODE_BREAK);
-  lv_obj_set_style_text_color(s_chat_history, lv_color_hex(0xc0c8d0), 0);
+  lv_obj_set_style_text_color(s_chat_history, lv_color_hex(0xe8ecf0), 0);
+  // Larger chat font — DM/Channel history was hard to read outdoors (issue 1).
+  lv_obj_set_style_text_font(s_chat_history, &lv_font_montserrat_18, 0);
 
   s_chat_compose = lv_label_create(s_subscreen_root);
-  lv_obj_set_size(s_chat_compose, lv_pct(96), 24);
+  // Taller box + bigger font so the typed text is legible; sits clear of the
+  // counter above it (issue 3: the two footer lines were cramped).
+  lv_obj_set_size(s_chat_compose, lv_pct(96), 34);
   lv_obj_align(s_chat_compose, LV_ALIGN_BOTTOM_LEFT, 6, -4);
   lv_label_set_long_mode(s_chat_compose, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_font(s_chat_compose, &lv_font_montserrat_18, 0);
   lv_obj_set_style_text_color(s_chat_compose, lv_color_hex(0xFAA61A), 0);
   lv_obj_set_style_bg_color(s_chat_compose, lv_color_hex(0x1c2530), 0);
   lv_obj_set_style_bg_opa(s_chat_compose, LV_OPA_COVER, 0);
   lv_obj_set_style_pad_hor(s_chat_compose, 6, 0);
+  lv_obj_set_style_pad_ver(s_chat_compose, 3, 0);
   lv_obj_set_style_radius(s_chat_compose, 4, 0);
   lv_obj_add_flag(s_chat_compose, LV_OBJ_FLAG_HIDDEN);
 
-  // Character-count indicator just above the compose box — kept on its
-  // own widget so the message text and the counter never share a line.
+  // Character-count indicator, lifted well above the (now taller) compose box
+  // so the two lines have a clear gap (issue 3).
   s_chat_counter = lv_label_create(s_subscreen_root);
   lv_label_set_text(s_chat_counter, "");
   lv_obj_set_style_text_color(s_chat_counter, lv_color_hex(0x707880), 0);
-  lv_obj_align(s_chat_counter, LV_ALIGN_BOTTOM_RIGHT, -8, -30);
+  lv_obj_align(s_chat_counter, LV_ALIGN_BOTTOM_RIGHT, -8, -46);
   lv_obj_add_flag(s_chat_counter, LV_OBJ_FLAG_HIDDEN);
 
   // ---- Persistent header (always visible) ----
@@ -3095,7 +3111,7 @@ static void build_ui() {
 
   s_battery_label = lv_label_create(scr);
   lv_label_set_text(s_battery_label, "");
-  lv_obj_set_style_text_color(s_battery_label, lv_color_hex(0xc0c8d0), 0);
+  lv_obj_set_style_text_color(s_battery_label, lv_color_hex(0xe8ecf0), 0);
   lv_obj_align(s_battery_label, LV_ALIGN_TOP_RIGHT, -6, 4);
 
   // Toast popup (item 2) — small centered label, hidden until ui_toast().
