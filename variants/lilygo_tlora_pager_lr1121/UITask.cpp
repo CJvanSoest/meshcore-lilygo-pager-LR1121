@@ -385,8 +385,6 @@ static void chat_view_close();
 static void chat_history_render();
 static void chat_compose_render();
 static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char *text);
-static void chan_persist_load(uint8_t idx);
-static bool chan_ring_has(uint8_t idx);
 static void contacts_list_populate();
 static void discovered_list_populate();
 static void settings_list_populate();
@@ -1387,6 +1385,73 @@ static void chat_history_append_line(const char *line) {
   flush_grey();
 }
 
+// ---- Channel history: stable, slot-independent SD persistence --------------
+// History is keyed by a hash of the channel NAME, not its slot index, so
+// adding/deleting channels (which compacts slots down) can never desync a
+// channel from its log — the old /sd/ch_<idx>.dat scheme shifted every file
+// after a delete. "Public" and "Test" are session-only (no SD file), per user
+// preference; their history lives in the shared RAM ring only.
+static bool chan_is_ephemeral(const char *name) {
+  return name && (strcmp(name, "Public") == 0 || strcmp(name, "Test") == 0);
+}
+static uint32_t chan_name_hash(const char *s) {
+  uint32_t h = 2166136261u; // FNV-1a/32
+  for (; s && *s; ++s) {
+    h ^= (uint8_t)*s;
+    h *= 16777619u;
+  }
+  return h;
+}
+// Fill `out` with a channel's SD history path. Returns false when the channel
+// is ephemeral (Public/Test) or its name can't be resolved right now.
+static bool chan_hist_path(int idx, char *out, size_t cap) {
+  char name[40];
+  if (!ui_get_channel_name || !ui_get_channel_name(idx, name, sizeof(name))) return false;
+  if (chan_is_ephemeral(name)) return false;
+  snprintf(out, cap, "/sd/chh_%08lx.dat", (unsigned long)chan_name_hash(name));
+  return true;
+}
+// Delete a channel's SD log (called when the user deletes the channel, while
+// its idx→name mapping is still valid — before the slot compaction).
+static void chan_hist_remove(int idx) {
+  char path[32];
+  if (chan_hist_path(idx, path, sizeof(path)) && sd_init()) remove(path);
+}
+// Append one length-prefixed record ([uint8 len][text]) to an SD log.
+static void chan_log_append(const char *path, const char *text) {
+  if (!text || !sd_init()) return;
+  FILE *f = fopen(path, "ab");
+  if (!f) return;
+  size_t L = strlen(text);
+  if (L > CHAT_TEXT_MAX - 1) L = CHAT_TEXT_MAX - 1; // matches ChatMsg.text
+  uint8_t len = (uint8_t)L;
+  fwrite(&len, 1, 1, f);
+  fwrite(text, 1, L, f);
+  fclose(f);
+}
+// Render a persistent channel's history straight from its SD log (last
+// CHAT_RING_SIZE records) — immune to shared-ring eviction by other channels,
+// which was the cause of history "randomly disappearing". Returns line count.
+static int chan_render_from_sd(const char *path) {
+  if (!sd_init()) return 0;
+  FILE *f = fopen(path, "rb");
+  if (!f) return 0;
+  static char recs[CHAT_RING_SIZE][CHAT_TEXT_MAX];
+  int n = 0;
+  uint8_t len;
+  while (fread(&len, 1, 1, f) == 1) {
+    if (len > CHAT_TEXT_MAX - 1) break;
+    if (fread(recs[n % CHAT_RING_SIZE], 1, len, f) != len) break;
+    recs[n % CHAT_RING_SIZE][len] = 0;
+    n++;
+  }
+  fclose(f);
+  int start = n > CHAT_RING_SIZE ? n - CHAT_RING_SIZE : 0;
+  for (int i = start; i < n; i++)
+    chat_history_append_line(recs[i % CHAT_RING_SIZE]);
+  return n - start;
+}
+
 // Format ring-buffer entries for the currently-open chat into the
 // history widget. Newest at the bottom. Each line gets two colored
 // spans: green sender, grey body.
@@ -1413,13 +1478,20 @@ static void chat_history_render() {
         rendered++;
       }
     }
-  } else if (s_chat_channel_idx >= 0 && s_chat_ring) {
-    int start = (s_chat_head - s_chat_count + CHAT_RING_SIZE) % CHAT_RING_SIZE;
-    for (int n = 0; n < s_chat_count; n++) {
-      int i = (start + n) % CHAT_RING_SIZE;
-      if (s_chat_ring[i].channel_idx != (uint8_t)s_chat_channel_idx) continue;
-      chat_history_append_line(s_chat_ring[i].text);
-      rendered++;
+  } else if (s_chat_channel_idx >= 0) {
+    char path[32];
+    if (chan_hist_path(s_chat_channel_idx, path, sizeof(path))) {
+      // Persistent channel → render straight from its SD log.
+      rendered += chan_render_from_sd(path);
+    } else if (s_chat_ring) {
+      // Ephemeral channel (Public/Test) → session-only shared RAM ring.
+      int start = (s_chat_head - s_chat_count + CHAT_RING_SIZE) % CHAT_RING_SIZE;
+      for (int n = 0; n < s_chat_count; n++) {
+        int i = (start + n) % CHAT_RING_SIZE;
+        if (s_chat_ring[i].channel_idx != (uint8_t)s_chat_channel_idx) continue;
+        chat_history_append_line(s_chat_ring[i].text);
+        rendered++;
+      }
     }
   }
   if (rendered == 0) {
@@ -1522,9 +1594,9 @@ static void chat_view_open(int channel_idx) {
     s_unread_ch[channel_idx] = 0; // reading clears this channel's badge
     update_tile_badges();
   }
-  // Restore persisted history from SD if the ring doesn't already hold it
-  // (e.g. first open after a reboot).
-  if (!chan_ring_has((uint8_t)channel_idx)) chan_persist_load((uint8_t)channel_idx);
+  // History is rendered straight from the per-channel SD log (persistent
+  // channels) or the RAM ring (Public/Test) by chat_history_render() below —
+  // no ring preload needed, and no cross-channel eviction can hide it.
   s_compose_buf[0] = 0;
   s_compose_len = 0;
   // Hide the channels list while the chat is active.
@@ -1589,27 +1661,17 @@ static void chat_view_close() {
   }
 }
 
-// Append a message to the ring buffer. Older entries are evicted FIFO.
-// ---- Channel chat-history SD persistence -----------------------------------
-// One append-log per channel at /sd/ch_<idx>.dat. Each record is
-// [uint8 len][len bytes of text]. Loaded back into the ring on chat open.
-static bool s_chan_loading = false; // suppress re-persist while loading
-
-static void chan_persist_append(uint8_t idx, const char *text) {
-  if (s_chan_loading || !text || !sd_init()) return;
-  char path[24];
-  snprintf(path, sizeof(path), "/sd/ch_%u.dat", (unsigned)idx);
-  FILE *f = fopen(path, "ab");
-  if (!f) return;
-  size_t L = strlen(text);
-  if (L > CHAT_TEXT_MAX - 1) L = CHAT_TEXT_MAX - 1; // matches ChatMsg.text
-  uint8_t len = (uint8_t)L;
-  fwrite(&len, 1, 1, f);
-  fwrite(text, 1, L, f);
-  fclose(f);
-}
-
+// Store a chat message. Persistent channels append to their name-keyed SD log
+// (the source of truth for rendering); Public/Test go to the session-only RAM
+// ring. The helper functions above (chan_hist_path / chan_log_append) do the
+// routing so add/delete slot compaction can never desync a channel's history.
 static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char *text) {
+  char path[32];
+  if (chan_hist_path(channel_idx, path, sizeof(path))) {
+    chan_log_append(path, text); // persistent channel → SD log
+    return;
+  }
+  // Ephemeral channel (Public/Test) → shared RAM ring, evicted FIFO.
   if (!ensure_chat_ring()) return;
   ChatMsg &slot = s_chat_ring[s_chat_head];
   slot.channel_idx = channel_idx;
@@ -1620,43 +1682,6 @@ static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char *
   slot.text[n] = 0;
   s_chat_head = (s_chat_head + 1) % CHAT_RING_SIZE;
   if (s_chat_count < CHAT_RING_SIZE) s_chat_count++;
-  chan_persist_append(channel_idx, text);
-}
-
-// Load a channel's persisted history into the ring (oldest-first), keeping
-// only the last CHAT_RING_SIZE records. Called when opening a channel chat
-// whose history isn't already in the ring (e.g. after reboot).
-static void chan_persist_load(uint8_t idx) {
-  if (!sd_init()) return;
-  char path[24];
-  snprintf(path, sizeof(path), "/sd/ch_%u.dat", (unsigned)idx);
-  FILE *f = fopen(path, "rb");
-  if (!f) return;
-  static char ring[CHAT_RING_SIZE][CHAT_TEXT_MAX];
-  int n = 0;
-  uint8_t len;
-  while (fread(&len, 1, 1, f) == 1) {
-    if (len > CHAT_TEXT_MAX - 1) break;
-    char buf[CHAT_TEXT_MAX];
-    if (fread(buf, 1, len, f) != len) break;
-    buf[len] = 0;
-    memcpy(ring[n % CHAT_RING_SIZE], buf, len + 1);
-    n++;
-  }
-  fclose(f);
-  int start = n > CHAT_RING_SIZE ? n - CHAT_RING_SIZE : 0;
-  s_chan_loading = true;
-  for (int i = start; i < n; i++)
-    chat_ring_push(idx, 0, ring[i % CHAT_RING_SIZE]);
-  s_chan_loading = false;
-}
-
-// True if the ring already holds at least one message for this channel.
-static bool chan_ring_has(uint8_t idx) {
-  if (!s_chat_ring) return false;
-  for (int i = 0; i < s_chat_count; i++)
-    if (s_chat_ring[i].channel_idx == idx) return true;
-  return false;
 }
 
 // Called by MyMesh::onChannelMessageRecv. Single-threaded with the LVGL
@@ -3416,6 +3441,7 @@ static void build_ui() {
             return;
           }
           if (which == 1 && ui_delete_channel) { // Delete channel
+            chan_hist_remove(idx);               // drop its SD log first (idx→name still valid)
             ui_delete_channel(idx);
           }
           ch_menu_close();
