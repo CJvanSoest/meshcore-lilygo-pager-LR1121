@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="lbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0e141b"/>
+      <stop offset="1" stop-color="#1c2530"/>
+    </linearGradient>
+    <linearGradient id="lscreen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#123641"/>
+      <stop offset="1" stop-color="#0b1a22"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#lbg)"/>
+
+  <!-- LoRa waves -->
+  <g fill="none" stroke="#FAA61A" stroke-width="14" stroke-linecap="round">
+    <path d="M 300 150 A 60 60 0 0 1 392 150" opacity="0.9"/>
+    <path d="M 276 186 A 96 96 0 0 1 416 186" opacity="0.55"/>
+  </g>
+
+  <!-- antenna -->
+  <rect x="340" y="120" width="14" height="70" rx="7" fill="#3a4756"/>
+  <circle cx="347" cy="120" r="12" fill="#FAA61A"/>
+
+  <!-- pager body -->
+  <rect x="128" y="176" width="196" height="236" rx="30" fill="#28323e" stroke="#3a4756" stroke-width="4"/>
+  <!-- screen -->
+  <rect x="152" y="204" width="148" height="150" rx="12" fill="url(#lscreen)"/>
+  <!-- tiles -->
+  <rect x="162" y="250" width="52" height="52" rx="9" fill="#1c2530" stroke="#404a55" stroke-width="3"/>
+  <rect x="226" y="244" width="60" height="62" rx="10" fill="#2b3742" stroke="#FAA61A" stroke-width="5"/>
+  <!-- chat lines -->
+  <rect x="162" y="322" width="120" height="10" rx="5" fill="#55cc66" opacity="0.9"/>
+  <!-- encoder -->
+  <circle cx="324" cy="300" r="14" fill="#3a4756"/>
+</svg>
