@@ -8,6 +8,13 @@
 #include <math.h>
 #include <stdio.h>
 
+// Active-theme colours, owned by UITask.cpp's palette. Only the backdrop and
+// the "SD failed" fallback text follow the theme; the crosshair, node markers
+// and the translucent status/hint strips stay fixed since they overlay the
+// (always colourful) map tiles, not a themed surface.
+extern "C" uint32_t tpager_pal_bg();
+extern "C" uint32_t tpager_pal_text();
+
 static lv_obj_t *s_root = nullptr;
 static lv_obj_t *s_body = nullptr;         // text shown when no tile is up
 static lv_obj_t *s_status_strip = nullptr; // top status bar
@@ -92,7 +99,7 @@ lv_obj_t *map_screen_create(lv_obj_t *parent) {
   s_root = lv_obj_create(parent);
   lv_obj_remove_style_all(s_root);
   lv_obj_set_size(s_root, lv_pct(100), lv_pct(100));
-  lv_obj_set_style_bg_color(s_root, lv_color_hex(0x0e141b), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(s_root, lv_color_hex(tpager_pal_bg()), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_root, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_add_flag(s_root, LV_OBJ_FLAG_HIDDEN);
 
@@ -135,7 +142,7 @@ lv_obj_t *map_screen_create(lv_obj_t *parent) {
   // on the card. Drawn under the status strip but above the tiles.
   s_body = lv_label_create(s_root);
   lv_label_set_text(s_body, "Map view\n\nMounting SD ...");
-  lv_obj_set_style_text_color(s_body, lv_color_hex(0xc0c8d0), 0);
+  lv_obj_set_style_text_color(s_body, lv_color_hex(tpager_pal_text()), 0);
   lv_obj_set_width(s_body, lv_pct(96));
   lv_label_set_long_mode(s_body, LV_LABEL_LONG_WRAP);
   lv_obj_align(s_body, LV_ALIGN_TOP_LEFT, 6, 48);
@@ -421,6 +428,11 @@ void map_screen_show() {
   lv_obj_remove_flag(s_root, LV_OBJ_FLAG_HIDDEN);
   Serial.println("MAP: open");
   map_render();
+}
+
+void map_screen_apply_theme() {
+  if (s_root) lv_obj_set_style_bg_color(s_root, lv_color_hex(tpager_pal_bg()), LV_PART_MAIN);
+  if (s_body) lv_obj_set_style_text_color(s_body, lv_color_hex(tpager_pal_text()), 0);
 }
 
 void map_screen_set_center(double lat_deg, double lon_deg) {

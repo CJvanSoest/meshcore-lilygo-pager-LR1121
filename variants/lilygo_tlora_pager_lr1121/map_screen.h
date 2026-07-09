@@ -30,3 +30,7 @@ void map_screen_zoom(int dz);
 // Refresh only the status strip (sat count / coords) without reloading
 // tiles — call on a timer while the Map view is open.
 void map_screen_refresh_status();
+
+// Re-tint the theme-aware map chrome (backdrop + "SD failed" fallback text)
+// to the active palette. Called from UITask's apply_theme() on a live switch.
+void map_screen_apply_theme();

@@ -8,7 +8,8 @@
 #include "TPagerST7796Display.h"
 #include "map_screen.h"
 
-#include <cstdio> // fopen/fread/fwrite for SD chat-history store
+#include <Preferences.h> // persist theme + backlight across reboots
+#include <cstdio>        // fopen/fread/fwrite for SD chat-history store
 #include <cstring>
 #include <ctime>           // gmtime_r for NL local-time / DST conversion
 #include <esp_heap_caps.h> // heap_caps_calloc / MALLOC_CAP_SPIRAM (S3.6d)
@@ -23,6 +24,47 @@ bool sd_init(); // from target.cpp — mounts /sd (idempotent)
 #ifndef FIRMWARE_VERSION
 #define FIRMWARE_VERSION "v?"
 #endif
+
+// ---------- Theme palette ----------------------------------------------------
+// Two appearances, switchable at runtime from Settings > Appearance and
+// persisted (Preferences "tpager"). DARK is the original dark scheme with
+// brighter text than before for outdoor legibility; LIGHT is a white,
+// high-contrast scheme with black text/icons, mirroring the LilyGo demo
+// firmware for use in bright sunlight. Every widget colour is routed through
+// the active palette (PAL) so a toggle re-tints the whole UI.
+struct Palette {
+  uint32_t bg;            // screen / list background
+  uint32_t surface;       // tile / row / popup background
+  uint32_t surface_focus; // focused tile / row background
+  uint32_t text;          // primary text
+  uint32_t text_dim;      // secondary text (was the various greys)
+  uint32_t accent;        // focus highlight + compose text (orange-ish)
+  uint32_t border;        // tile / row borders + separators
+  uint32_t sender;        // chat sender name
+  uint32_t mention;       // chat @mention
+};
+
+// clang-format off
+static const Palette PAL_DARK = {
+  /*bg*/ 0x0e141b, /*surface*/ 0x1c2530, /*surface_focus*/ 0x2b3742,
+  /*text*/ 0xFFFFFF, /*text_dim*/ 0xC8CDD3, /*accent*/ 0xFAA61A,
+  /*border*/ 0x404a55, /*sender*/ 0x55cc66, /*mention*/ 0x5ab8ff,
+};
+static const Palette PAL_LIGHT = {
+  /*bg*/ 0xFFFFFF, /*surface*/ 0xF2F2F2, /*surface_focus*/ 0xFFE0A3,
+  /*text*/ 0x000000, /*text_dim*/ 0x3A3A3A, /*accent*/ 0xC65A00,
+  /*border*/ 0xC0C4C8, /*sender*/ 0x1a7f37, /*mention*/ 0x0b5ed7,
+};
+// clang-format on
+
+static uint8_t s_theme = 0;            // 0 = dark, 1 = light
+static const Palette *PAL = &PAL_DARK; // active palette (read at every use)
+
+// Backlight brightness cycle (DISP_BL PWM, 0..255). Low is the historical
+// default (LGFXDisplay::begin used 64); Max is for direct sunlight.
+static const uint8_t BL_LEVELS[3] = { 64, 160, 255 };
+static const char *BL_NAMES[3] = { "Low", "Med", "Max" };
+static uint8_t s_brightness_idx = 0;
 
 // ---------- Tile definitions -------------------------------------------------
 
@@ -343,8 +385,6 @@ static void chat_view_close();
 static void chat_history_render();
 static void chat_compose_render();
 static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char *text);
-static void chan_persist_load(uint8_t idx);
-static bool chan_ring_has(uint8_t idx);
 static void contacts_list_populate();
 static void discovered_list_populate();
 static void settings_list_populate();
@@ -366,8 +406,8 @@ static void ch_menu_close();
 // the ST7796 panel — applying orange bg + dark text matches the row
 // focus style used by the list tiles.
 static void style_popup_button(lv_obj_t *btn) {
-  lv_obj_set_style_bg_color(btn, lv_color_hex(0x1c2530), 0);
-  lv_obj_set_style_text_color(btn, lv_color_hex(0xe8ecf0), 0);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(PAL->surface), 0);
+  lv_obj_set_style_text_color(btn, lv_color_hex(PAL->text), 0);
   lv_obj_set_style_bg_color(btn, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
   lv_obj_set_style_text_color(btn, lv_color_hex(0x101418), LV_STATE_FOCUSED);
   lv_obj_set_style_border_width(btn, 0, 0);
@@ -518,11 +558,18 @@ extern "C" void variant_loop();
 // any kb_keymap slot, so we can identify unknown special keys.
 extern "C" uint8_t tpager_kb_last_raw();
 
+// Set by ui_input_char on any keystroke; consumed in UITask::loop() to reset
+// the screen-sleep timer and wake the panel (the keyboard is a free function
+// with no access to _auto_off / _display, so we bridge via this flag).
+static volatile bool s_input_activity = false;
+
 // Sink for chars produced by the TCA8418 keyboard (variant_loop in
 // target.cpp). Routes to whichever screen is currently capturing input:
 //   * freq-editor popup  (s_editing_idx == 0)  — digits + '.' + backspace
 //   * Messages tester    (s_input_active)      — anything goes
 extern "C" void ui_input_char(char c) {
+  s_input_activity = true; // any key counts as activity → keep the screen awake
+
   // Map navigation (item: map controls). While the Map tile is open the
   // QWERTY keys drive pan/zoom: W/A/S/D pan north/west/south/east, Z zooms
   // in, X zooms out. Any handled key cancels the pending auto-GPS recenter
@@ -713,6 +760,23 @@ static unsigned long s_next_status = 0;
 
 static UITask *s_self = nullptr;
 
+// Persistent, always-visible carousel chrome — promoted to statics so a live
+// theme switch can re-tint them (see apply_theme()).
+static lv_obj_t *s_arrow_l = nullptr;
+static lv_obj_t *s_arrow_r = nullptr;
+static lv_obj_t *s_footer_hint = nullptr;
+
+static void apply_theme();      // re-tint the whole UI to PAL
+static void apply_brightness(); // push BL_LEVELS[s_brightness_idx]
+
+// Palette accessors for map_screen.cpp (fallback text + backdrop).
+extern "C" uint32_t tpager_pal_bg() {
+  return PAL->bg;
+}
+extern "C" uint32_t tpager_pal_text() {
+  return PAL->text;
+}
+
 // ---------- Style helpers ----------------------------------------------------
 
 static lv_style_t style_tile;
@@ -723,15 +787,15 @@ static void init_styles() {
   lv_style_set_radius(&style_tile, 8);
   lv_style_set_pad_all(&style_tile, 6);
   lv_style_set_border_width(&style_tile, 1);
-  lv_style_set_border_color(&style_tile, lv_color_hex(0x404a55));
-  lv_style_set_bg_color(&style_tile, lv_color_hex(0x1c2530));
-  lv_style_set_text_color(&style_tile, lv_color_hex(0xe8ecf0));
+  lv_style_set_border_color(&style_tile, lv_color_hex(PAL->border));
+  lv_style_set_bg_color(&style_tile, lv_color_hex(PAL->surface));
+  lv_style_set_text_color(&style_tile, lv_color_hex(PAL->text));
   lv_style_set_text_font(&style_tile, &lv_font_montserrat_18); // bigger menu labels (issue 1)
 
   lv_style_init(&style_tile_focused);
   lv_style_set_border_width(&style_tile_focused, 3);
   lv_style_set_border_color(&style_tile_focused, lv_color_hex(0xFAA61A));
-  lv_style_set_bg_color(&style_tile_focused, lv_color_hex(0x2b3742));
+  lv_style_set_bg_color(&style_tile_focused, lv_color_hex(PAL->surface_focus));
   lv_style_set_text_color(&style_tile_focused, lv_color_hex(0xFAA61A));
   // (no transform_zoom — it animated during scroll and produced a visible
   // diagonal skew. Thicker orange border is the focus indicator.)
@@ -1010,10 +1074,10 @@ static void radio_list_populate(NodePrefs *p, int focus_row) {
     lv_obj_t *row = lv_obj_create(s_radio_list);
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 28);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(PAL->surface), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(PAL->surface_focus), LV_STATE_FOCUSED);
     lv_obj_set_style_text_font(row, &lv_font_montserrat_16, 0); // bigger list rows (issue 1)
-    lv_obj_set_style_text_color(row, lv_color_hex(0xe8ecf0), 0);
+    lv_obj_set_style_text_color(row, lv_color_hex(PAL->text), 0);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 8, 0);
     lv_obj_set_style_pad_ver(row, 2, 0);
@@ -1021,7 +1085,7 @@ static void radio_list_populate(NodePrefs *p, int focus_row) {
     lv_obj_set_style_margin_bottom(row, 2, 0);
     // Thin bottom separator for readability between rows. Width-1 only on
     // the bottom side so the focused-state bg pill still looks isolated.
-    lv_obj_set_style_border_color(row, lv_color_hex(0x303a47), 0);
+    lv_obj_set_style_border_color(row, lv_color_hex(PAL->border), 0);
     lv_obj_set_style_border_width(row, 1, 0);
     lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
@@ -1116,16 +1180,16 @@ static void channels_list_populate(int focus_row) {
     lv_obj_t *row = lv_obj_create(s_channel_list);
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 28);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(PAL->surface), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(PAL->surface_focus), LV_STATE_FOCUSED);
     lv_obj_set_style_text_font(row, &lv_font_montserrat_16, 0); // bigger list rows (issue 1)
-    lv_obj_set_style_text_color(row, is_add ? lv_color_hex(0xFAA61A) : lv_color_hex(0xe8ecf0), 0);
+    lv_obj_set_style_text_color(row, is_add ? lv_color_hex(0xFAA61A) : lv_color_hex(PAL->text), 0);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 8, 0);
     lv_obj_set_style_pad_ver(row, 2, 0);
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_margin_bottom(row, 2, 0);
-    lv_obj_set_style_border_color(row, lv_color_hex(0x303a47), 0);
+    lv_obj_set_style_border_color(row, lv_color_hex(PAL->border), 0);
     lv_obj_set_style_border_width(row, 1, 0);
     lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -1241,14 +1305,14 @@ static void chat_history_append_line(const char *line) {
   } else {
     lv_span_set_text(sp_who, line);
   }
-  lv_style_set_text_color(&sp_who->style, lv_color_hex(0x55cc66));
+  lv_style_set_text_color(&sp_who->style, lv_color_hex(PAL->sender));
 
   // Message body — light grey with @-mentions highlighted blue.
   if (!colon) {
     lv_span_t *sp_nl = lv_spangroup_new_span(s_chat_history);
     if (sp_nl) {
       lv_span_set_text(sp_nl, "\n");
-      lv_style_set_text_color(&sp_nl->style, lv_color_hex(0xe8ecf0));
+      lv_style_set_text_color(&sp_nl->style, lv_color_hex(PAL->text));
     }
     return;
   }
@@ -1271,7 +1335,7 @@ static void chat_history_append_line(const char *line) {
     lv_span_t *sp = lv_spangroup_new_span(s_chat_history);
     if (sp) {
       lv_span_set_text(sp, buf);
-      lv_style_set_text_color(&sp->style, lv_color_hex(0xe8ecf0));
+      lv_style_set_text_color(&sp->style, lv_color_hex(PAL->text));
     }
     bi = 0;
   };
@@ -1306,7 +1370,7 @@ static void chat_history_append_line(const char *line) {
       lv_span_t *sp = lv_spangroup_new_span(s_chat_history);
       if (sp) {
         lv_span_set_text(sp, mention);
-        lv_style_set_text_color(&sp->style, lv_color_hex(0x5ab8ff));
+        lv_style_set_text_color(&sp->style, lv_color_hex(PAL->mention));
       }
       if (!*p) break;
       // The char that broke the token still needs to be emitted. Back up
@@ -1319,6 +1383,73 @@ static void chat_history_append_line(const char *line) {
   // Trailing newline goes in the last grey span so word-wrap is clean.
   if (bi < (int)sizeof(buf) - 1) buf[bi++] = '\n';
   flush_grey();
+}
+
+// ---- Channel history: stable, slot-independent SD persistence --------------
+// History is keyed by a hash of the channel NAME, not its slot index, so
+// adding/deleting channels (which compacts slots down) can never desync a
+// channel from its log — the old /sd/ch_<idx>.dat scheme shifted every file
+// after a delete. "Public" and "Test" are session-only (no SD file), per user
+// preference; their history lives in the shared RAM ring only.
+static bool chan_is_ephemeral(const char *name) {
+  return name && (strcmp(name, "Public") == 0 || strcmp(name, "Test") == 0);
+}
+static uint32_t chan_name_hash(const char *s) {
+  uint32_t h = 2166136261u; // FNV-1a/32
+  for (; s && *s; ++s) {
+    h ^= (uint8_t)*s;
+    h *= 16777619u;
+  }
+  return h;
+}
+// Fill `out` with a channel's SD history path. Returns false when the channel
+// is ephemeral (Public/Test) or its name can't be resolved right now.
+static bool chan_hist_path(int idx, char *out, size_t cap) {
+  char name[40];
+  if (!ui_get_channel_name || !ui_get_channel_name(idx, name, sizeof(name))) return false;
+  if (chan_is_ephemeral(name)) return false;
+  snprintf(out, cap, "/sd/chh_%08lx.dat", (unsigned long)chan_name_hash(name));
+  return true;
+}
+// Delete a channel's SD log (called when the user deletes the channel, while
+// its idx→name mapping is still valid — before the slot compaction).
+static void chan_hist_remove(int idx) {
+  char path[32];
+  if (chan_hist_path(idx, path, sizeof(path)) && sd_init()) remove(path);
+}
+// Append one length-prefixed record ([uint8 len][text]) to an SD log.
+static void chan_log_append(const char *path, const char *text) {
+  if (!text || !sd_init()) return;
+  FILE *f = fopen(path, "ab");
+  if (!f) return;
+  size_t L = strlen(text);
+  if (L > CHAT_TEXT_MAX - 1) L = CHAT_TEXT_MAX - 1; // matches ChatMsg.text
+  uint8_t len = (uint8_t)L;
+  fwrite(&len, 1, 1, f);
+  fwrite(text, 1, L, f);
+  fclose(f);
+}
+// Render a persistent channel's history straight from its SD log (last
+// CHAT_RING_SIZE records) — immune to shared-ring eviction by other channels,
+// which was the cause of history "randomly disappearing". Returns line count.
+static int chan_render_from_sd(const char *path) {
+  if (!sd_init()) return 0;
+  FILE *f = fopen(path, "rb");
+  if (!f) return 0;
+  static char recs[CHAT_RING_SIZE][CHAT_TEXT_MAX];
+  int n = 0;
+  uint8_t len;
+  while (fread(&len, 1, 1, f) == 1) {
+    if (len > CHAT_TEXT_MAX - 1) break;
+    if (fread(recs[n % CHAT_RING_SIZE], 1, len, f) != len) break;
+    recs[n % CHAT_RING_SIZE][len] = 0;
+    n++;
+  }
+  fclose(f);
+  int start = n > CHAT_RING_SIZE ? n - CHAT_RING_SIZE : 0;
+  for (int i = start; i < n; i++)
+    chat_history_append_line(recs[i % CHAT_RING_SIZE]);
+  return n - start;
 }
 
 // Format ring-buffer entries for the currently-open chat into the
@@ -1347,20 +1478,27 @@ static void chat_history_render() {
         rendered++;
       }
     }
-  } else if (s_chat_channel_idx >= 0 && s_chat_ring) {
-    int start = (s_chat_head - s_chat_count + CHAT_RING_SIZE) % CHAT_RING_SIZE;
-    for (int n = 0; n < s_chat_count; n++) {
-      int i = (start + n) % CHAT_RING_SIZE;
-      if (s_chat_ring[i].channel_idx != (uint8_t)s_chat_channel_idx) continue;
-      chat_history_append_line(s_chat_ring[i].text);
-      rendered++;
+  } else if (s_chat_channel_idx >= 0) {
+    char path[32];
+    if (chan_hist_path(s_chat_channel_idx, path, sizeof(path))) {
+      // Persistent channel → render straight from its SD log.
+      rendered += chan_render_from_sd(path);
+    } else if (s_chat_ring) {
+      // Ephemeral channel (Public/Test) → session-only shared RAM ring.
+      int start = (s_chat_head - s_chat_count + CHAT_RING_SIZE) % CHAT_RING_SIZE;
+      for (int n = 0; n < s_chat_count; n++) {
+        int i = (start + n) % CHAT_RING_SIZE;
+        if (s_chat_ring[i].channel_idx != (uint8_t)s_chat_channel_idx) continue;
+        chat_history_append_line(s_chat_ring[i].text);
+        rendered++;
+      }
     }
   }
   if (rendered == 0) {
     lv_span_t *sp = lv_spangroup_new_span(s_chat_history);
     if (sp) {
       lv_span_set_text(sp, "(no messages yet)");
-      lv_style_set_text_color(&sp->style, lv_color_hex(0x707880));
+      lv_style_set_text_color(&sp->style, lv_color_hex(PAL->text_dim));
     }
   }
   // Pin to bottom — force a layout pass first so the spangroup's content
@@ -1442,7 +1580,7 @@ static void chat_compose_render() {
     snprintf(cbuf, sizeof(cbuf), "%d/%d", s_compose_len, max_chars);
     lv_label_set_text(s_chat_counter, cbuf);
     // Tint red when within 10 chars of the limit.
-    uint32_t col = (s_compose_len > max_chars - 10) ? 0xe05050 : 0x707880;
+    uint32_t col = (s_compose_len > max_chars - 10) ? 0xe05050 : PAL->text_dim;
     lv_obj_set_style_text_color(s_chat_counter, lv_color_hex(col), 0);
   }
 }
@@ -1456,9 +1594,9 @@ static void chat_view_open(int channel_idx) {
     s_unread_ch[channel_idx] = 0; // reading clears this channel's badge
     update_tile_badges();
   }
-  // Restore persisted history from SD if the ring doesn't already hold it
-  // (e.g. first open after a reboot).
-  if (!chan_ring_has((uint8_t)channel_idx)) chan_persist_load((uint8_t)channel_idx);
+  // History is rendered straight from the per-channel SD log (persistent
+  // channels) or the RAM ring (Public/Test) by chat_history_render() below —
+  // no ring preload needed, and no cross-channel eviction can hide it.
   s_compose_buf[0] = 0;
   s_compose_len = 0;
   // Hide the channels list while the chat is active.
@@ -1523,27 +1661,17 @@ static void chat_view_close() {
   }
 }
 
-// Append a message to the ring buffer. Older entries are evicted FIFO.
-// ---- Channel chat-history SD persistence -----------------------------------
-// One append-log per channel at /sd/ch_<idx>.dat. Each record is
-// [uint8 len][len bytes of text]. Loaded back into the ring on chat open.
-static bool s_chan_loading = false; // suppress re-persist while loading
-
-static void chan_persist_append(uint8_t idx, const char *text) {
-  if (s_chan_loading || !text || !sd_init()) return;
-  char path[24];
-  snprintf(path, sizeof(path), "/sd/ch_%u.dat", (unsigned)idx);
-  FILE *f = fopen(path, "ab");
-  if (!f) return;
-  size_t L = strlen(text);
-  if (L > CHAT_TEXT_MAX - 1) L = CHAT_TEXT_MAX - 1; // matches ChatMsg.text
-  uint8_t len = (uint8_t)L;
-  fwrite(&len, 1, 1, f);
-  fwrite(text, 1, L, f);
-  fclose(f);
-}
-
+// Store a chat message. Persistent channels append to their name-keyed SD log
+// (the source of truth for rendering); Public/Test go to the session-only RAM
+// ring. The helper functions above (chan_hist_path / chan_log_append) do the
+// routing so add/delete slot compaction can never desync a channel's history.
 static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char *text) {
+  char path[32];
+  if (chan_hist_path(channel_idx, path, sizeof(path))) {
+    chan_log_append(path, text); // persistent channel → SD log
+    return;
+  }
+  // Ephemeral channel (Public/Test) → shared RAM ring, evicted FIFO.
   if (!ensure_chat_ring()) return;
   ChatMsg &slot = s_chat_ring[s_chat_head];
   slot.channel_idx = channel_idx;
@@ -1554,43 +1682,6 @@ static void chat_ring_push(uint8_t channel_idx, uint32_t timestamp, const char *
   slot.text[n] = 0;
   s_chat_head = (s_chat_head + 1) % CHAT_RING_SIZE;
   if (s_chat_count < CHAT_RING_SIZE) s_chat_count++;
-  chan_persist_append(channel_idx, text);
-}
-
-// Load a channel's persisted history into the ring (oldest-first), keeping
-// only the last CHAT_RING_SIZE records. Called when opening a channel chat
-// whose history isn't already in the ring (e.g. after reboot).
-static void chan_persist_load(uint8_t idx) {
-  if (!sd_init()) return;
-  char path[24];
-  snprintf(path, sizeof(path), "/sd/ch_%u.dat", (unsigned)idx);
-  FILE *f = fopen(path, "rb");
-  if (!f) return;
-  static char ring[CHAT_RING_SIZE][CHAT_TEXT_MAX];
-  int n = 0;
-  uint8_t len;
-  while (fread(&len, 1, 1, f) == 1) {
-    if (len > CHAT_TEXT_MAX - 1) break;
-    char buf[CHAT_TEXT_MAX];
-    if (fread(buf, 1, len, f) != len) break;
-    buf[len] = 0;
-    memcpy(ring[n % CHAT_RING_SIZE], buf, len + 1);
-    n++;
-  }
-  fclose(f);
-  int start = n > CHAT_RING_SIZE ? n - CHAT_RING_SIZE : 0;
-  s_chan_loading = true;
-  for (int i = start; i < n; i++)
-    chat_ring_push(idx, 0, ring[i % CHAT_RING_SIZE]);
-  s_chan_loading = false;
-}
-
-// True if the ring already holds at least one message for this channel.
-static bool chan_ring_has(uint8_t idx) {
-  if (!s_chat_ring) return false;
-  for (int i = 0; i < s_chat_count; i++)
-    if (s_chat_ring[i].channel_idx == idx) return true;
-  return false;
 }
 
 // Called by MyMesh::onChannelMessageRecv. Single-threaded with the LVGL
@@ -1689,7 +1780,7 @@ static void contacts_list_populate() {
     lv_obj_remove_style_all(hdr);
     lv_obj_set_size(hdr, lv_pct(100), 18);
     lv_obj_set_style_bg_opa(hdr, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_text_color(hdr, lv_color_hex(0x707880), 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(PAL->text_dim), 0);
     lv_obj_set_style_pad_hor(hdr, 6, 0);
     lv_obj_set_style_margin_bottom(hdr, 1, 0);
     lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
@@ -1713,7 +1804,7 @@ static void contacts_list_populate() {
   if (count == 0) {
     lv_obj_t *empty = lv_label_create(s_contacts_list);
     lv_label_set_text(empty, "No favorites yet.\nOpen Discovered to add.");
-    lv_obj_set_style_text_color(empty, lv_color_hex(0x707880), 0);
+    lv_obj_set_style_text_color(empty, lv_color_hex(PAL->text_dim), 0);
     return;
   }
 
@@ -1745,15 +1836,15 @@ static void contacts_list_populate() {
     lv_obj_t *row = lv_obj_create(s_contacts_list);
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 30);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(PAL->surface), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(PAL->surface_focus), LV_STATE_FOCUSED);
     lv_obj_set_style_text_font(row, &lv_font_montserrat_16, 0); // bigger list rows (issue 1)
-    lv_obj_set_style_text_color(row, lv_color_hex(0xe8ecf0), 0);
+    lv_obj_set_style_text_color(row, lv_color_hex(PAL->text), 0);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_margin_bottom(row, 1, 0);
-    lv_obj_set_style_border_color(row, lv_color_hex(0x303a47), 0);
+    lv_obj_set_style_border_color(row, lv_color_hex(PAL->border), 0);
     lv_obj_set_style_border_width(row, 1, 0);
     lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -1823,7 +1914,7 @@ static void contacts_list_populate() {
     else
       snprintf(dist_buf, sizeof(dist_buf), "%dk", (int)km);
     lv_label_set_text(lbl_dist, dist_buf);
-    lv_obj_set_style_text_color(lbl_dist, lv_color_hex(0x80868f), 0);
+    lv_obj_set_style_text_color(lbl_dist, lv_color_hex(PAL->text_dim), 0);
 
     // Last advert (relative).
     lv_obj_t *lbl_age = lv_label_create(row);
@@ -1831,7 +1922,7 @@ static void contacts_list_populate() {
     char age_buf[12];
     rel_time_fmt(ci.last_advert, now, age_buf, sizeof(age_buf));
     lv_label_set_text(lbl_age, age_buf);
-    lv_obj_set_style_text_color(lbl_age, lv_color_hex(0x80868f), 0);
+    lv_obj_set_style_text_color(lbl_age, lv_color_hex(PAL->text_dim), 0);
 
     if (s_contacts_group) lv_group_add_obj(s_contacts_group, row);
   }
@@ -1863,7 +1954,7 @@ static void dm_list_populate() {
   if (count == 0) {
     lv_obj_t *empty = lv_label_create(s_dm_list);
     lv_label_set_text(empty, "No DM contacts.\nOpen Discovered to add a chat node.");
-    lv_obj_set_style_text_color(empty, lv_color_hex(0x707880), 0);
+    lv_obj_set_style_text_color(empty, lv_color_hex(PAL->text_dim), 0);
     return;
   }
 
@@ -1874,10 +1965,10 @@ static void dm_list_populate() {
     lv_obj_t *row = lv_obj_create(s_dm_list);
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 30);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(PAL->surface), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(PAL->surface_focus), LV_STATE_FOCUSED);
     lv_obj_set_style_text_font(row, &lv_font_montserrat_16, 0); // bigger list rows (issue 1)
-    lv_obj_set_style_text_color(row, lv_color_hex(0xe8ecf0), 0);
+    lv_obj_set_style_text_color(row, lv_color_hex(PAL->text), 0);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);
@@ -2014,7 +2105,7 @@ static void discovered_list_populate() {
     lv_obj_remove_style_all(hdr);
     lv_obj_set_size(hdr, lv_pct(100), 18);
     lv_obj_set_style_bg_opa(hdr, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_text_color(hdr, lv_color_hex(0x707880), 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(PAL->text_dim), 0);
     lv_obj_set_style_pad_hor(hdr, 6, 0);
     lv_obj_set_style_margin_bottom(hdr, 1, 0);
     lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
@@ -2038,7 +2129,7 @@ static void discovered_list_populate() {
   if (count == 0) {
     lv_obj_t *empty = lv_label_create(s_discovered_list);
     lv_label_set_text(empty, "(no adverts heard yet)");
-    lv_obj_set_style_text_color(empty, lv_color_hex(0x707880), 0);
+    lv_obj_set_style_text_color(empty, lv_color_hex(PAL->text_dim), 0);
     return;
   }
 
@@ -2050,15 +2141,15 @@ static void discovered_list_populate() {
     lv_obj_t *row = lv_obj_create(s_discovered_list);
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 30);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(PAL->surface), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(PAL->surface_focus), LV_STATE_FOCUSED);
     lv_obj_set_style_text_font(row, &lv_font_montserrat_16, 0); // bigger list rows (issue 1)
-    lv_obj_set_style_text_color(row, lv_color_hex(0xe8ecf0), 0);
+    lv_obj_set_style_text_color(row, lv_color_hex(PAL->text), 0);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_margin_bottom(row, 1, 0);
-    lv_obj_set_style_border_color(row, lv_color_hex(0x303a47), 0);
+    lv_obj_set_style_border_color(row, lv_color_hex(PAL->border), 0);
     lv_obj_set_style_border_width(row, 1, 0);
     lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -2101,7 +2192,7 @@ static void discovered_list_populate() {
     char hop_buf[8];
     snprintf(hop_buf, sizeof(hop_buf), "%u", (unsigned)ci.path_len);
     lv_label_set_text(lbl_hops, hop_buf);
-    lv_obj_set_style_text_color(lbl_hops, lv_color_hex(0x80868f), 0);
+    lv_obj_set_style_text_color(lbl_hops, lv_color_hex(PAL->text_dim), 0);
 
     // Age based on last_advert which we store as "ms-since-boot / 1000"
     // for discovered entries (no NTP needed). Render as "Ns / Nm" etc.
@@ -2116,7 +2207,7 @@ static void discovered_list_populate() {
     else
       snprintf(age_buf, sizeof(age_buf), "%uh", age_s / 3600);
     lv_label_set_text(lbl_age, age_buf);
-    lv_obj_set_style_text_color(lbl_age, lv_color_hex(0x80868f), 0);
+    lv_obj_set_style_text_color(lbl_age, lv_color_hex(PAL->text_dim), 0);
 
     if (s_discovered_group) lv_group_add_obj(s_discovered_group, row);
   }
@@ -2481,8 +2572,11 @@ enum {
   SET_GPS_INFO,   // live GPS fix/sat readout — informational, click no-ops
   SET_HOME_INFO,  // click = clear home
   SET_SCREEN_OFF, // click = cycle timeout
+  SET_APPEARANCE, // click = toggle dark / light theme
+  SET_BRIGHTNESS, // click = cycle backlight Low/Med/Max
   SET_TIME,       // display (NL local, DST-aware) — click refreshes
 };
+static void save_ui_prefs();                   // persist theme + brightness (defined below)
 static lv_obj_t *s_settings_gps_lbl = nullptr; // label of the GPS-status row
 
 static void settings_row_clicked(lv_event_t *e) {
@@ -2514,6 +2608,17 @@ static void settings_row_clicked(lv_event_t *e) {
       s_screen_off_ms = 300000UL;
     else
       s_screen_off_ms = 30000UL;
+    break;
+  case SET_APPEARANCE:
+    s_theme ^= 1;
+    PAL = s_theme ? &PAL_LIGHT : &PAL_DARK;
+    apply_theme();
+    save_ui_prefs();
+    break;
+  case SET_BRIGHTNESS:
+    s_brightness_idx = (uint8_t)((s_brightness_idx + 1) % 3);
+    apply_brightness();
+    save_ui_prefs();
     break;
   case SET_TIME:
     open_set_time_popup(); // opens the text-input popup; switches groups
@@ -2703,7 +2808,7 @@ static void open_set_time_popup() {
 
   // Hint line — parked in s_edit_widget so it is cleaned up on the next open.
   s_edit_widget = lv_label_create(s_edit_popup);
-  lv_obj_set_style_text_color(s_edit_widget, lv_color_hex(0x8a94a0), 0);
+  lv_obj_set_style_text_color(s_edit_widget, lv_color_hex(PAL->text_dim), 0);
   lv_label_set_text(s_edit_widget, "a/d: field   wheel: value\nclick: OK   hold: cancel");
   lv_obj_set_style_text_align(s_edit_widget, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_align(s_edit_widget, LV_ALIGN_BOTTOM_MID, 0, -14);
@@ -2736,16 +2841,16 @@ static void settings_list_populate() {
     lv_obj_t *row = lv_obj_create(s_settings_list);
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, lv_pct(100), 30);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x1c2530), 0);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x2b3742), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(row, lv_color_hex(PAL->surface), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(PAL->surface_focus), LV_STATE_FOCUSED);
     lv_obj_set_style_text_font(row, &lv_font_montserrat_16, 0); // bigger list rows (issue 1)
-    lv_obj_set_style_text_color(row, lv_color_hex(0xe8ecf0), 0);
+    lv_obj_set_style_text_color(row, lv_color_hex(PAL->text), 0);
     lv_obj_set_style_text_color(row, lv_color_hex(0xFAA61A), LV_STATE_FOCUSED);
     lv_obj_set_style_pad_hor(row, 8, 0);
     lv_obj_set_style_pad_ver(row, 2, 0);
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_margin_bottom(row, 2, 0);
-    lv_obj_set_style_border_color(row, lv_color_hex(0x303a47), 0);
+    lv_obj_set_style_border_color(row, lv_color_hex(PAL->border), 0);
     lv_obj_set_style_border_width(row, 1, 0);
     lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -2782,6 +2887,12 @@ static void settings_list_populate() {
   snprintf(buf, sizeof(buf), "Screen off: %lus", s_screen_off_ms / 1000UL);
   build_row(buf, SET_SCREEN_OFF);
 
+  snprintf(buf, sizeof(buf), "Appearance: %s", s_theme ? "Light" : "Dark");
+  build_row(buf, SET_APPEARANCE);
+
+  snprintf(buf, sizeof(buf), "Brightness: %s", BL_NAMES[s_brightness_idx]);
+  build_row(buf, SET_BRIGHTNESS);
+
   uint32_t ep = ui_get_now_epoch ? ui_get_now_epoch() : 0;
   if (ep > 0) {
     struct tm l;
@@ -2802,14 +2913,14 @@ static void build_ui() {
   init_styles();
 
   lv_obj_t *scr = lv_screen_active();
-  lv_obj_set_style_bg_color(scr, lv_color_hex(0x0e141b), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(scr, lv_color_hex(PAL->bg), LV_PART_MAIN);
   lv_obj_set_style_pad_all(scr, 0, LV_PART_MAIN);
 
   // ---- Carousel root container ----
   s_root = lv_obj_create(scr);
   lv_obj_remove_style_all(s_root);
   lv_obj_set_size(s_root, lv_pct(100), lv_pct(100));
-  lv_obj_set_style_bg_color(s_root, lv_color_hex(0x0e141b), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(s_root, lv_color_hex(PAL->bg), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_root, LV_OPA_COVER, LV_PART_MAIN);
 
   // Tile row — flexbox with scroll snap so focused tile centres.
@@ -2865,28 +2976,28 @@ static void build_ui() {
   }
 
   // < > arrow hints below the row
-  lv_obj_t *arrow_l = lv_label_create(s_root);
-  lv_label_set_text(arrow_l, LV_SYMBOL_LEFT);
-  lv_obj_set_style_text_color(arrow_l, lv_color_hex(0x80868f), 0);
-  lv_obj_align_to(arrow_l, s_tile_row, LV_ALIGN_OUT_LEFT_MID, -2, 0);
+  s_arrow_l = lv_label_create(s_root);
+  lv_label_set_text(s_arrow_l, LV_SYMBOL_LEFT);
+  lv_obj_set_style_text_color(s_arrow_l, lv_color_hex(PAL->text_dim), 0);
+  lv_obj_align_to(s_arrow_l, s_tile_row, LV_ALIGN_OUT_LEFT_MID, -2, 0);
 
-  lv_obj_t *arrow_r = lv_label_create(s_root);
-  lv_label_set_text(arrow_r, LV_SYMBOL_RIGHT);
-  lv_obj_set_style_text_color(arrow_r, lv_color_hex(0x80868f), 0);
-  lv_obj_align_to(arrow_r, s_tile_row, LV_ALIGN_OUT_RIGHT_MID, 2, 0);
+  s_arrow_r = lv_label_create(s_root);
+  lv_label_set_text(s_arrow_r, LV_SYMBOL_RIGHT);
+  lv_obj_set_style_text_color(s_arrow_r, lv_color_hex(PAL->text_dim), 0);
+  lv_obj_align_to(s_arrow_r, s_tile_row, LV_ALIGN_OUT_RIGHT_MID, 2, 0);
 
   // Footer hint (the duplicated tile title stays removed; only this control
   // hint sits under the carousel).
-  lv_obj_t *hint = lv_label_create(s_root);
-  lv_label_set_text(hint, "rotate: scroll   click: open   long: back   3s: power off");
-  lv_obj_set_style_text_color(hint, lv_color_hex(0x707880), 0);
-  lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -4);
+  s_footer_hint = lv_label_create(s_root);
+  lv_label_set_text(s_footer_hint, "rotate: scroll   click: open   long: back   3s: power off");
+  lv_obj_set_style_text_color(s_footer_hint, lv_color_hex(PAL->text_dim), 0);
+  lv_obj_align(s_footer_hint, LV_ALIGN_BOTTOM_MID, 0, -4);
 
   // ---- Sub-screen container (hidden by default) ----
   s_subscreen_root = lv_obj_create(scr);
   lv_obj_remove_style_all(s_subscreen_root);
   lv_obj_set_size(s_subscreen_root, lv_pct(100), lv_pct(100));
-  lv_obj_set_style_bg_color(s_subscreen_root, lv_color_hex(0x0e141b), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(s_subscreen_root, lv_color_hex(PAL->bg), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_subscreen_root, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_add_flag(s_subscreen_root, LV_OBJ_FLAG_HIDDEN);
 
@@ -2905,14 +3016,14 @@ static void build_ui() {
     lv_obj_remove_style_all(rule);
     lv_obj_set_size(rule, lv_pct(96), 2);
     lv_obj_align(rule, LV_ALIGN_TOP_LEFT, 6, yk == 0 ? 20 : 42);
-    lv_obj_set_style_bg_color(rule, lv_color_hex(0x404a55), 0);
+    lv_obj_set_style_bg_color(rule, lv_color_hex(PAL->border), 0);
     lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
     s_title_rule[yk] = rule;
   }
 
   s_subscreen_body = lv_label_create(s_subscreen_root);
   lv_label_set_text(s_subscreen_body, "");
-  lv_obj_set_style_text_color(s_subscreen_body, lv_color_hex(0xe8ecf0), 0);
+  lv_obj_set_style_text_color(s_subscreen_body, lv_color_hex(PAL->text), 0);
   lv_obj_set_width(s_subscreen_body, lv_pct(96));
   lv_label_set_long_mode(s_subscreen_body, LV_LABEL_LONG_WRAP);
   lv_obj_align(s_subscreen_body, LV_ALIGN_TOP_LEFT, 6, 48);
@@ -2928,7 +3039,7 @@ static void build_ui() {
   lv_obj_set_size(s_radio_list, lv_pct(96), lv_pct(70));
   lv_obj_align(s_radio_list, LV_ALIGN_TOP_LEFT, 6, 44);
   lv_obj_set_flex_flow(s_radio_list, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_bg_color(s_radio_list, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_bg_color(s_radio_list, lv_color_hex(PAL->bg), 0);
   lv_obj_set_style_pad_all(s_radio_list, 2, 0);
   lv_obj_set_scroll_dir(s_radio_list, LV_DIR_VER);
   lv_obj_add_flag(s_radio_list, LV_OBJ_FLAG_HIDDEN);
@@ -2944,7 +3055,7 @@ static void build_ui() {
   lv_obj_set_size(s_channel_list, lv_pct(96), lv_pct(70));
   lv_obj_align(s_channel_list, LV_ALIGN_TOP_LEFT, 6, 44);
   lv_obj_set_flex_flow(s_channel_list, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_bg_color(s_channel_list, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_bg_color(s_channel_list, lv_color_hex(PAL->bg), 0);
   lv_obj_set_style_pad_all(s_channel_list, 2, 0);
   lv_obj_set_scroll_dir(s_channel_list, LV_DIR_VER);
   lv_obj_add_flag(s_channel_list, LV_OBJ_FLAG_HIDDEN);
@@ -2960,7 +3071,7 @@ static void build_ui() {
   lv_obj_set_size(s_contacts_list, lv_pct(96), lv_pct(70));
   lv_obj_align(s_contacts_list, LV_ALIGN_TOP_LEFT, 6, 44);
   lv_obj_set_flex_flow(s_contacts_list, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_bg_color(s_contacts_list, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_bg_color(s_contacts_list, lv_color_hex(PAL->bg), 0);
   lv_obj_set_style_pad_all(s_contacts_list, 2, 0);
   lv_obj_set_scroll_dir(s_contacts_list, LV_DIR_VER);
   lv_obj_add_flag(s_contacts_list, LV_OBJ_FLAG_HIDDEN);
@@ -2973,7 +3084,7 @@ static void build_ui() {
   lv_obj_set_size(s_dm_list, lv_pct(96), lv_pct(70));
   lv_obj_align(s_dm_list, LV_ALIGN_TOP_LEFT, 6, 44);
   lv_obj_set_flex_flow(s_dm_list, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_bg_color(s_dm_list, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_bg_color(s_dm_list, lv_color_hex(PAL->bg), 0);
   lv_obj_set_style_pad_all(s_dm_list, 2, 0);
   lv_obj_set_scroll_dir(s_dm_list, LV_DIR_VER);
   lv_obj_add_flag(s_dm_list, LV_OBJ_FLAG_HIDDEN);
@@ -2987,7 +3098,7 @@ static void build_ui() {
   lv_obj_set_size(s_discovered_list, lv_pct(96), lv_pct(70));
   lv_obj_align(s_discovered_list, LV_ALIGN_TOP_LEFT, 6, 44);
   lv_obj_set_flex_flow(s_discovered_list, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_bg_color(s_discovered_list, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_bg_color(s_discovered_list, lv_color_hex(PAL->bg), 0);
   lv_obj_set_style_pad_all(s_discovered_list, 2, 0);
   lv_obj_set_scroll_dir(s_discovered_list, LV_DIR_VER);
   lv_obj_add_flag(s_discovered_list, LV_OBJ_FLAG_HIDDEN);
@@ -3003,7 +3114,7 @@ static void build_ui() {
   lv_obj_set_flex_flow(s_advert_root, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(s_advert_root, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_row(s_advert_root, 16, 0);
-  lv_obj_set_style_bg_color(s_advert_root, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_bg_color(s_advert_root, lv_color_hex(PAL->bg), 0);
   lv_obj_add_flag(s_advert_root, LV_OBJ_FLAG_HIDDEN);
   s_advert_group = lv_group_create();
   {
@@ -3033,7 +3144,7 @@ static void build_ui() {
   lv_obj_set_size(s_settings_list, lv_pct(96), lv_pct(70));
   lv_obj_align(s_settings_list, LV_ALIGN_TOP_LEFT, 6, 44);
   lv_obj_set_flex_flow(s_settings_list, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_bg_color(s_settings_list, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_bg_color(s_settings_list, lv_color_hex(PAL->bg), 0);
   lv_obj_set_style_pad_all(s_settings_list, 2, 0);
   lv_obj_set_scroll_dir(s_settings_list, LV_DIR_VER);
   lv_obj_add_flag(s_settings_list, LV_OBJ_FLAG_HIDDEN);
@@ -3051,7 +3162,7 @@ static void build_ui() {
   lv_obj_remove_style_all(s_chat_scroll);
   lv_obj_set_size(s_chat_scroll, lv_pct(96), lv_pct(60));
   lv_obj_align(s_chat_scroll, LV_ALIGN_TOP_LEFT, 6, 44);
-  lv_obj_set_style_bg_color(s_chat_scroll, lv_color_hex(0x0e141b), 0);
+  lv_obj_set_style_bg_color(s_chat_scroll, lv_color_hex(PAL->bg), 0);
   lv_obj_set_style_bg_opa(s_chat_scroll, LV_OPA_COVER, 0);
   lv_obj_set_style_pad_all(s_chat_scroll, 0, 0);
   lv_obj_add_flag(s_chat_scroll, LV_OBJ_FLAG_SCROLLABLE);
@@ -3064,7 +3175,7 @@ static void build_ui() {
   lv_obj_set_height(s_chat_history, LV_SIZE_CONTENT);
   lv_obj_set_pos(s_chat_history, 0, 0);
   lv_spangroup_set_mode(s_chat_history, LV_SPAN_MODE_BREAK);
-  lv_obj_set_style_text_color(s_chat_history, lv_color_hex(0xe8ecf0), 0);
+  lv_obj_set_style_text_color(s_chat_history, lv_color_hex(PAL->text), 0);
   // Larger chat font — DM/Channel history was hard to read outdoors (issue 1).
   lv_obj_set_style_text_font(s_chat_history, &lv_font_montserrat_18, 0);
 
@@ -3076,7 +3187,7 @@ static void build_ui() {
   lv_label_set_long_mode(s_chat_compose, LV_LABEL_LONG_DOT);
   lv_obj_set_style_text_font(s_chat_compose, &lv_font_montserrat_18, 0);
   lv_obj_set_style_text_color(s_chat_compose, lv_color_hex(0xFAA61A), 0);
-  lv_obj_set_style_bg_color(s_chat_compose, lv_color_hex(0x1c2530), 0);
+  lv_obj_set_style_bg_color(s_chat_compose, lv_color_hex(PAL->surface), 0);
   lv_obj_set_style_bg_opa(s_chat_compose, LV_OPA_COVER, 0);
   lv_obj_set_style_pad_hor(s_chat_compose, 6, 0);
   lv_obj_set_style_pad_ver(s_chat_compose, 3, 0);
@@ -3087,7 +3198,7 @@ static void build_ui() {
   // so the two lines have a clear gap (issue 3).
   s_chat_counter = lv_label_create(s_subscreen_root);
   lv_label_set_text(s_chat_counter, "");
-  lv_obj_set_style_text_color(s_chat_counter, lv_color_hex(0x707880), 0);
+  lv_obj_set_style_text_color(s_chat_counter, lv_color_hex(PAL->text_dim), 0);
   lv_obj_align(s_chat_counter, LV_ALIGN_BOTTOM_RIGHT, -8, -46);
   lv_obj_add_flag(s_chat_counter, LV_OBJ_FLAG_HIDDEN);
 
@@ -3101,24 +3212,24 @@ static void build_ui() {
   lv_label_set_text(s_header_label, "T-Pager");
   // Same muted-grey as the DC label so the persistent top row reads as
   // one cohesive status strip instead of three competing colors.
-  lv_obj_set_style_text_color(s_header_label, lv_color_hex(0x80868f), 0);
+  lv_obj_set_style_text_color(s_header_label, lv_color_hex(PAL->text_dim), 0);
   lv_obj_align(s_header_label, LV_ALIGN_TOP_LEFT, 6, 4);
 
   s_dc_label = lv_label_create(scr);
   lv_label_set_text(s_dc_label, "");
-  lv_obj_set_style_text_color(s_dc_label, lv_color_hex(0x80868f), 0);
+  lv_obj_set_style_text_color(s_dc_label, lv_color_hex(PAL->text_dim), 0);
   lv_obj_align(s_dc_label, LV_ALIGN_TOP_MID, 0, 4);
 
   s_battery_label = lv_label_create(scr);
   lv_label_set_text(s_battery_label, "");
-  lv_obj_set_style_text_color(s_battery_label, lv_color_hex(0xe8ecf0), 0);
+  lv_obj_set_style_text_color(s_battery_label, lv_color_hex(PAL->text), 0);
   lv_obj_align(s_battery_label, LV_ALIGN_TOP_RIGHT, -6, 4);
 
   // Toast popup (item 2) — small centered label, hidden until ui_toast().
   s_toast_popup = lv_obj_create(scr);
   lv_obj_set_size(s_toast_popup, lv_pct(70), LV_SIZE_CONTENT);
   lv_obj_center(s_toast_popup);
-  lv_obj_set_style_bg_color(s_toast_popup, lv_color_hex(0x1c2530), 0);
+  lv_obj_set_style_bg_color(s_toast_popup, lv_color_hex(PAL->surface), 0);
   lv_obj_set_style_border_width(s_toast_popup, 2, 0);
   lv_obj_set_style_border_color(s_toast_popup, lv_color_hex(0xFAA61A), 0);
   lv_obj_set_style_radius(s_toast_popup, 8, 0);
@@ -3135,7 +3246,7 @@ static void build_ui() {
   s_edit_popup = lv_obj_create(scr);
   lv_obj_set_size(s_edit_popup, lv_pct(80), 130);
   lv_obj_center(s_edit_popup);
-  lv_obj_set_style_bg_color(s_edit_popup, lv_color_hex(0x1c2530), 0);
+  lv_obj_set_style_bg_color(s_edit_popup, lv_color_hex(PAL->surface), 0);
   lv_obj_set_style_border_width(s_edit_popup, 2, 0);
   lv_obj_set_style_border_color(s_edit_popup, lv_color_hex(0xFAA61A), 0);
   lv_obj_set_style_radius(s_edit_popup, 8, 0);
@@ -3149,7 +3260,7 @@ static void build_ui() {
 
   lv_obj_t *edit_hint = lv_label_create(s_edit_popup);
   lv_label_set_text(edit_hint, "rotate to change, click to save");
-  lv_obj_set_style_text_color(edit_hint, lv_color_hex(0x707880), 0);
+  lv_obj_set_style_text_color(edit_hint, lv_color_hex(PAL->text_dim), 0);
   lv_obj_align(edit_hint, LV_ALIGN_BOTTOM_MID, 0, -4);
 
   s_edit_group = lv_group_create();
@@ -3159,7 +3270,7 @@ static void build_ui() {
   s_disc_menu_popup = lv_obj_create(scr);
   lv_obj_set_size(s_disc_menu_popup, lv_pct(80), 96);
   lv_obj_center(s_disc_menu_popup);
-  lv_obj_set_style_bg_color(s_disc_menu_popup, lv_color_hex(0x1c2530), 0);
+  lv_obj_set_style_bg_color(s_disc_menu_popup, lv_color_hex(PAL->surface), 0);
   lv_obj_set_style_border_width(s_disc_menu_popup, 2, 0);
   lv_obj_set_style_border_color(s_disc_menu_popup, lv_color_hex(0xFAA61A), 0);
   lv_obj_set_style_radius(s_disc_menu_popup, 8, 0);
@@ -3225,7 +3336,7 @@ static void build_ui() {
   s_con_menu_popup = lv_obj_create(scr);
   lv_obj_set_size(s_con_menu_popup, lv_pct(80), 130);
   lv_obj_center(s_con_menu_popup);
-  lv_obj_set_style_bg_color(s_con_menu_popup, lv_color_hex(0x1c2530), 0);
+  lv_obj_set_style_bg_color(s_con_menu_popup, lv_color_hex(PAL->surface), 0);
   lv_obj_set_style_border_width(s_con_menu_popup, 2, 0);
   lv_obj_set_style_border_color(s_con_menu_popup, lv_color_hex(0xFAA61A), 0);
   lv_obj_set_style_radius(s_con_menu_popup, 8, 0);
@@ -3292,7 +3403,7 @@ static void build_ui() {
   s_ch_menu_popup = lv_obj_create(scr);
   lv_obj_set_size(s_ch_menu_popup, lv_pct(80), 130);
   lv_obj_center(s_ch_menu_popup);
-  lv_obj_set_style_bg_color(s_ch_menu_popup, lv_color_hex(0x1c2530), 0);
+  lv_obj_set_style_bg_color(s_ch_menu_popup, lv_color_hex(PAL->surface), 0);
   lv_obj_set_style_border_width(s_ch_menu_popup, 2, 0);
   lv_obj_set_style_border_color(s_ch_menu_popup, lv_color_hex(0xFAA61A), 0);
   lv_obj_set_style_radius(s_ch_menu_popup, 8, 0);
@@ -3330,6 +3441,7 @@ static void build_ui() {
             return;
           }
           if (which == 1 && ui_delete_channel) { // Delete channel
+            chan_hist_remove(idx);               // drop its SD log first (idx→name still valid)
             ui_delete_channel(idx);
           }
           ch_menu_close();
@@ -3340,7 +3452,7 @@ static void build_ui() {
 
   s_back_hint = lv_label_create(s_subscreen_root);
   lv_label_set_text(s_back_hint, "click: open   long-press: back");
-  lv_obj_set_style_text_color(s_back_hint, lv_color_hex(0x707880), 0);
+  lv_obj_set_style_text_color(s_back_hint, lv_color_hex(PAL->text_dim), 0);
   lv_obj_align(s_back_hint, LV_ALIGN_BOTTOM_MID, 0, -4);
 
   // ---- Encoder group ----
@@ -3353,6 +3465,80 @@ static void build_ui() {
   lv_group_focus_obj(s_tile_buttons[0]);
 }
 
+// Push the selected backlight level to the panel's PWM.
+static void apply_brightness() {
+  tpager_lgfx_panel.setBrightness(BL_LEVELS[s_brightness_idx]);
+}
+
+// Re-tint the whole UI to the active palette (PAL). Content lists (settings,
+// contacts, channels, chat...) rebuild their rows from PAL on every entry, so
+// here we only need to re-colour the shared tile styles and the persistent,
+// always-/often-visible surfaces that are created once in build_ui().
+static void apply_theme() {
+  // Shared carousel tile styles — re-set the palette-driven props, then ask
+  // LVGL to repaint every object that uses them.
+  lv_style_set_border_color(&style_tile, lv_color_hex(PAL->border));
+  lv_style_set_bg_color(&style_tile, lv_color_hex(PAL->surface));
+  lv_style_set_text_color(&style_tile, lv_color_hex(PAL->text));
+  lv_style_set_border_color(&style_tile_focused, lv_color_hex(PAL->accent));
+  lv_style_set_bg_color(&style_tile_focused, lv_color_hex(PAL->surface_focus));
+  lv_style_set_text_color(&style_tile_focused, lv_color_hex(PAL->accent));
+
+  auto bg = [](lv_obj_t *o) {
+    if (o) lv_obj_set_style_bg_color(o, lv_color_hex(PAL->bg), 0);
+  };
+  auto txt = [](lv_obj_t *o, uint32_t c) {
+    if (o) lv_obj_set_style_text_color(o, lv_color_hex(c), 0);
+  };
+
+  bg(lv_screen_active());
+  bg(s_root);
+  bg(s_subscreen_root);
+  bg(s_radio_list);
+  bg(s_channel_list);
+  bg(s_contacts_list);
+  bg(s_dm_list);
+  bg(s_discovered_list);
+  bg(s_advert_root);
+  bg(s_settings_list);
+  bg(s_chat_scroll);
+
+  txt(s_subscreen_title, PAL->accent);
+  txt(s_subscreen_body, PAL->text);
+  txt(s_chat_history, PAL->text);
+  txt(s_chat_counter, PAL->text_dim);
+  txt(s_header_label, PAL->text_dim);
+  txt(s_dc_label, PAL->text_dim); // loop re-tints dynamically
+  txt(s_battery_label, PAL->text);
+  txt(s_arrow_l, PAL->text_dim);
+  txt(s_arrow_r, PAL->text_dim);
+  txt(s_footer_hint, PAL->text_dim);
+  for (int i = 0; i < 2; i++)
+    bg(s_title_rule[i]);
+
+  if (s_chat_compose) {
+    lv_obj_set_style_text_color(s_chat_compose, lv_color_hex(PAL->accent), 0);
+    lv_obj_set_style_bg_color(s_chat_compose, lv_color_hex(PAL->surface), 0);
+  }
+
+  // Popups (built once): surface fill + accent border. Their body text must be
+  // the palette's text colour, not the old hard-white (invisible on a light
+  // surface).
+  lv_obj_t *popups[] = { s_toast_popup, s_edit_popup, s_disc_menu_popup, s_con_menu_popup, s_ch_menu_popup };
+  for (lv_obj_t *p : popups) {
+    if (!p) continue;
+    lv_obj_set_style_bg_color(p, lv_color_hex(PAL->surface), 0);
+    lv_obj_set_style_border_color(p, lv_color_hex(PAL->accent), 0);
+    lv_obj_set_style_text_color(p, lv_color_hex(PAL->text), 0);
+  }
+  txt(s_toast_label, PAL->text);
+  txt(s_edit_title, PAL->accent);
+
+  map_screen_apply_theme(); // backdrop + SD-fail text follow the theme too
+
+  lv_obj_report_style_change(NULL); // repaint everything using the shared styles
+}
+
 static void focused_changed_cb(lv_event_t *e) {
   lv_obj_t *obj = (lv_obj_t *)lv_event_get_target(e);
   for (int i = 0; i < NUM_TILES; i++) {
@@ -3360,6 +3546,29 @@ static void focused_changed_cb(lv_event_t *e) {
       lv_obj_scroll_to_view(obj, LV_ANIM_OFF); // snap — no animation queue
       break;
     }
+  }
+}
+
+// ---------- Theme / brightness persistence -----------------------------------
+
+static void load_ui_prefs() {
+  Preferences p;
+  if (p.begin("tpager", true /*read-only*/)) {
+    s_theme = p.getUChar("theme", 0);
+    s_brightness_idx = p.getUChar("bl", 0);
+    p.end();
+  }
+  if (s_theme > 1) s_theme = 0;
+  if (s_brightness_idx > 2) s_brightness_idx = 0;
+  PAL = s_theme ? &PAL_LIGHT : &PAL_DARK;
+}
+
+static void save_ui_prefs() {
+  Preferences p;
+  if (p.begin("tpager", false)) {
+    p.putUChar("theme", s_theme);
+    p.putUChar("bl", s_brightness_idx);
+    p.end();
   }
 }
 
@@ -3372,11 +3581,15 @@ void UITask::begin(DisplayDriver *display, SensorManager *sensors, NodePrefs *pr
   _auto_off = millis() + s_screen_off_ms;
   s_self = this;
 
+  load_ui_prefs(); // sets PAL before build_ui so widgets build in the saved theme
+
   if (_display) _display->turnOn();
 
   if (tpager_lvgl_begin(&tpager_lgfx_panel)) {
     s_lvgl_ready = true;
     build_ui();
+    apply_theme();      // reconcile popup/text colours for a persisted light theme
+    apply_brightness(); // restore saved backlight level
     // Hook focus-changed events on each tile so the title label tracks
     // the focused tile.
     for (int i = 0; i < NUM_TILES; i++) {
@@ -3390,6 +3603,16 @@ void UITask::loop() {
   // any variant hook, so we do it here. variant_loop() is cheap when the
   // FIFO is empty and self-initialises on first call.
   variant_loop();
+
+  // Keyboard input (map pan/zoom, chat typing) counts as user activity too —
+  // previously only the encoder + button reset the sleep timer, so typing
+  // could let the screen die and map keys never woke it. ui_input_char() flags
+  // s_input_activity; act on it here where we can touch _auto_off / _display.
+  if (s_input_activity) {
+    s_input_activity = false;
+    _auto_off = millis() + s_screen_off_ms;
+    if (_display && !_display->isOn()) _display->turnOn();
+  }
 
 #if defined(PIN_ENCODER_A) && defined(PIN_ENCODER_B)
   // Full quadrature state-table decoder. Each mechanical detent moves the
@@ -3553,11 +3776,26 @@ void UITask::loop() {
     bool popup_open = s_disc_menu_popup && !lv_obj_has_flag(s_disc_menu_popup, LV_OBJ_FLAG_HIDDEN);
     if (!popup_open) discovered_list_populate();
   }
+  // Screen-off gate for the Map work. map_follow + status refresh drive SD tile
+  // reads + PNG decode over the SPI bus shared with the radio; running them
+  // while the panel is asleep (e.g. walking with the Map open, screen timed
+  // out) both wastes battery AND stretches each cooperative loop pass, which
+  // starves the once-per-loop encoder/button poll and made wake take 30 s+.
+  // While off we skip the map entirely; on the wake edge we force an immediate
+  // re-centre + status refresh so the view is fresh the instant it lights up.
+  const bool disp_on = _display && _display->isOn();
+  static bool s_disp_on_prev = true;
+  if (disp_on && !s_disp_on_prev) {
+    s_map_follow_next = 0; // just woke → catch up now, don't wait up to 2 s
+    s_map_status_next = 0;
+  }
+  s_disp_on_prev = disp_on;
+
   // Map (item 5 / issue 3): follow the live fix. After the initial dwell on
   // Home (s_map_gps_switch_at), re-centre on GPS every ~2 s so the crosshair
   // + tiles track movement. Manual pan/zoom clears s_map_follow so the view
   // stays put until the Map tile is re-opened.
-  if (s_active_tile == TILE_MAP && s_map_follow &&
+  if (disp_on && s_active_tile == TILE_MAP && s_map_follow &&
       (s_map_gps_switch_at == 0 || (long)(millis() - s_map_gps_switch_at) >= 0) &&
       (long)(millis() - s_map_follow_next) >= 0) {
     s_map_follow_next = millis() + 2000;
@@ -3567,7 +3805,7 @@ void UITask::loop() {
     if (glat || glon) map_screen_set_center(glat, glon);
   }
   // Live sat-count refresh on the Map status strip (no tile reload).
-  if (s_active_tile == TILE_MAP && (long)(millis() - s_map_status_next) >= 0) {
+  if (disp_on && s_active_tile == TILE_MAP && (long)(millis() - s_map_status_next) >= 0) {
     s_map_status_next = millis() + 2000;
     map_screen_refresh_status();
   }
@@ -3632,7 +3870,7 @@ void UITask::loop() {
       snprintf(buf, sizeof(buf), "DC %d.%d%% %d.%ds/%ds", t / 10, t % 10, used_s_whole, used_tenths, max_s);
       lv_label_set_text(s_dc_label, buf);
       // Tint: amber over 70% used, red over 90%, otherwise low-contrast.
-      uint32_t col = (t > 900) ? 0xe05050 : (t > 700) ? 0xFAA61A : 0x80868f;
+      uint32_t col = (t > 900) ? 0xe05050 : (t > 700) ? PAL->accent : PAL->text_dim;
       lv_obj_set_style_text_color(s_dc_label, lv_color_hex(col), 0);
     }
     if (s_header_label && _prefs && _prefs->node_name[0]) {
