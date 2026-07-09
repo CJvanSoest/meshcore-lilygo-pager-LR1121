@@ -1,128 +1,101 @@
-## About MeshCore
+<p align="center">
+  <img src=".github/assets/banner.svg" alt="MeshCore for the LilyGo T-Lora Pager (LR1121)" width="100%">
+</p>
 
-MeshCore is a lightweight, portable C++ library that enables multi-hop packet routing for embedded projects using LoRa and other packet radios. It is designed for developers who want to create resilient, decentralized communication networks that work without the internet.
+<h1 align="center">MeshCore for the LilyGo T-Lora Pager (LR1121)</h1>
 
-## 🔍 What is MeshCore?
+<p align="center">
+  A standalone, off-grid <strong>LoRa mesh messenger</strong> firmware for the
+  <strong>LilyGo T-Lora Pager</strong> with the multi-band <strong>Semtech LR1121</strong> radio —
+  a <a href="https://meshtastic.org">Meshtastic</a> alternative built on
+  <a href="https://github.com/meshcore-dev/MeshCore">MeshCore</a>. No phone required.
+</p>
 
-MeshCore now supports a range of LoRa devices, allowing for easy flashing without the need to compile firmware manually. Users can flash a pre-built binary using tools like Adafruit ESPTool and interact with the network through a serial console.
-MeshCore provides the ability to create wireless mesh networks, similar to Meshtastic and Reticulum but with a focus on lightweight multi-hop packet routing for embedded projects. Unlike Meshtastic, which is tailored for casual LoRa communication, or Reticulum, which offers advanced networking, MeshCore balances simplicity with scalability, making it ideal for custom embedded solutions, where devices (nodes) can communicate over long distances by relaying messages through intermediate nodes. This is especially useful in off-grid, emergency, or tactical situations where traditional communication infrastructure is unavailable.
+<p align="center">
+  <a href="https://github.com/CJvanSoest/meshcore-lilygo-pager-LR1121/actions/workflows/pr-build-check.yml"><img src="https://github.com/CJvanSoest/meshcore-lilygo-pager-LR1121/actions/workflows/pr-build-check.yml/badge.svg" alt="Build"></a>
+  <a href="https://github.com/CJvanSoest/meshcore-lilygo-pager-LR1121/releases/latest"><img src="https://img.shields.io/github/v/release/CJvanSoest/meshcore-lilygo-pager-LR1121?label=release" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/platform-ESP32--S3-3178c6" alt="Platform ESP32-S3">
+  <img src="https://img.shields.io/badge/radio-LR1121-FAA61A" alt="Radio LR1121">
+  <a href="https://github.com/CJvanSoest/meshcore-lilygo-pager-LR1121/blob/main/license.txt"><img src="https://img.shields.io/github/license/CJvanSoest/meshcore-lilygo-pager-LR1121" alt="License"></a>
+</p>
 
-## ⚡ Key Features
+---
 
-* Multi-Hop Packet Routing
-  * Devices can forward messages across multiple nodes, extending range beyond a single radio's reach.
-  * Supports up to a configurable number of hops to balance network efficiency and prevent excessive traffic.
-  * Nodes use fixed roles where "Companion" nodes are not repeating messages at all to prevent adverse routing paths from being used.
-* Supports LoRa Radios – Works with Heltec, RAK Wireless, and other LoRa-based hardware.
-* Decentralized & Resilient – No central server or internet required; the network is self-healing.
-* Low Power Consumption – Ideal for battery-powered or solar-powered devices.
-* Simple to Deploy – Pre-built example applications make it easy to get started.
+The **LilyGo T-Lora Pager** is a pocket LoRa handheld with a colour IPS screen, a
+QWERTY keyboard and a scroll-wheel. This firmware turns it into a fully
+**standalone MeshCore node** — you read and write channel messages and direct
+messages, watch nodes appear on an offline map, and manage the radio, all on the
+device itself. It joins the same mesh as any other MeshCore, Meshtastic-style
+off-grid network, and works where there is no cell coverage, no WiFi and no
+internet.
 
-## 🎯 What Can You Use MeshCore For?
+## ✨ Features
 
-* Off-Grid Communication: Stay connected even in remote areas.
-* Emergency Response & Disaster Recovery: Set up instant networks where infrastructure is down.
-* Outdoor Activities: Hiking, camping, and adventure racing communication.
-* Tactical & Security Applications: Military, law enforcement, and private security use cases.
-* IoT & Sensor Networks: Collect data from remote sensors and relay it back to a central location.
+- **Standalone LVGL UI** — a tile carousel (Radio · Channels · DM · Contacts · Discovered · Map · Settings) driven entirely by the scroll-wheel + QWERTY keyboard; no companion phone app needed.
+- **Channels & direct messages** — hashtag channels and per-contact DMs with an on-screen keyboard, unread badges, and **per-channel chat history saved to the microSD card** (survives reboots).
+- **GPS + offline maps** — live position fix, a satellite-test screen, and a pannable/zoomable **offline map** rendered from tiles on the SD card, with your position and heard nodes drawn on it.
+- **Dark / light themes + brightness control** — a white high-contrast theme and Low/Med/Max backlight for readability in bright sunlight; both persist across reboots.
+- **On-device radio settings** — frequency, spreading factor, bandwidth, coding rate, TX power, RX-boost and node name, all editable from the UI and saved to flash.
+- **Contacts & node discovery** — a live list of heard nodes with SNR/RSSI/distance, plus a "Discovered" view to add new nodes or send adverts.
+- **Repeater build** — a low-footprint relay/repeater firmware for the same hardware.
 
-## 🚀 How to Get Started
+## 📟 Supported hardware
 
-- Watch the [MeshCore QuickStart Playlist](https://www.youtube.com/watch?v=iaFltojJrAc&list=PLshzThxhw4O4WU_iZo3NmNZOv6KMrUuF9) by The Comms Channel
-- Watch the [MeshCore Technical Presentation](https://www.youtube.com/watch?v=OwmkVkZQTf4) by Liam Cottle.
-- Read through our [Frequently Asked Questions](./docs/faq.md) and [Documentation](https://docs.meshcore.io).
-- Flash the MeshCore firmware on a supported device.
-- Connect with a supported client.
+| | |
+|---|---|
+| **Board** | LilyGo T-Lora Pager (LR1121 variant) |
+| **MCU** | Espressif ESP32-S3 (PSRAM) |
+| **Radio** | Semtech LR1121 — multi-band, sub-GHz **and** 2.4 GHz |
+| **Display** | Sitronix ST7796 IPS LCD |
+| **Input** | TCA8418 QWERTY keyboard + rotary encoder / scroll-wheel |
+| **Other** | GPS, BQ25896 charger / BQ27220 fuel gauge, XL9555 IO expander, microSD |
 
-For developers:
+> This is the **LR1121** variant. Boards fitted with an SX1262 use a different
+> radio driver and are not covered here.
 
-- Install [PlatformIO](https://docs.platformio.org) in [Visual Studio Code](https://code.visualstudio.com).
-- Clone and open the MeshCore repository in Visual Studio Code.
-- See the example applications you can modify and run:
-  - [Companion Radio](./examples/companion_radio) - For use with an external chat app, over BLE, USB or Wi-Fi.
-  - [KISS Modem](./examples/kiss_modem) - Serial KISS protocol bridge for host applications. ([protocol docs](./docs/kiss_modem_protocol.md))
-  - [Simple Repeater](./examples/simple_repeater) - Extends network coverage by relaying messages.
-  - [Simple Room Server](./examples/simple_room_server) - A simple BBS server for shared Posts.
-  - [Simple Secure Chat](./examples/simple_secure_chat) - Secure terminal based text communication between devices.
-  - [Simple Sensor](./examples/simple_sensor) - Remote sensor node with telemetry and alerting.
+## ⚡ Flashing a pre-built firmware
 
-The Simple Secure Chat example can be interacted with through the Serial Monitor in Visual Studio Code, or with a Serial USB Terminal on Android.
+1. Download the latest firmware from the [**Releases**](https://github.com/CJvanSoest/meshcore-lilygo-pager-LR1121/releases/latest) page. Two builds are published:
+   - `…companion_radio_usb…` — the standalone messenger UI (most people want this).
+   - `…repeater…` — the relay/repeater build.
+2. Flash it with [esptool](https://github.com/espressif/esptool) or the [Adafruit ESPTool web flasher](https://adafruit.github.io/Adafruit_WebSerial_ESPTool/):
+   - **`…-merged.bin`** → write to offset **`0x0`** (full image, easiest for a first flash).
+   - **`….bin`** (app only) → write to offset **`0x10000`** to update without erasing your saved settings / SD data.
+3. **Power on** with the small side button; the UI comes up on the screen.
 
-## ⚡️ MeshCore Flasher
+## 🛠️ Build from source
 
-We have prebuilt firmware ready to flash on supported devices.
-
-- Launch https://meshcore.io/flasher
-- Select a supported device
-- Flash one of the firmware types:
-  - Companion, Repeater or Room Server
-- Once flashing is complete, you can connect with one of the MeshCore clients below.
-
-## 📱 MeshCore Clients
-
-**Companion Firmware**
-
-The companion firmware can be connected to via BLE, USB or Wi-Fi depending on the firmware type you flashed.
-
-- Web: https://app.meshcore.nz
-- Android: https://play.google.com/store/apps/details?id=com.liamcottle.meshcore.android
-- iOS: https://apps.apple.com/us/app/meshcore/id6742354151?platform=iphone
-- NodeJS: https://github.com/liamcottle/meshcore.js
-- Python: https://github.com/fdlamotte/meshcore-cli
-
-**Repeater and Room Server Firmware**
-
-The repeater and room server firmware can be set up via USB in the web config tool.
-
-- https://config.meshcore.io
-
-They can also be managed via LoRa in the mobile app by using the Remote Management feature.
-
-## 🛠 Hardware Compatibility
-
-MeshCore is designed for devices listed in the [MeshCore Flasher](https://meshcore.io/flasher)
-
-## 📜 License
-
-MeshCore is open-source software released under the MIT License. You are free to use, modify, and distribute it for personal and commercial projects.
-
-## Contributing
-
-Please submit PR's using 'dev' as the base branch!
-For minor changes just submit your PR and we'll try to review it, but for anything more 'impactful' please open an Issue first and start a discussion. It is better to sound out what it is you want to achieve first, and try to come to a consensus on what the best approach is, especially when it impacts the structure or architecture of this codebase.
-
-Here are some general principles you should try to adhere to:
-* Keep it simple. Please, don't think like a high-level lang programmer. Think embedded, and keep code concise, without any unnecessary layers.
-* No dynamic memory allocation, except during setup/begin functions.
-* Use the same brace and indenting style that's in the core source modules. (A .clang-format is probably going to be added soon, but please do NOT retroactively re-format existing code. This just creates unnecessary diffs that make finding problems harder)
-
-Help us prioritize! Please react with thumbs-up to issues/PRs you care about most. We look at reaction counts when planning work.
-
-### Running unit tests
-
-To run unit tests, run the following command:
+Built with [PlatformIO](https://platformio.org/):
 
 ```bash
-pio test --environment native --verbose
+# Standalone messenger (companion UI)
+pio run -e T_LoRa_Pager_LR1121_companion_radio_usb -t upload
+
+# Repeater
+pio run -e T_LoRa_Pager_LR1121_repeater -t upload
 ```
 
-## Road-Map / To-Do
+See [`variants/lilygo_tlora_pager_lr1121/README.md`](variants/lilygo_tlora_pager_lr1121/README.md) for the full build/flash notes, pin map, UI navigation and hardware details.
 
-There are a number of fairly major features in the pipeline, with no particular time-frames attached yet. In very rough chronological order:
-- [X] Companion radio: UI redesign
-- [X] Repeater + Room Server: add ACL's (like Sensor Node has)
-- [X] Standardise Bridge mode for repeaters
-- [ ] Repeater/Bridge: Standardise the Transport Codes for zoning/filtering
-- [X] Core + Repeater: enhanced zero-hop neighbour discovery
-- [ ] Core: round-trip manual path support
-- [ ] Companion + Apps: support for multiple sub-meshes (and 'off-grid' client repeat mode)
-- [ ] Core + Apps: support for LZW message compression
-- [ ] Core: dynamic CR (Coding Rate) for weak vs strong hops
-- [ ] Core: new framework for hosting multiple virtual nodes on one physical device
-- [ ] V2 protocol spec: discussion and consensus around V2 packet protocol, including path hashes, new encryption specs, etc
+## 🔌 Power on / off
 
-## 📞 Get Support
+- **Power on:** the small dedicated button on the side (between the antennas).
+- **Power off:** hold the **scroll-wheel / encoder button for ≥ 3 seconds** (the shorter 600 ms hold is the in-UI "back" gesture).
 
-- Report bugs and request features on the [GitHub Issues](https://github.com/ripplebiz/MeshCore/issues) page.
-- Find additional guides and components on [my site](https://buymeacoffee.com/ripplebiz).
-- Join [MeshCore Discord](https://meshcore.gg) to chat with the developers and get help from the community.
+## 📚 Documentation
+
+- [Variant README](variants/lilygo_tlora_pager_lr1121/README.md) — build environments, pin map, UI navigation, on/off, offline map setup.
+- [Offline map tiles](variants/lilygo_tlora_pager_lr1121/MAPS.md) — how the SD-card map tiles are laid out.
+
+## 🌐 Built on MeshCore
+
+This is a hardware variant/port of **[MeshCore](https://github.com/meshcore-dev/MeshCore)**, a
+lightweight C++ library for multi-hop LoRa packet routing. All credit for the
+underlying mesh stack goes to the MeshCore project; this repository adds the
+LilyGo T-Lora Pager (LR1121) board support and the standalone on-device UI.
+Upstream changes are periodically merged in.
+
+## 📄 License
+
+Released under the **MIT License**, same as upstream MeshCore — see
+[`license.txt`](license.txt). Pager variant and UI by CJ van Soest.
