@@ -557,7 +557,7 @@ void TLoraPagerBoard::powerOff() {
   Serial.flush();
   delay(100);
   tpager_power_off();
-  while (1) ; // rail should already be dead; wait it out just in case
+  while (1); // rail should already be dead; wait it out just in case
 }
 
 static int read_bq27220_word(uint8_t reg) {
