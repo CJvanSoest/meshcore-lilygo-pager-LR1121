@@ -666,7 +666,7 @@ extern "C" const char *mesh_home_region_name() __attribute__((weak));
 
 void render_extra_status_lines(DisplayDriver *d, int start_y) {
   char tmp[40];
-  d->setColor(DisplayDriver::LIGHT);
+  d->setColor(UIColor::secondary_txt);
   int y = start_y;
 
   // Region — read live from the active mesh's RegionMap home_id.

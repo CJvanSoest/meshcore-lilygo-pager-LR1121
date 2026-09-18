@@ -16,7 +16,7 @@
 
 #include <Arduino.h>
 #include <MeshCore.h>
-#include <helpers/BaseSerialInterface.h>
+#include <helpers/MultiSerialInterface.h>
 #include <helpers/SensorManager.h>
 #include <helpers/ui/DisplayDriver.h>
 
@@ -42,7 +42,7 @@ class UITask : public AbstractUITask {
   void pollInput();
 
 public:
-  UITask(mesh::MainBoard *board, BaseSerialInterface *serial)
+  UITask(mesh::MainBoard *board, MultiSerialInterface *serial)
       : AbstractUITask(board, serial), _display(NULL), _sensors(NULL), _prefs(NULL), _next_refresh(0),
         _auto_off(0), _msgcount(0), _tile(0), _screen(0), _last_enc_a(HIGH), _prev_btn(HIGH),
         _btn_press_at(0) {}

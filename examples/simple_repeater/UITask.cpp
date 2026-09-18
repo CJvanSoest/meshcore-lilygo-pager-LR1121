@@ -131,7 +131,7 @@ void UITask::renderCurrScreen() {
     if (_display->height() >= 50) {
       unsigned long up_s = millis() / 1000;
       _display->setCursor(0, 40);
-      _display->setColor(DisplayDriver::LIGHT);
+      _display->setColor(UIColor::secondary_txt);
       sprintf(tmp, "UP: %02lu:%02lu:%02lu",
               up_s / 3600, (up_s / 60) % 60, up_s % 60);
       _display->print(tmp);
@@ -140,7 +140,7 @@ void UITask::renderCurrScreen() {
     // path hash size (mode 0/1/2 maps to 1/2/3 bytes)
     if (_display->height() >= 60) {
       _display->setCursor(0, 50);
-      _display->setColor(DisplayDriver::LIGHT);
+      _display->setColor(UIColor::secondary_txt);
       int bytes = _node_prefs->path_hash_mode + 1;
       sprintf(tmp, "PATH: %d byte%s", bytes, bytes == 1 ? "" : "s");
       _display->print(tmp);
@@ -232,7 +232,7 @@ void UITask::loop() {
 
 static void renderAboutScreen(DisplayDriver* d, const char* version_info) {
   char tmp[64];
-  d->setColor(DisplayDriver::LIGHT);
+  d->setColor(UIColor::secondary_txt);
   d->setTextSize(1);
 
   d->setCursor(0, 0);
@@ -269,11 +269,11 @@ static void renderAboutScreen(DisplayDriver* d, const char* version_info) {
 extern "C" void ui_send_message(const char* msg) __attribute__((weak));
 
 static void renderComposeScreen(DisplayDriver* d, const char* buf, uint16_t len) {
-  d->setColor(DisplayDriver::LIGHT);
+  d->setColor(UIColor::secondary_txt);
   d->setTextSize(1);
 
   d->setCursor(0, 0);
-  d->setColor(DisplayDriver::YELLOW);
+  d->setColor(UIColor::warning_txt);
 #ifdef COMPOSE_CHANNEL
   char hdr[40];
   snprintf(hdr, sizeof(hdr), "Compose %s", COMPOSE_CHANNEL);
@@ -283,7 +283,7 @@ static void renderComposeScreen(DisplayDriver* d, const char* buf, uint16_t len)
 #endif
 
   // Visible buffer — append a block cursor for legibility.
-  d->setColor(DisplayDriver::LIGHT);
+  d->setColor(UIColor::secondary_txt);
   char shown[COMPOSE_BUFFER_SIZE + 2];
   size_t n = len < COMPOSE_BUFFER_SIZE ? len : COMPOSE_BUFFER_SIZE - 1;
   memcpy(shown, buf, n);
@@ -293,9 +293,9 @@ static void renderComposeScreen(DisplayDriver* d, const char* buf, uint16_t len)
   d->printWordWrap(shown, d->width());
 
   // Hint at the bottom.
-  d->setColor(DisplayDriver::DARK);  // dim
+  d->setColor(UIColor::secondary_txt);  // dim
   d->setCursor(0, d->height() - 8);
-  d->setColor(DisplayDriver::LIGHT);
+  d->setColor(UIColor::secondary_txt);
   d->print("Enter=send  Bksp=del");
 }
 
