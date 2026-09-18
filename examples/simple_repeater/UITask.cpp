@@ -1,4 +1,5 @@
 #include "UITask.h"
+#include "target.h"
 #include <Arduino.h>
 #include <helpers/CommonCLI.h>
 
@@ -8,6 +9,8 @@
 
 #define AUTO_OFF_MILLIS      20000  // 20 seconds
 #define BOOT_SCREEN_MILLIS   4000   // 4 seconds
+
+#define POWEROFF_DELAY 3000
 
 // 'meshcore', 128x13px
 static const uint8_t meshcore_logo [] PROGMEM = {
@@ -29,8 +32,13 @@ static const uint8_t meshcore_logo [] PROGMEM = {
 void UITask::begin(NodePrefs* node_prefs, const char* build_date, const char* firmware_version) {
   _prevBtnState = HIGH;
   _auto_off = millis() + AUTO_OFF_MILLIS;
+  _started_at = millis();
   _node_prefs = node_prefs;
   _display->turnOn();
+
+#if defined(PIN_USER_BTN) && defined(DISPLAY_CLASS)
+  user_btn.begin();
+#endif
 
   // strip off dash and commit hash by changing dash to null terminator
   // e.g: v1.2.3-abcdef -> v1.2.3
@@ -41,7 +49,8 @@ void UITask::begin(NodePrefs* node_prefs, const char* build_date, const char* fi
   }
 
   // v1.2.3 (1 Jan 2025)
-  sprintf(_version_info, "%s (%s)", version, build_date);
+  snprintf(_version_info, sizeof(_version_info), "%s (%s)", version, build_date);
+  free(version);
 }
 
 // Forward declarations for non-home screen renderers — defined at the bottom
@@ -66,42 +75,50 @@ void UITask::renderCurrScreen() {
   }
 #endif
 
-  if (millis() < BOOT_SCREEN_MILLIS) { // boot screen
+  if (millis() < _started_at + BOOT_SCREEN_MILLIS) { // boot screen
     // meshcore logo
-    _display->setColor(DisplayDriver::BLUE);
+    _display->setColor(UIColor::corp_blue);
     int logoWidth = 128;
     _display->drawXbm((_display->width() - logoWidth) / 2, 3, meshcore_logo, logoWidth, 13);
 
     // meshcore website
     const char* website = "https://meshcore.io";
-    _display->setColor(DisplayDriver::LIGHT);
+    _display->setColor(UIColor::primary_txt);
     _display->setTextSize(1);
-    uint16_t websiteWidth = _display->getTextWidth(website);
-    _display->setCursor((_display->width() - websiteWidth) / 2, 22);
-    _display->print(website);
+    _display->drawTextCentered(_display->width() / 2, 22, website);
 
     // version info
-    _display->setColor(DisplayDriver::LIGHT);
     _display->setTextSize(1);
-    uint16_t versionWidth = _display->getTextWidth(_version_info);
-    _display->setCursor((_display->width() - versionWidth) / 2, 35);
-    _display->print(_version_info);
+    _display->drawTextCentered(_display->width() / 2, 35, _version_info);
 
     // node type
     const char* node_type = "< Repeater >";
-    uint16_t typeWidth = _display->getTextWidth(node_type);
-    _display->setCursor((_display->width() - typeWidth) / 2, 48);
-    _display->print(node_type);
-  } else {  // home screen
-    // node name
+    _display->drawTextCentered(_display->width() / 2, 48, node_type);
+  } else if (_powering_off_at > 0) {
+    // meshcore logo
+    _display->setColor(UIColor::corp_blue);
+    int logoWidth = 128;
+    _display->drawXbm((_display->width() - logoWidth) / 2, 3, meshcore_logo, logoWidth, 13);
+
+    // meshcore website
+    const char* website = "https://meshcore.io";
+    _display->setColor(UIColor::primary_txt);
+    _display->setTextSize(1);
+    _display->drawTextCentered(_display->width()/ 2, 22, website);
+
+    // Powering off
+    const char* poweroff_string = "Turning OFF";
+    uint16_t poffWidth = _display->getTextWidth(poweroff_string);
+    _display->setCursor((_display->width() - poffWidth) / 2, 48);
+    _display->drawTextCentered(_display->width()/2, 48, poweroff_string);
+  } else {
     _display->setCursor(0, 0);
     _display->setTextSize(1);
-    _display->setColor(DisplayDriver::GREEN);
+    _display->setColor(UIColor::primary_txt);
     _display->print(_node_prefs->node_name);
 
     // freq / sf
     _display->setCursor(0, 20);
-    _display->setColor(DisplayDriver::YELLOW);
     sprintf(tmp, "FREQ: %06.3f SF%d", _node_prefs->freq, _node_prefs->sf);
     _display->print(tmp);
 
@@ -114,7 +131,7 @@ void UITask::renderCurrScreen() {
     if (_display->height() >= 50) {
       unsigned long up_s = millis() / 1000;
       _display->setCursor(0, 40);
-      _display->setColor(DisplayDriver::LIGHT);
+      _display->setColor(UIColor::secondary_txt);
       sprintf(tmp, "UP: %02lu:%02lu:%02lu",
               up_s / 3600, (up_s / 60) % 60, up_s % 60);
       _display->print(tmp);
@@ -123,7 +140,7 @@ void UITask::renderCurrScreen() {
     // path hash size (mode 0/1/2 maps to 1/2/3 bytes)
     if (_display->height() >= 60) {
       _display->setCursor(0, 50);
-      _display->setColor(DisplayDriver::LIGHT);
+      _display->setColor(UIColor::secondary_txt);
       int bytes = _node_prefs->path_hash_mode + 1;
       sprintf(tmp, "PATH: %d byte%s", bytes, bytes == 1 ? "" : "s");
       _display->print(tmp);
@@ -162,23 +179,21 @@ void UITask::loop() {
   last_enc_a = enc_a;
 #endif
 
-#ifdef PIN_USER_BTN
-  if (millis() >= _next_read) {
-    int btnState = digitalRead(PIN_USER_BTN);
-    if (btnState != _prevBtnState) {
-      if (btnState == USER_BTN_PRESSED) {  // pressed?
-        if (_display->isOn()) {
-          // Cycle to the next screen (boards with NUM_SCREENS > 1).
-          _current_screen = (_current_screen + 1) % NUM_SCREENS;
-          _next_refresh = 0;  // force immediate redraw
-        } else {
-          _display->turnOn();
-        }
-        _auto_off = millis() + AUTO_OFF_MILLIS;   // extend auto-off timer
-      }
-      _prevBtnState = btnState;
+#if defined(PIN_USER_BTN) && defined(DISPLAY_CLASS)
+  int ev = user_btn.check();
+  if (ev == BUTTON_EVENT_CLICK && _powering_off_at == 0) {
+    if (_display->isOn()) {
+      // Cycle to the next screen (boards with NUM_SCREENS > 1).
+      _current_screen = (_current_screen + 1) % NUM_SCREENS;
+      _next_refresh = 0;  // force immediate redraw
+    } else {
+      _display->turnOn();
     }
-    _next_read = millis() + 200;  // 5 reads per second
+    _auto_off = millis() + AUTO_OFF_MILLIS;   // extend auto-off timer
+  } else if (ev == BUTTON_EVENT_LONG_PRESS) {
+      _display->turnOn();
+      Serial.println("Powering Off");
+      _powering_off_at = millis() + POWEROFF_DELAY;
   }
 #endif
 
@@ -192,6 +207,15 @@ void UITask::loop() {
     }
     if (millis() > _auto_off) {
       _display->turnOff();
+    }
+  }
+
+  if (_powering_off_at > 0) { // power off timer armed
+#ifdef LED_PIN
+    digitalWrite(LED_PIN, LED_STATE_ON); // switch on the led until poweroff
+#endif
+    if (millis() > _powering_off_at) {
+      _board->powerOff();  // should not return
     }
   }
 }
@@ -208,7 +232,7 @@ void UITask::loop() {
 
 static void renderAboutScreen(DisplayDriver* d, const char* version_info) {
   char tmp[64];
-  d->setColor(DisplayDriver::LIGHT);
+  d->setColor(UIColor::secondary_txt);
   d->setTextSize(1);
 
   d->setCursor(0, 0);
@@ -245,11 +269,11 @@ static void renderAboutScreen(DisplayDriver* d, const char* version_info) {
 extern "C" void ui_send_message(const char* msg) __attribute__((weak));
 
 static void renderComposeScreen(DisplayDriver* d, const char* buf, uint16_t len) {
-  d->setColor(DisplayDriver::LIGHT);
+  d->setColor(UIColor::secondary_txt);
   d->setTextSize(1);
 
   d->setCursor(0, 0);
-  d->setColor(DisplayDriver::YELLOW);
+  d->setColor(UIColor::warning_txt);
 #ifdef COMPOSE_CHANNEL
   char hdr[40];
   snprintf(hdr, sizeof(hdr), "Compose %s", COMPOSE_CHANNEL);
@@ -259,7 +283,7 @@ static void renderComposeScreen(DisplayDriver* d, const char* buf, uint16_t len)
 #endif
 
   // Visible buffer — append a block cursor for legibility.
-  d->setColor(DisplayDriver::LIGHT);
+  d->setColor(UIColor::secondary_txt);
   char shown[COMPOSE_BUFFER_SIZE + 2];
   size_t n = len < COMPOSE_BUFFER_SIZE ? len : COMPOSE_BUFFER_SIZE - 1;
   memcpy(shown, buf, n);
@@ -269,9 +293,8 @@ static void renderComposeScreen(DisplayDriver* d, const char* buf, uint16_t len)
   d->printWordWrap(shown, d->width());
 
   // Hint at the bottom.
-  d->setColor(DisplayDriver::DARK);  // dim
   d->setCursor(0, d->height() - 8);
-  d->setColor(DisplayDriver::LIGHT);
+  d->setColor(UIColor::secondary_txt);
   d->print("Enter=send  Bksp=del");
 }
 

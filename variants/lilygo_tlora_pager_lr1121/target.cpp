@@ -23,7 +23,10 @@ DISPLAY_CLASS display;
 #ifndef USER_BTN_LONG_PRESS_MS
 #define USER_BTN_LONG_PRESS_MS 1000
 #endif
-MomentaryButton user_btn(PIN_USER_BTN, USER_BTN_LONG_PRESS_MS, true);
+// reverse=true (active-low), pulldownup=true — MomentaryButton::begin() would
+// otherwise re-pinMode this to a floating INPUT and clobber the pull-up set
+// above, which is risky now a long-press has a destructive effect (power off).
+MomentaryButton user_btn(PIN_USER_BTN, USER_BTN_LONG_PRESS_MS, true, true);
 #endif
 
 static SPIClass spi;
@@ -542,6 +545,23 @@ extern "C" void tpager_power_off() {
   Wire.endTransmission();
 }
 
+// Real power-off for this board (BATFET cutoff, not deep-sleep). Used by
+// both the companion LVGL UI and the repeater's long-button-press handler
+// so "power off" means the same thing on every firmware built for this
+// variant. Does not return — the BQ25896 kills the system rail once the
+// write above lands.
+void TLoraPagerBoard::powerOff() {
+#ifdef DISPLAY_CLASS
+  display.turnOff();
+#endif
+  Serial.flush();
+  delay(100);
+  tpager_power_off();
+  // Rail should already be dead. Wait it out just in case.
+  while (1)
+    ;
+}
+
 static int read_bq27220_word(uint8_t reg) {
   Wire.beginTransmission(BQ27220_I2C_ADDR);
   Wire.write(reg);
@@ -666,7 +686,7 @@ extern "C" const char *mesh_home_region_name() __attribute__((weak));
 
 void render_extra_status_lines(DisplayDriver *d, int start_y) {
   char tmp[40];
-  d->setColor(DisplayDriver::LIGHT);
+  d->setColor(UIColor::secondary_txt);
   int y = start_y;
 
   // Region — read live from the active mesh's RegionMap home_id.
