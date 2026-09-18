@@ -558,7 +558,8 @@ void TLoraPagerBoard::powerOff() {
   delay(100);
   tpager_power_off();
   // Rail should already be dead. Wait it out just in case.
-  while (1) ;
+  while (1)
+    ;
 }
 
 static int read_bq27220_word(uint8_t reg) {
