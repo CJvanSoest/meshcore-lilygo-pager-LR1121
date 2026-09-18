@@ -181,7 +181,7 @@ void UITask::loop() {
 
 #if defined(PIN_USER_BTN) && defined(DISPLAY_CLASS)
   int ev = user_btn.check();
-  if (ev == BUTTON_EVENT_CLICK) {
+  if (ev == BUTTON_EVENT_CLICK && _powering_off_at == 0) {
     if (_display->isOn()) {
       // Cycle to the next screen (boards with NUM_SCREENS > 1).
       _current_screen = (_current_screen + 1) % NUM_SCREENS;
@@ -293,7 +293,6 @@ static void renderComposeScreen(DisplayDriver* d, const char* buf, uint16_t len)
   d->printWordWrap(shown, d->width());
 
   // Hint at the bottom.
-  d->setColor(UIColor::secondary_txt);  // dim
   d->setCursor(0, d->height() - 8);
   d->setColor(UIColor::secondary_txt);
   d->print("Enter=send  Bksp=del");

@@ -20,6 +20,11 @@ public:
   void begin();
   uint16_t getBattMilliVolts() override;
   const char *getManufacturerName() const override { return "LilyGo"; }
+  // ESP32Board's default just deep-sleeps (system rails stay powered).
+  // This board has a real off switch (BQ25896 BATFET) — use it, so a
+  // repeater-firmware long-press behaves the same as the companion UI's
+  // power-off (tpager_power_off() in target.cpp).
+  void powerOff() override;
 };
 
 extern TLoraPagerBoard board;

@@ -201,6 +201,14 @@ void DataStore::loadPrefs(NodePrefs& prefs) {
     if (savePrefs(prefs) ) {                // save to new format
       //_fs->remove("/new_prefs"); // remove old
     }
+  } else if (_fs->exists("/node_prefs")) {
+    // Oldest raw-struct filename, from before "/new_prefs" existed. Upstream
+    // dropped this tier when it introduced prefs.json; keep it so a device
+    // that never booted an intermediate version doesn't silently reset to
+    // defaults.
+    loadPrefsInt("/node_prefs", prefs);
+    savePrefs(prefs);            // save to new format
+    _fs->remove("/node_prefs");  // remove old
   }
 }
 
